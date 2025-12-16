@@ -1,0 +1,113 @@
+import { create } from "zustand";
+import { LatLngBounds } from "leaflet";
+
+interface GenerationState {
+  selectedArea: LatLngBounds | null;
+  isGenerating: boolean;
+  taskId: string | null;
+  progress: number;
+  status: string;
+  downloadUrl: string | null;
+  
+  // Параметри генерації
+  roadWidthMultiplier: number;
+  roadHeightMm: number;
+  roadEmbedMm: number;
+  buildingMinHeight: number;
+  buildingHeightMultiplier: number;
+  buildingFoundationMm: number;
+  buildingEmbedMm: number;
+  waterDepth: number;
+  terrainEnabled: boolean;
+  terrainZScale: number;
+  terrainBaseThicknessMm: number;
+  terrainResolution: number;
+  terrariumZoom: number;
+  exportFormat: "stl" | "3mf";
+  modelSizeMm: number; // Розмір моделі в міліметрах
+  
+  // Actions
+  setSelectedArea: (area: LatLngBounds | null) => void;
+  setGenerating: (isGenerating: boolean) => void;
+  setTaskId: (taskId: string | null) => void;
+  updateProgress: (progress: number, status: string) => void;
+  setDownloadUrl: (url: string | null) => void;
+  
+  // Параметри
+  setRoadWidthMultiplier: (value: number) => void;
+  setRoadHeightMm: (value: number) => void;
+  setRoadEmbedMm: (value: number) => void;
+  setBuildingMinHeight: (value: number) => void;
+  setBuildingHeightMultiplier: (value: number) => void;
+  setBuildingFoundationMm: (value: number) => void;
+  setBuildingEmbedMm: (value: number) => void;
+  setWaterDepth: (value: number) => void;
+  setTerrainEnabled: (value: boolean) => void;
+  setTerrainZScale: (value: number) => void;
+  setTerrainBaseThicknessMm: (value: number) => void;
+  setTerrainResolution: (value: number) => void;
+  setTerrariumZoom: (value: number) => void;
+  setExportFormat: (format: "stl" | "3mf") => void;
+  setModelSizeMm: (value: number) => void;
+  
+  reset: () => void;
+}
+
+const initialState = {
+  selectedArea: null,
+  isGenerating: false,
+  taskId: null,
+  progress: 0,
+  status: "",
+  downloadUrl: null,
+  // На 10×10см “реальні” ширини доріг часто виглядають надто товстими — ставимо мʼякший дефолт.
+  roadWidthMultiplier: 0.8,
+  // Дороги: менша висота + трохи більше втиснення дають кращий вигляд і менше z-fighting
+  roadHeightMm: 0.5,
+  roadEmbedMm: 0.3,
+  // Реальні OSM висоти на масштабі 10x10см часто виглядають занадто низько,
+  // тому робимо трохи вищі дефолти (користувач може змінити слайдерами).
+  buildingMinHeight: 5.0,
+  buildingHeightMultiplier: 1.8,
+  buildingFoundationMm: 0.6,
+  buildingEmbedMm: 0.2,
+  waterDepth: 2.0,
+  terrainEnabled: true,
+  terrainZScale: 1.5,
+  // Тонка “підложка” під рельєф (мм на фінальній моделі)
+  terrainBaseThicknessMm: 2.0,
+  // Вища деталізація рельєфу -> менші трикутники, більше “реальності”
+  terrainResolution: 180,
+  terrariumZoom: 15,
+  exportFormat: "3mf" as const,
+  modelSizeMm: 100.0, // 100мм = 10см за замовчуванням
+};
+
+export const useGenerationStore = create<GenerationState>((set) => ({
+  ...initialState,
+  
+  setSelectedArea: (area) => set({ selectedArea: area }),
+  setGenerating: (isGenerating) => set({ isGenerating }),
+  setTaskId: (taskId) => set({ taskId }),
+  updateProgress: (progress, status) => set({ progress, status }),
+  setDownloadUrl: (url) => set({ downloadUrl: url }),
+  
+  setRoadWidthMultiplier: (value) => set({ roadWidthMultiplier: value }),
+  setRoadHeightMm: (value) => set({ roadHeightMm: value }),
+  setRoadEmbedMm: (value) => set({ roadEmbedMm: value }),
+  setBuildingMinHeight: (value) => set({ buildingMinHeight: value }),
+  setBuildingHeightMultiplier: (value) => set({ buildingHeightMultiplier: value }),
+  setBuildingFoundationMm: (value) => set({ buildingFoundationMm: value }),
+  setBuildingEmbedMm: (value) => set({ buildingEmbedMm: value }),
+  setWaterDepth: (value) => set({ waterDepth: value }),
+  setTerrainEnabled: (value) => set({ terrainEnabled: value }),
+  setTerrainZScale: (value) => set({ terrainZScale: value }),
+  setTerrainBaseThicknessMm: (value) => set({ terrainBaseThicknessMm: value }),
+  setTerrainResolution: (value) => set({ terrainResolution: value }),
+  setTerrariumZoom: (value) => set({ terrariumZoom: value }),
+  setExportFormat: (format) => set({ exportFormat: format }),
+  setModelSizeMm: (value) => set({ modelSizeMm: value }),
+  
+  reset: () => set(initialState),
+}));
+
