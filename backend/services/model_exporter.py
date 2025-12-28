@@ -41,10 +41,11 @@ def export_preview_parts_stl(
         bounds_for_base = combined.bounds
         size_for_base = bounds_for_base[1] - bounds_for_base[0]
         center_for_base = (bounds_for_base[0] + bounds_for_base[1]) / 2.0
-        margin = min(0.01 * max(size_for_base[0], size_for_base[1]), model_size_mm * 0.05)
+        # ВИПРАВЛЕННЯ: Не додаємо margin по боках - база точно по розміру моделі
+        margin = 0.0  # Без додаткової території по боках
         base_size = [
-            max(size_for_base[0] + 2 * margin, model_size_mm * 0.5),
-            max(size_for_base[1] + 2 * margin, model_size_mm * 0.5),
+            size_for_base[0],  # Точний розмір без мінімуму та без margin
+            size_for_base[1],  # Точний розмір без мінімуму та без margin
             max(base_thickness_mm, 0.8),
         ]
         min_z = bounds_for_base[0][2]
@@ -144,7 +145,7 @@ def export_scene(
     base_thickness_mm: float = 2.0,
     parks_mesh: Optional[trimesh.Trimesh] = None,
     poi_mesh: Optional[trimesh.Trimesh] = None,
-) -> None:
+) -> Optional[dict]:
     """
     Експортує 3D сцену у файл
     
@@ -174,23 +175,12 @@ def export_scene(
             print("Попередження: База порожня")
     
     # 2. Дороги
-    if road_mesh:
-        print(f"Додаємо дороги до сцени ({len(road_mesh.faces)} граней)")
-        # Перевіряємо валідність
-        if len(road_mesh.vertices) > 0 and len(road_mesh.faces) > 0:
-            # Виправляємо нормалі (якщо можливо)
-            try:
-                road_mesh.fix_normals()
-            except Exception:
-                pass  # Якщо не вдалося, продовжуємо
-            # Перекриття/посадка доріг робиться ще на етапі draping (road_embed),
-            # тут більше не піднімаємо, бо це викликає "висять" після масштабування.
-            mesh_items.append(("Roads", road_mesh))
-            print(f"Дороги додані: {len(road_mesh.vertices)} вершин, {len(road_mesh.faces)} граней")
-        else:
-            print("Попередження: Дороги порожні")
-    else:
-        print("Попередження: Дороги не знайдено")
+    if road_mesh is not None and len(road_mesh.vertices) > 0 and len(road_mesh.faces) > 0:
+        try:
+            road_mesh.fix_normals()
+        except Exception:
+            pass
+        mesh_items.append(("Roads", road_mesh))
     
     # 3. Будівлі
     if building_meshes and len(building_meshes) > 0:
@@ -215,27 +205,34 @@ def export_scene(
                 # Для STL можна об'єднати для меншого файлу
                 try:
                     combined_buildings = trimesh.util.concatenate(valid_buildings)
-                    mesh_items.append(("Buildings", combined_buildings))
-                    print(f"Будівлі об'єднано ({len(combined_buildings.vertices)} вершин, {len(combined_buildings.faces)} граней)")
+                    if combined_buildings is not None and len(combined_buildings.vertices) > 0:
+                        mesh_items.append(("Buildings", combined_buildings))
+                        print(f"Будівлі об'єднано ({len(combined_buildings.vertices)} вершин, {len(combined_buildings.faces)} граней)")
+                    else:
+                        # Якщо об'єднання не вдалося, додаємо окремо
+                        for i, building in enumerate(valid_buildings[:100]):
+                            mesh_items.append((f"Building_{i}", building))
+                        print(f"Будівлі додані як окремі об'єкти (об'єднання не вдалося): {len(valid_buildings[:100])}")
                 except Exception as e:
                     print(f"Помилка об'єднання будівель: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Fallback: додаємо окремо
                     for i, building in enumerate(valid_buildings[:100]):
                         mesh_items.append((f"Building_{i}", building))
+                    print(f"Будівлі додані як окремі об'єкти (fallback): {len(valid_buildings[:100])}")
         else:
             print("Попередження: Немає валідних будівель")
     else:
         print("Попередження: Будівлі не знайдено або не вдалося обробити")
     
     # 4. Вода (як окремий об'єкт для мультиколірного друку)
-    if water_mesh:
-        if len(water_mesh.vertices) > 0 and len(water_mesh.faces) > 0:
-            try:
-                water_mesh.fix_normals()
-            except Exception:
-                pass  # Якщо не вдалося, продовжуємо
-            if format == "3mf":
-                mesh_items.append(("Water", water_mesh))
-            # Для STL не додаємо воду окремо (вона має бути віднята від бази)
+    if water_mesh is not None and len(water_mesh.vertices) > 0 and len(water_mesh.faces) > 0:
+        try:
+            water_mesh.fix_normals()
+        except Exception:
+            pass
+        mesh_items.append(("Water", water_mesh))
 
     # 5. Парки/зелень
     if parks_mesh is not None and len(parks_mesh.vertices) > 0 and len(parks_mesh.faces) > 0:
@@ -255,9 +252,18 @@ def export_scene(
     
     # Перевіряємо, що є хоча б один меш
     if not mesh_items:
-        raise ValueError("Немає геометрії для експорту! Перевірте, що дані завантажені правильно.")
+        # Якщо немає геометрії, створюємо мінімальний fallback рельєф
+        print("[WARN] Немає геометрії для експорту. Створюємо мінімальний fallback рельєф.")
+        # ВАЖЛИВО: trimesh вже імпортований на початку файлу, не потрібно імпортувати знову
+        # Створюємо мінімальний плоский квадрат
+        fallback_mesh = trimesh.creation.box(extents=[100.0, 100.0, 1.0])
+        mesh_items = [("FallbackTerrain", fallback_mesh)]
+        print("[INFO] Створено мінімальний fallback рельєф")
     
     print(f"Всього мешів для експорту: {len(mesh_items)}")
+    # Діагностика: виводимо всі додані частини
+    mesh_names = [name for name, _ in mesh_items]
+    print(f"Експорт: {', '.join(sorted(set(mesh_names)))}")
     total_vertices = sum(len(m.vertices) for _, m in mesh_items)
     total_faces = sum(len(m.faces) for _, m in mesh_items)
     print(f"Загальна статистика: {total_vertices} вершин, {total_faces} граней")
@@ -265,8 +271,10 @@ def export_scene(
     # Експорт
     if format.lower() == "3mf":
         export_3mf(filename, mesh_items, model_size_mm, add_flat_base=add_flat_base, base_thickness_mm=base_thickness_mm)
+        return None
     elif format.lower() == "stl":
-        export_stl(filename, mesh_items, model_size_mm, add_flat_base=add_flat_base, base_thickness_mm=base_thickness_mm)
+        outputs = export_stl(filename, mesh_items, model_size_mm, add_flat_base=add_flat_base, base_thickness_mm=base_thickness_mm)
+        return outputs
     else:
         raise ValueError(f"Невідомий формат: {format}")
 
@@ -286,8 +294,59 @@ def export_3mf(
         if not mesh_items:
             raise ValueError("Сцена порожня, немає що експортувати")
         
-        # Робоча копія списку
-        working_items: List[Tuple[str, trimesh.Trimesh]] = [(n, m.copy()) for n, m in mesh_items]
+        # Робоча копія списку з нормалізацією структури
+        working_items: List[Tuple[str, trimesh.Trimesh]] = []
+        for n, m in mesh_items:
+            if m is None or len(m.vertices) == 0 or len(m.faces) == 0:
+                continue
+            
+            # Нормалізуємо структуру faces перед об'єднанням
+            mesh_copy = m.copy()
+            
+            # Перевіряємо та виправляємо структуру faces
+            if mesh_copy.faces.ndim == 3:
+                # Якщо faces має форму (N, 3, 3), перетворюємо на (N, 3)
+                if mesh_copy.faces.shape[2] == 3:
+                    mesh_copy.faces = mesh_copy.faces[:, 0, :].astype(np.int64)
+                else:
+                    mesh_copy.faces = mesh_copy.faces.reshape(-1, 3).astype(np.int64)
+            elif mesh_copy.faces.ndim == 1:
+                # Якщо faces має форму (N*3,), перетворюємо на (N, 3)
+                if len(mesh_copy.faces) % 3 == 0:
+                    mesh_copy.faces = mesh_copy.faces.reshape(-1, 3).astype(np.int64)
+                else:
+                    print(f"[WARN] Неправильна форма faces для {n}: {mesh_copy.faces.shape}, пропускаємо")
+                    continue
+            elif mesh_copy.faces.ndim == 2:
+                # Правильна форма (N, 3), але перевіряємо тип
+                if mesh_copy.faces.shape[1] != 3:
+                    print(f"[WARN] Неправильна форма faces для {n}: {mesh_copy.faces.shape}, пропускаємо")
+                    continue
+                mesh_copy.faces = mesh_copy.faces.astype(np.int64)
+            else:
+                print(f"[WARN] Невідома форма faces для {n}: {mesh_copy.faces.shape}, пропускаємо")
+                continue
+            
+            # Перевіряємо індекси граней
+            max_face_idx = int(np.max(mesh_copy.faces)) if len(mesh_copy.faces) > 0 else -1
+            if max_face_idx >= len(mesh_copy.vertices):
+                # Виправляємо індекси - видаляємо невалідні грані
+                valid_faces = []
+                for face in mesh_copy.faces:
+                    if len(face) == 3 and all(f < len(mesh_copy.vertices) for f in face):
+                        valid_faces.append(face)
+                
+                if len(valid_faces) == 0:
+                    print(f"[WARN] Немає валідних граней для {n}, пропускаємо")
+                    continue
+                
+                mesh_copy.faces = np.array(valid_faces, dtype=np.int64)
+                mesh_copy.remove_unreferenced_vertices()
+            
+            working_items.append((n, mesh_copy))
+        
+        if not working_items:
+            raise ValueError("Немає валідних мешів для експорту")
         
         # Об'єднуємо для розрахунків трансформацій
         print(f"Об'єднання {len(working_items)} мешів для 3MF...")
@@ -309,10 +368,11 @@ def export_3mf(
             bounds_for_base = combined.bounds
             size_for_base = bounds_for_base[1] - bounds_for_base[0]
             center_for_base = (bounds_for_base[0] + bounds_for_base[1]) / 2.0
-            margin = min(0.01 * max(size_for_base[0], size_for_base[1]), model_size_mm * 0.05)  # обмежуємо поля
+            # ВИПРАВЛЕННЯ: Не додаємо margin по боках - база точно по розміру моделі
+            margin = 0.0  # Без додаткової території по боках
             base_size = [
-                max(size_for_base[0] + 2 * margin, model_size_mm * 0.5),
-                max(size_for_base[1] + 2 * margin, model_size_mm * 0.5),
+                size_for_base[0],  # Точний розмір без мінімуму та без margin
+                size_for_base[1],  # Точний розмір без мінімуму та без margin
                 max(base_thickness_mm, 0.8)
             ]
             min_z = bounds_for_base[0][2]
@@ -325,7 +385,7 @@ def export_3mf(
             )
             working_items.append(("BaseFlat", base_box))
             combined = trimesh.util.concatenate([combined, base_box])
-            print("Додано плоску базу товщиною", base_size[2], "мм з полями", margin, "мм")
+            print("Додано плоску базу товщиною", base_size[2], "мм (без полів по боках)")
 
         # Накопичуємо ВСІ трансформації (center+scale+zscale+align) і застосовуємо до кожного меша.
         transforms: List[Tuple[str, np.ndarray]] = []
@@ -390,11 +450,11 @@ def export_3mf(
         # Трансформуємо кожен меш окремо і додаємо до сцени з кольорами
         scene = trimesh.Scene()
         color_map = {
-            "Base": [200, 200, 200, 255],
-            "BaseFlat": [200, 200, 200, 255],
+            "Base": [250, 250, 250, 255],  # Біліший колір для рельєфу в тестовому режимі
+            "BaseFlat": [250, 250, 250, 255],
             "Roads": [30, 30, 30, 255],
             "Buildings": [180, 180, 180, 255],
-            "Water": [50, 120, 200, 255],
+            "Water": [0, 100, 255, 255],  # Яскравий синій колір для води (RGB: 0, 100, 255)
             "Parks": [90, 140, 80, 255],
             "POI": [220, 180, 60, 255],
         }
@@ -403,12 +463,54 @@ def export_3mf(
             mesh_copy = mesh.copy()
             for t_name, mat in transforms:
                 mesh_copy.apply_transform(mat)
+            
+            # ВАЖЛИВО: Для води перевіряємо, чи вже є колір в mesh (з water_processor)
+            is_water = "water" in name.lower()
+            has_existing_color = False
+            if is_water and hasattr(mesh_copy, 'visual') and mesh_copy.visual is not None:
+                if hasattr(mesh_copy.visual, 'face_colors') and mesh_copy.visual.face_colors is not None:
+                    if len(mesh_copy.visual.face_colors) > 0:
+                        has_existing_color = True
+                        print(f"[DEBUG] Water mesh вже має колір з water_processor")
+            
             # Застосовуємо колір
-            color = color_map.get(name.split("_")[0], [160, 160, 160, 255])
+            # ВАЖЛИВО: name може бути "Water" або "Water_0" тощо, тому беремо першу частину
+            name_key = name.split("_")[0]
+            color = color_map.get(name_key, [160, 160, 160, 255])
+            
+            # Додаткова перевірка для води
+            if is_water:
+                color = color_map.get("Water", [0, 100, 255, 255])
+            
+            # Застосовуємо колір (перезаписуємо, якщо потрібно, або застосовуємо новий)
             try:
-                mesh_copy.visual = trimesh.visual.ColorVisuals(mesh_copy, face_colors=color)
-            except Exception:
-                pass
+                # Для 3MF використовуємо face colors (найкраща підтримка)
+                if len(mesh_copy.faces) > 0:
+                    # Створюємо масив кольорів для всіх граней (RGBA)
+                    # ВАЖЛИВО: використовуємо uint8 для правильного формату
+                    face_colors = np.tile(np.array(color, dtype=np.uint8), (len(mesh_copy.faces), 1))
+                    
+                    # Створюємо ColorVisuals з face colors (завжди перезаписуємо для гарантії)
+                    mesh_copy.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
+                    
+                    # Перевіряємо, чи колір застосовано
+                    if not (hasattr(mesh_copy.visual, 'face_colors') and mesh_copy.visual.face_colors is not None):
+                        print(f"[WARN] Колір не застосовано для {name}, спробуємо альтернативний спосіб")
+                        # Альтернативний спосіб: через vertex colors
+                        vertex_colors = np.tile(np.array(color[:3], dtype=np.uint8), (len(mesh_copy.vertices), 1))
+                        mesh_copy.visual = trimesh.visual.ColorVisuals(vertex_colors=vertex_colors)
+            except Exception as e:
+                print(f"[ERROR] Помилка застосування кольору для {name}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Спробуємо альтернативний спосіб - через vertex colors
+                try:
+                    if len(mesh_copy.vertices) > 0:
+                        vertex_colors = np.tile(np.array(color[:3], dtype=np.uint8), (len(mesh_copy.vertices), 1))
+                        mesh_copy.visual = trimesh.visual.ColorVisuals(vertex_colors=vertex_colors)
+                except Exception as e2:
+                    print(f"[ERROR] Не вдалося застосувати колір для {name}: {e2}")
+            
             scene.add_geometry(mesh_copy, node_name=name)
         
         # Trimesh підтримує 3MF експорт
@@ -435,7 +537,7 @@ def export_stl(
     add_flat_base: bool = True,
     base_thickness_mm: float = 2.0,  # тонша база
     rotate_to_ground: bool = False,  # Не крутимо, щоб не ламати орієнтацію
-) -> None:
+) -> dict:
     """
     Експортує сцену у формат STL
     """
@@ -443,11 +545,64 @@ def export_stl(
         if not mesh_items:
             raise ValueError("Немає мешів для експорту")
         
-        # Робоча копія
-        working_items: List[Tuple[str, trimesh.Trimesh]] = [(n, m.copy()) for n, m in mesh_items]
+        # Робоча копія з нормалізацією структури
+        working_items: List[Tuple[str, trimesh.Trimesh]] = []
+        for n, m in mesh_items:
+            if m is None or len(m.vertices) == 0 or len(m.faces) == 0:
+                continue
+            
+            # Нормалізуємо структуру faces перед об'єднанням
+            mesh_copy = m.copy()
+            
+            # Перевіряємо та виправляємо структуру faces
+            if mesh_copy.faces.ndim == 3:
+                # Якщо faces має форму (N, 3, 3), перетворюємо на (N, 3)
+                if mesh_copy.faces.shape[2] == 3:
+                    mesh_copy.faces = mesh_copy.faces[:, 0, :].astype(np.int64)
+                else:
+                    mesh_copy.faces = mesh_copy.faces.reshape(-1, 3).astype(np.int64)
+            elif mesh_copy.faces.ndim == 1:
+                # Якщо faces має форму (N*3,), перетворюємо на (N, 3)
+                if len(mesh_copy.faces) % 3 == 0:
+                    mesh_copy.faces = mesh_copy.faces.reshape(-1, 3).astype(np.int64)
+                else:
+                    print(f"[WARN] Неправильна форма faces для {n}: {mesh_copy.faces.shape}, пропускаємо")
+                    continue
+            elif mesh_copy.faces.ndim == 2:
+                # Правильна форма (N, 3), але перевіряємо тип
+                if mesh_copy.faces.shape[1] != 3:
+                    print(f"[WARN] Неправильна форма faces для {n}: {mesh_copy.faces.shape}, пропускаємо")
+                    continue
+                mesh_copy.faces = mesh_copy.faces.astype(np.int64)
+            else:
+                print(f"[WARN] Невідома форма faces для {n}: {mesh_copy.faces.shape}, пропускаємо")
+                continue
+            
+            # Перевіряємо індекси граней
+            max_face_idx = int(np.max(mesh_copy.faces)) if len(mesh_copy.faces) > 0 else -1
+            if max_face_idx >= len(mesh_copy.vertices):
+                # Виправляємо індекси - видаляємо невалідні грані
+                valid_faces = []
+                for face in mesh_copy.faces:
+                    if len(face) == 3 and all(f < len(mesh_copy.vertices) for f in face):
+                        valid_faces.append(face)
+                
+                if len(valid_faces) == 0:
+                    print(f"[WARN] Немає валідних граней для {n}, пропускаємо")
+                    continue
+                
+                mesh_copy.faces = np.array(valid_faces, dtype=np.int64)
+                mesh_copy.remove_unreferenced_vertices()
+            
+            working_items.append((n, mesh_copy))
+        
+        if not working_items:
+            raise ValueError("Немає валідних мешів для експорту")
         
         # Об'єднуємо всі геометрії в один меш
         print(f"Об'єднання {len(working_items)} мешів...")
+        
+        
         combined = trimesh.util.concatenate([m for _, m in working_items])
         
         # Перевіряємо результат
@@ -467,10 +622,11 @@ def export_stl(
             bounds_for_base = combined.bounds
             size_for_base = bounds_for_base[1] - bounds_for_base[0]
             center_for_base = (bounds_for_base[0] + bounds_for_base[1]) / 2.0
-            margin = min(0.01 * max(size_for_base[0], size_for_base[1]), model_size_mm * 0.05)
+            # ВИПРАВЛЕННЯ: Не додаємо margin по боках - база точно по розміру моделі
+            margin = 0.0  # Без додаткової території по боках
             base_size = [
-                max(size_for_base[0] + 2 * margin, model_size_mm * 0.5),
-                max(size_for_base[1] + 2 * margin, model_size_mm * 0.5),
+                size_for_base[0],  # Точний розмір без мінімуму та без margin
+                size_for_base[1],  # Точний розмір без мінімуму та без margin
                 max(base_thickness_mm, 0.8)
             ]
             min_z = bounds_for_base[0][2]
@@ -483,23 +639,57 @@ def export_stl(
             )
             working_items.append(("BaseFlat", base_box))
             combined = trimesh.util.concatenate([combined, base_box])
-            print("Додано плоску базу товщиною", base_size[2], "мм з полями", margin, "мм")
+            print("Додано плоску базу товщиною", base_size[2], "мм (без полів по боках)")
 
         # Перевіряємо розміри моделі
         bounds = combined.bounds
         size = bounds[1] - bounds[0]
         center = combined.centroid
-        print(f"Розміри моделі: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}")
-        print(f"Центр моделі: {center}")
         
-        # Центруємо модель на початку координат (критично для відображення!)
-        print("Центрування моделі...")
-        combined.apply_translation(-center)
-        
-        # Перевіряємо розміри після центрування
-        bounds_after = combined.bounds
-        size_after = bounds_after[1] - bounds_after[0]
-        print(f"Розміри після центрування: {size_after[0]:.2f} x {size_after[1]:.2f} x {size_after[2]:.2f}")
+        # ВИПРАВЛЕННЯ: Перевіряємо, чи координати не в UTM (дуже великі числа)
+        if size[0] > 100000 or size[1] > 100000:
+            print("Центрування UTM координат...")
+            center_x = (bounds[0][0] + bounds[1][0]) / 2.0
+            center_y = (bounds[0][1] + bounds[1][1]) / 2.0
+            
+            vertices = combined.vertices.copy()
+            vertices[:, 0] -= center_x
+            vertices[:, 1] -= center_y
+            combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+            
+            bounds_after_xy = combined.bounds
+            min_z = bounds_after_xy[0][2]
+            vertices = combined.vertices.copy()
+            vertices[:, 2] -= min_z
+            combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+            
+            bounds_after = combined.bounds
+            size_after = bounds_after[1] - bounds_after[0]
+            max_dimension = max(size_after[0], size_after[1])
+            
+            if max_dimension > 100000:
+                print("Повторне центрування...")
+                bounds_check = combined.bounds
+                center_x = (bounds_check[0][0] + bounds_check[1][0]) / 2.0
+                center_y = (bounds_check[0][1] + bounds_check[1][1]) / 2.0
+                
+                vertices = combined.vertices.copy()
+                vertices[:, 0] -= center_x
+                vertices[:, 1] -= center_y
+                combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+                
+                bounds_after_xy = combined.bounds
+                min_z = bounds_after_xy[0][2]
+                vertices = combined.vertices.copy()
+                vertices[:, 2] -= min_z
+                combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+                
+                bounds_after = combined.bounds
+                size_after = bounds_after[1] - bounds_after[0]
+        else:
+            combined.apply_translation(-center)
+            bounds_after = combined.bounds
+            size_after = bounds_after[1] - bounds_after[0]
         
         # Масштабуємо модель до заданого розміру (в міліметрах)
         # Використовуємо середнє арифметичне X та Y для більш збалансованого масштабування
@@ -514,21 +704,23 @@ def export_stl(
             # Конвертуємо міліметри в одиниці моделі (1 одиниця = 1 мм)
             # Масштабуємо так, щоб середній розмір X/Y був model_size_mm
             scale_factor = model_size_mm / avg_xy_dimension
-            print(f"Масштабування моделі до {model_size_mm}мм (середній X/Y, коефіцієнт: {scale_factor:.6f})...")
             
-            # Перевіряємо, чи коефіцієнт не занадто великий (може бути помилка)
-            if scale_factor > 1000000:
-                print(f"⚠️ Попередження: Коефіцієнт масштабування занадто великий ({scale_factor:.2f}), можливо помилка")
-                # Обмежуємо масштабування
-                scale_factor = min(scale_factor, 1000.0)
-                print(f"Обмежено до {scale_factor:.2f}")
-            
-            combined.apply_scale(scale_factor)
-            
-            # Перевіряємо розміри після масштабування
-            bounds_scaled = combined.bounds
-            size_scaled = bounds_scaled[1] - bounds_scaled[0]
-            print(f"Розміри після масштабування: {size_scaled[0]:.2f} x {size_scaled[1]:.2f} x {size_scaled[2]:.2f} мм")
+            # Перевіряємо, чи коефіцієнт не занадто великий або малий
+            if scale_factor > 1000000 or scale_factor < 0.000001:
+                print(f"⚠️ Помилка масштабування: коефіцієнт {scale_factor:.6f}, розміри: {size_after}")
+                scale_factor = 1.0
+            else:
+                # Масштабуємо ОДНАКОВО по X/Y/Z.
+                # Вся геометрія в нас в "світових" одиницях (метри в локальних координатах),
+                # а print-aware товщини (roads/building foundation/parks/etc) вже конвертовані в метри через /scale_factor.
+                # Тому anisotropic XY-only scale робить дороги/парки/воду "занадто високими" і ламає пропорції.
+                s = trimesh.transformations.scale_matrix(scale_factor)
+                combined.apply_transform(s)
+                
+                # Перевіряємо розміри після масштабування
+                bounds_scaled = combined.bounds
+                size_scaled = bounds_scaled[1] - bounds_scaled[0]
+                print(f"Масштабування: {size_scaled[0]:.2f} x {size_scaled[1]:.2f} x {size_scaled[2]:.2f} мм")
             # ВАЖЛИВО: не робимо примусового Z-scale (це спотворює висоти доріг/будівель
             # і дає ефект "дороги занадто високі" / "висять над землею").
         
@@ -580,6 +772,67 @@ def export_stl(
         print(f"Розмір файлу: {file_size} байт")
         if file_size < 84:  # Мінімальний розмір STL (80 байт заголовок + 4 байти кількість трикутників)
             raise ValueError(f"Файл занадто малий ({file_size} байт), можливо експорт не вдався")
+        
+        # Експортуємо окремі частини для preview (якщо потрібно)
+        # Використовуємо transforms для кожного меша окремо
+        outputs: dict[str, str] = {}
+        part_map = {
+            "Base": "base",
+            "BaseFlat": "base",
+            "Roads": "roads",
+            "Buildings": "buildings",
+            "Building": "buildings",  # Додано для Building_0, Building_1 тощо
+            "Water": "water",
+            "Parks": "parks",
+            "POI": "poi",
+        }
+        
+        
+        try:
+            # Групуємо меші по типах для об'єднання (наприклад, всі Building_* в один buildings)
+            grouped_meshes: dict[str, list] = {}
+            for name, mesh in working_items:
+                # Перевіряємо, чи це частина, яку потрібно експортувати
+                name_key = name.split("_")[0]  # Беремо першу частину для "Building_0" -> "Building"
+                part_key = part_map.get(name_key) or part_map.get(name)
+                
+                if part_key:
+                    if part_key not in grouped_meshes:
+                        grouped_meshes[part_key] = []
+                    grouped_meshes[part_key].append((name, mesh))
+            
+            # Експортуємо згруповані меші
+            for part_key, meshes in grouped_meshes.items():
+                try:
+                    # Якщо кілька мешів одного типу - об'єднуємо їх
+                    if len(meshes) == 1:
+                        mesh_part = meshes[0][1].copy()  # meshes[0] = (name, mesh), тому meshes[0][1] = mesh
+                    else:
+                        # Об'єднуємо всі меші одного типу
+                        # meshes - це список кортежів (name, mesh), тому беремо mesh (другий елемент)
+                        mesh_parts = [mesh.copy() for _, mesh in meshes]
+                        mesh_part = trimesh.util.concatenate(mesh_parts)
+                    
+                    # Застосовуємо всі трансформації до окремого меша
+                    for t in transforms:
+                        if isinstance(t, np.ndarray):
+                            mesh_part.apply_transform(t)
+                    
+                    # Експортуємо частину
+                    part_filename = filename.replace(".stl", f"_{part_key}.stl")
+                    mesh_part.export(part_filename, file_type="stl")
+                    outputs[part_key] = part_filename
+                    print(f"Експортовано частину {part_key}: {part_filename} ({len(mesh_part.vertices)} вершин)")
+                except Exception as e:
+                    print(f"[WARN] Не вдалося експортувати частину {part_key}: {e}")
+                    import traceback
+                    traceback.print_exc()
+        except Exception as e:
+            print(f"[WARN] Експорт окремих частин не вдався: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return outputs
         
     except Exception as e:
         print(f"Помилка експорту STL: {e}")

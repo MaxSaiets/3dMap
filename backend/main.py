@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import os
 import uuid
 from pathlib import Path
@@ -27,8 +27,44 @@ from services.green_processor import process_green_areas
 from services.poi_processor import process_pois
 from services.model_exporter import export_scene, export_preview_parts_stl
 from services.generation_task import GenerationTask
+from services.mesh_quality import improve_mesh_for_3d_printing, validate_mesh_for_3d_printing
+from services.global_center import get_or_create_global_center, set_global_center, get_global_center, GlobalCenter
+from services.hexagonal_grid import generate_hexagonal_grid, hexagons_to_geojson, validate_hexagonal_grid
+from shapely.ops import transform
 
 app = FastAPI(title="3D Map Generator API", version="1.0.0")
+
+def _transform_building_geometries_to_local(gdf_buildings, global_center: Optional[GlobalCenter]) -> Optional[List]:
+    """
+    Перетворює геометрії будівель з UTM в локальні координати для вирівнювання землі.
+    """
+    if gdf_buildings is None or gdf_buildings.empty or global_center is None:
+        return None
+    
+    try:
+        def to_local_transform(x, y, z=None):
+            """Трансформер: UTM -> локальні координати"""
+            x_local, y_local = global_center.to_local(x, y)
+            if z is not None:
+                return (x_local, y_local, z)
+            return (x_local, y_local)
+        
+        building_geometries_local = []
+        for geom in gdf_buildings.geometry.values:
+            if geom is not None and not geom.is_empty:
+                try:
+                    local_geom = transform(to_local_transform, geom)
+                    if local_geom is not None and not local_geom.is_empty:
+                        building_geometries_local.append(local_geom)
+                except Exception as e:
+                    print(f"[WARN] Не вдалося перетворити геометрію будівлі для flatten: {e}")
+                    continue
+        
+        print(f"[DEBUG] Перетворено {len(building_geometries_local)} геометрій будівель в локальні координати для flatten")
+        return building_geometries_local if building_geometries_local else None
+    except Exception as e:
+        print(f"[WARN] Помилка перетворення building_geometries для flatten: {e}")
+        return None
 
 # CORS налаштування для інтеграції з frontend
 app.add_middleware(
@@ -41,6 +77,8 @@ app.add_middleware(
 
 # Зберігання задач генерації
 tasks: dict[str, GenerationTask] = {}
+# Зберігання зв'язків між множинними задачами (task_id -> list of task_ids)
+multiple_tasks_map: dict[str, list[str]] = {}
 
 # Директорія для збереження згенерованих файлів
 OUTPUT_DIR = Path("output")
@@ -77,29 +115,40 @@ class GenerationRequest(BaseModel):
     poi_embed_mm: float = Field(default=0.2, ge=0.0, le=2.0)
     water_depth: float = 2.0  # мм
     terrain_enabled: bool = True
-    terrain_z_scale: float = 1.5
+    terrain_z_scale: float = 3.0  # Збільшено для кращої видимості рельєфу
     # Тонка основа для друку: за замовчуванням 2мм (користувач може збільшити).
     terrain_base_thickness_mm: float = Field(default=2.0, ge=1.0, le=20.0)
     # Деталізація рельєфу
     # - terrain_resolution: кількість точок по осі (mesh деталь). Вища = детальніше, повільніше.
-    terrain_resolution: int = Field(default=180, ge=80, le=320)
+    terrain_resolution: int = Field(default=350, ge=80, le=600)  # Висока деталізація для максимально плавного рельєфу
+    # Subdivision: додаткова деталізація mesh після створення (для ще плавнішого рельєфу)
+    terrain_subdivide: bool = Field(default=True, description="Застосувати subdivision для плавнішого mesh")
+    terrain_subdivide_levels: int = Field(default=1, ge=0, le=2, description="Рівні subdivision (0-2, більше = плавніше але повільніше)")
     # - terrarium_zoom: зум DEM tiles (Terrarium). Вища = детальніше, але більше тайлів.
     terrarium_zoom: int = Field(default=15, ge=10, le=16)
     # Згладжування рельєфу (sigma в клітинках heightfield). 0 = без згладжування.
-    # Допомагає прибрати “грубі грані/шум” на DEM, особливо при високому zoom.
-    terrain_smoothing_sigma: float = Field(default=0.6, ge=0.0, le=3.0)
+    # Допомагає прибрати "грубі грані/шум" на DEM, особливо при високому zoom.
+    terrain_smoothing_sigma: float = Field(default=2.0, ge=0.0, le=5.0)  # Оптимальне згладжування для ідеального рельєфу
     # Terrain-first стабілізація: вирівняти (flatten) рельєф під будівлями, щоб будівлі не були "криво" на схилах/шумному DEM.
     flatten_buildings_on_terrain: bool = True
     # Terrain-first стабілізація для доріг: робить дороги більш читабельними на малому масштабі і прибирає "шипи" на бокових стінках.
     flatten_roads_on_terrain: bool = True
     export_format: str = "3mf"  # "stl" або "3mf"
     model_size_mm: float = 100.0  # Розмір моделі в міліметрах (за замовчуванням 100мм = 10см)
+    # Контекст навколо зони (в метрах): завантажуємо OSM/Extras з більшим bbox,
+    # але фінальні меші все одно обрізаємо по полігону зони.
+    # Це потрібно, щоб коректно визначати мости/перетини біля краю зони.
+    context_padding_m: float = Field(default=400.0, ge=0.0, le=5000.0)
+    # Тестування: генерувати тільки рельєф без будівель/доріг/води (за замовчуванням False - повна модель)
+    terrain_only: bool = False  # Тестовий режим вимкнено за замовчуванням
 
 
 class GenerationResponse(BaseModel):
     """Відповідь з ID задачі"""
     task_id: str
     status: str
+    message: Optional[str] = None
+    all_task_ids: Optional[List[str]] = None  # Для множинних зон
 
 
 @app.get("/")
@@ -125,8 +174,39 @@ async def generate_model(request: GenerationRequest, background_tasks: Backgroun
 @app.get("/api/status/{task_id}")
 async def get_status(task_id: str):
     """
-    Отримує статус задачі генерації
+    Отримує статус задачі генерації або множинних задач
     """
+    # Перевіряємо, чи це batch запит на множинні задачі (формат: batch_<uuid>)
+    if task_id.startswith("batch_"):
+        all_task_ids_list = multiple_tasks_map.get(task_id)
+        if not all_task_ids_list:
+            raise HTTPException(status_code=404, detail="Multiple tasks not found")
+        
+        # Повертаємо статус всіх задач
+        tasks_status = []
+        for tid in all_task_ids_list:
+            if tid in tasks:
+                t = tasks[tid]
+                output_files = getattr(t, "output_files", {}) or {}
+                tasks_status.append({
+                    "task_id": tid,
+                    "status": t.status,
+                    "progress": t.progress,
+                    "message": t.message,
+                    "output_file": t.output_file,
+                    "output_files": output_files,
+                    "download_url": f"/api/download/{tid}" if t.status == "completed" else None,
+                })
+        
+        return {
+            "task_id": task_id,
+            "status": "multiple",
+            "tasks": tasks_status,
+            "total": len(tasks_status),
+            "completed": sum(1 for t in tasks_status if t["status"] == "completed"),
+            "all_task_ids": all_task_ids_list
+        }
+    
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
@@ -268,58 +348,523 @@ async def get_test_model_part(part_name: str):
     return FileResponse(str(file_path), media_type="model/stl", filename=file_path.name)
 
 
-async def generate_model_task(task_id: str, request: GenerationRequest):
+@app.post("/api/global-center")
+async def set_global_center_endpoint(center_lat: float = Query(...), center_lon: float = Query(...), utm_zone: Optional[int] = Query(None)):
+    """
+    Встановлює глобальний центр карти для синхронізації квадратів
+    
+    Args:
+        center_lat: Широта глобального центру (WGS84)
+        center_lon: Довгота глобального центру (WGS84)
+        utm_zone: UTM зона (опціонально, визначається автоматично якщо не вказано)
+    
+    Returns:
+        Інформація про встановлений центр
+    """
+    try:
+        global_center = set_global_center(center_lat, center_lon, utm_zone)
+        center_x_utm, center_y_utm = global_center.get_center_utm()
+        return {
+            "status": "success",
+            "center": {
+                "lat": center_lat,
+                "lon": center_lon,
+                "utm_zone": global_center.utm_zone,
+                "utm_x": center_x_utm,
+                "utm_y": center_y_utm,
+            },
+            "message": f"Глобальний центр встановлено: ({center_lat:.6f}, {center_lon:.6f})"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Помилка встановлення глобального центру: {str(e)}")
+
+
+@app.get("/api/global-center")
+async def get_global_center_endpoint():
+    """
+    Отримує поточний глобальний центр карти
+    
+    Returns:
+        Інформація про поточний центр або null якщо не встановлено
+    """
+    global_center = get_global_center()
+    if global_center is None:
+        return {"status": "not_set", "center": None}
+    
+    center_x_utm, center_y_utm = global_center.get_center_utm()
+    return {
+        "status": "set",
+        "center": {
+            "lat": global_center.center_lat,
+            "lon": global_center.center_lon,
+            "utm_zone": global_center.utm_zone,
+            "utm_x": center_x_utm,
+            "utm_y": center_y_utm,
+        }
+    }
+
+
+class HexagonalGridRequest(BaseModel):
+    """Запит для генерації сітки (шестикутники або квадрати)"""
+    north: float
+    south: float
+    east: float
+    west: float
+    hex_size_m: float = Field(default=1000.0, ge=100.0, le=10000.0)  # 1 км за замовчуванням
+    grid_type: str = Field(default="hexagonal", description="Тип сітки: 'hexagonal' (шестикутники) або 'square' (квадрати)")
+
+
+class HexagonalGridResponse(BaseModel):
+    """Відповідь з гексагональною сіткою"""
+    geojson: dict
+    hex_count: int
+    is_valid: bool
+    validation_errors: List[str] = []
+
+
+@app.post("/api/hexagonal-grid", response_model=HexagonalGridResponse)
+async def generate_hexagonal_grid_endpoint(request: HexagonalGridRequest):
+    """
+    Генерує гексагональну сітку для заданої області.
+    Шестикутники мають розмір hex_size_m (за замовчуванням 1 км).
+    """
+    try:
+        print(f"[DEBUG] Hexagonal grid request: north={request.north}, south={request.south}, east={request.east}, west={request.west}, hex_size_m={request.hex_size_m}")
+        
+        # Перевірка валідності координат
+        if request.north <= request.south or request.east <= request.west:
+            raise ValueError(f"Невірні координати: north={request.north} <= south={request.south} або east={request.east} <= west={request.west}")
+        
+        # Конвертуємо lat/lon bbox в UTM для генерації сітки
+        from services.crs_utils import bbox_latlon_to_utm
+        bbox_utm = bbox_latlon_to_utm(
+            request.north, request.south, request.east, request.west
+        )
+        bbox_meters = bbox_utm[:4]  # (minx, miny, maxx, maxy)
+        to_wgs84 = bbox_utm[6]  # Функція для конвертації UTM -> WGS84 (індекс 6)
+        
+        print(f"[DEBUG] Bbox в UTM: {bbox_meters}")
+        print(f"[DEBUG] to_wgs84 функція доступна: {to_wgs84 is not None}")
+        
+        # Генеруємо сітку (шестикутники або квадрати)
+        grid_type = request.grid_type.lower() if hasattr(request, 'grid_type') else 'hexagonal'
+        if grid_type == 'square':
+            from services.hexagonal_grid import generate_square_grid
+            cells = generate_square_grid(bbox_meters, square_size_m=request.hex_size_m)
+            print(f"[DEBUG] Згенеровано {len(cells)} квадратів")
+        else:
+            cells = generate_hexagonal_grid(bbox_meters, hex_size_m=request.hex_size_m)
+            print(f"[DEBUG] Згенеровано {len(cells)} шестикутників")
+        
+        # Конвертуємо в GeoJSON з конвертацією координат UTM -> WGS84
+        geojson = hexagons_to_geojson(cells, to_wgs84=to_wgs84)
+        
+        # Перевіряємо перший feature для діагностики
+        if geojson['features']:
+            first_feature = geojson['features'][0]
+            first_coords = first_feature['geometry']['coordinates'][0]
+            if first_coords:
+                print(f"[DEBUG] Перший шестикутник координати (перша точка): {first_coords[0]}")
+        
+        # Валідуємо сітку (тільки для шестикутників)
+        is_valid = True
+        errors = []
+        if grid_type == 'hexagonal':
+            is_valid, errors = validate_hexagonal_grid(cells)
+            if errors:
+                print(f"[WARN] Помилки валідації сітки: {errors}")
+        
+        return HexagonalGridResponse(
+            geojson=geojson,
+            hex_count=len(cells),
+            is_valid=is_valid,
+            validation_errors=errors
+        )
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[ERROR] Помилка генерації сітки: {e}\n{error_trace}")
+        raise HTTPException(status_code=500, detail=f"Помилка генерації сітки: {str(e)}")
+
+
+class ZoneGenerationRequest(BaseModel):
+    """Запит для генерації моделей для вибраних зон"""
+    model_config = ConfigDict(protected_namespaces=())
+    
+    zones: List[dict]  # Список зон (GeoJSON features)
+    # Всі інші параметри як у GenerationRequest
+    model_size_mm: float = Field(default=100.0, ge=10.0, le=500.0)
+    road_width_multiplier: float = Field(default=0.8, ge=0.1, le=5.0)
+    road_height_mm: float = Field(default=0.5, ge=0.1, le=10.0)
+    road_embed_mm: float = Field(default=0.3, ge=0.0, le=5.0)
+    building_min_height: float = Field(default=5.0, ge=1.0, le=100.0)
+    building_height_multiplier: float = Field(default=1.8, ge=0.1, le=10.0)
+    building_foundation_mm: float = Field(default=0.6, ge=0.0, le=10.0)
+    building_embed_mm: float = Field(default=0.2, ge=0.0, le=5.0)
+    building_max_foundation_mm: float = Field(default=5.0, ge=0.0, le=20.0)
+    water_depth: float = Field(default=2.0, ge=0.1, le=10.0)
+    terrain_enabled: bool = True
+    terrain_z_scale: float = Field(default=0.5, ge=0.1, le=10.0)
+    terrain_base_thickness_mm: float = Field(default=2.0, ge=1.0, le=20.0)
+    terrain_resolution: int = Field(default=180, ge=50, le=500)
+    terrarium_zoom: int = Field(default=15, ge=10, le=18)
+    terrain_smoothing_sigma: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    terrain_subdivide: bool = False
+    terrain_subdivide_levels: int = Field(default=1, ge=1, le=3)
+    flatten_buildings_on_terrain: bool = True
+    flatten_roads_on_terrain: bool = False
+    export_format: str = Field(default="3mf", pattern="^(stl|3mf)$")
+    context_padding_m: float = Field(default=400.0, ge=0.0, le=5000.0)
+
+
+@app.post("/api/generate-zones", response_model=GenerationResponse)
+async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tasks: BackgroundTasks):
+    """
+    Генерує 3D моделі для вибраних зон гексагональної сітки.
+    Кожна зона генерується як окрема модель.
+    """
+    if not request.zones or len(request.zones) == 0:
+        raise HTTPException(status_code=400, detail="Не вибрано жодної зони")
+    
+    task_ids = []
+    
+    for zone_idx, zone in enumerate(request.zones):
+        # Отримуємо bbox з зони
+        geometry = zone.get('geometry', {})
+        if geometry.get('type') != 'Polygon':
+            continue
+        
+        coordinates = geometry.get('coordinates', [])
+        if not coordinates or len(coordinates) == 0:
+            continue
+        
+        # Знаходимо min/max координати
+        all_coords = [coord for ring in coordinates for coord in ring]
+        lons = [coord[0] for coord in all_coords]
+        lats = [coord[1] for coord in all_coords]
+        
+        zone_bbox = {
+            'north': max(lats),
+            'south': min(lats),
+            'east': max(lons),
+            'west': min(lons)
+        }
+        
+        # Створюємо GenerationRequest для цієї зони
+        # Використовуємо дефолтне значення для terrain_smoothing_sigma якщо None
+        terrain_smoothing_sigma = request.terrain_smoothing_sigma if request.terrain_smoothing_sigma is not None else 2.0
+        
+        zone_request = GenerationRequest(
+            north=zone_bbox['north'],
+            south=zone_bbox['south'],
+            east=zone_bbox['east'],
+            west=zone_bbox['west'],
+            model_size_mm=request.model_size_mm,
+            road_width_multiplier=request.road_width_multiplier,
+            road_height_mm=request.road_height_mm,
+            road_embed_mm=request.road_embed_mm,
+            building_min_height=request.building_min_height,
+            building_height_multiplier=request.building_height_multiplier,
+            building_foundation_mm=request.building_foundation_mm,
+            building_embed_mm=request.building_embed_mm,
+            building_max_foundation_mm=request.building_max_foundation_mm,
+            water_depth=request.water_depth,
+            terrain_enabled=request.terrain_enabled,
+            terrain_z_scale=request.terrain_z_scale,
+            terrain_base_thickness_mm=request.terrain_base_thickness_mm,
+            terrain_resolution=request.terrain_resolution,
+            terrarium_zoom=request.terrarium_zoom,
+            terrain_smoothing_sigma=terrain_smoothing_sigma,
+            terrain_subdivide=request.terrain_subdivide if request.terrain_subdivide is not None else False,
+            terrain_subdivide_levels=request.terrain_subdivide_levels if request.terrain_subdivide_levels is not None else 1,
+            flatten_buildings_on_terrain=request.flatten_buildings_on_terrain,
+            flatten_roads_on_terrain=request.flatten_roads_on_terrain if request.flatten_roads_on_terrain is not None else False,
+            export_format=request.export_format,
+            context_padding_m=request.context_padding_m,
+            terrain_only=False
+        )
+        
+        # Генеруємо модель для зони
+        task_id = str(uuid.uuid4())
+        zone_id_str = zone.get('id', f'zone_{zone_idx}')
+        task = GenerationTask(task_id=task_id, request=zone_request)
+        tasks[task_id] = task
+        
+        # Зберігаємо форму зони (полігон) для обрізання мешів
+        zone_polygon_coords = coordinates[0] if coordinates else None  # Зовнішній ring полігону
+        
+        print(f"[INFO] Створюємо задачу {task_id} для зони {zone_id_str} (зона {zone_idx + 1}/{len(request.zones)})")
+        print(f"[DEBUG] Zone bbox: north={zone_bbox['north']:.6f}, south={zone_bbox['south']:.6f}, east={zone_bbox['east']:.6f}, west={zone_bbox['west']:.6f}")
+        
+        background_tasks.add_task(
+            generate_model_task,
+            task_id=task_id,
+            request=zone_request,
+            zone_id=zone_id_str,
+            zone_polygon_coords=zone_polygon_coords  # Передаємо координати полігону для обрізання
+        )
+        
+        task_ids.append(task_id)
+        print(f"[DEBUG] Задача {task_id} додана до background_tasks. Всього задач: {len(task_ids)}")
+    
+    if len(task_ids) == 0:
+        raise HTTPException(status_code=400, detail="Не вдалося створити задачі для зон")
+    
+    print(f"[INFO] Створено {len(task_ids)} задач для генерації зон: {task_ids}")
+    
+    # Зберігаємо зв'язок для множинних задач
+    # ВАЖЛИВО: груповий task_id має бути унікальним, інакше multiple_2 буде колізити між запусками
+    if len(task_ids) > 1:
+        main_task_id = f"batch_{uuid.uuid4()}"
+        multiple_tasks_map[main_task_id] = task_ids
+        print(f"[INFO] Batch задачі: {main_task_id} -> {task_ids}")
+    else:
+        main_task_id = task_ids[0]
+    
+    # Повертаємо список task_id
+    return GenerationResponse(
+        task_id=main_task_id,
+        status="processing",
+        message=f"Створено {len(task_ids)} задач для генерації зон",
+        all_task_ids=task_ids  # Додаємо список всіх task_id
+    )
+
+
+async def generate_model_task(task_id: str, request: GenerationRequest, zone_id: Optional[str] = None, zone_polygon_coords: Optional[list] = None):
     """
     Фонова задача генерації 3D моделі
     """
+    print(f"[INFO] === ПОЧАТОК ГЕНЕРАЦІЇ МОДЕЛІ === Task ID: {task_id}, Zone ID: {zone_id}")
     task = tasks[task_id]
+    zone_prefix = f"[{zone_id}] " if zone_id else ""
     
     try:
-        task.update_status("processing", 10, "Завантаження даних OSM...")
-        
-        # 1. Завантаження даних
-        gdf_buildings, gdf_water, G_roads = fetch_city_data(
-            request.north, request.south, request.east, request.west
-        )
-        
-        task.update_status("processing", 20, "Генерація рельєфу...")
+        # 0) Глобальний центр (потрібний для коректної локальної системи координат + padding bbox)
+        latlon_bbox = (request.north, request.south, request.east, request.west)
+        global_center = get_or_create_global_center(bbox_latlon=latlon_bbox)
+        print(f"[INFO] Використовується глобальний центр: lat={global_center.center_lat:.6f}, lon={global_center.center_lon:.6f}")
 
-        # 2) Розрахунок bounds/scale_factor РАНО і ЗАВЖДИ (навіть коли рельєф вимкнено),
-        # щоб "mm on model" параметри (дороги/фундамент/embedding) працювали завжди.
-        # scale_factor: (мм на моделі) / (метри у світі)  =>  мм/м
-        import osmnx as ox
-        minx = miny = -500.0
-        maxx = maxy = 500.0
-        try:
-            if gdf_buildings is not None and not gdf_buildings.empty:
-                minx, miny, maxx, maxy = gdf_buildings.total_bounds
-            else:
-                gdf_edges = None
-                if G_roads is not None:
-                    if hasattr(G_roads, "total_bounds"):
-                        gdf_edges = G_roads
-                    else:
-                        gdf_edges = ox.graph_to_gdfs(G_roads, nodes=False)
-                if gdf_edges is not None and not gdf_edges.empty:
-                    minx, miny, maxx, maxy = gdf_edges.total_bounds
-        except Exception:
-            pass
+        # 1) bbox_meters (локальні координати) + scale_factor
+        from services.crs_utils import bbox_latlon_to_utm
+        bbox_utm_result = bbox_latlon_to_utm(request.north, request.south, request.east, request.west)
+        bbox_utm_coords = bbox_utm_result[:4]  # (minx, miny, maxx, maxy) в UTM
 
-        bbox_meters = (float(minx), float(miny), float(maxx), float(maxy))
+        minx_utm, miny_utm, maxx_utm, maxy_utm = bbox_utm_coords
+        minx_local, miny_local = global_center.to_local(minx_utm, miny_utm)
+        maxx_local, maxy_local = global_center.to_local(maxx_utm, maxy_utm)
+
+        bbox_meters = (float(minx_local), float(miny_local), float(maxx_local), float(maxy_local))
+        print(f"[DEBUG] Bbox для зони (локальні координати): {bbox_meters}")
+
         scale_factor = None
         try:
-            size_x = float(maxx - minx)
-            size_y = float(maxy - miny)
+            size_x = float(maxx_local - minx_local)
+            size_y = float(maxy_local - miny_local)
             avg_xy = (size_x + size_y) / 2.0 if (size_x > 0 and size_y > 0) else max(size_x, size_y)
             if avg_xy and avg_xy > 0:
                 scale_factor = float(request.model_size_mm) / float(avg_xy)
-        except Exception:
+                print(f"[DEBUG] Scale factor для зони: {scale_factor:.6f} мм/м (розмір зони: {size_x:.1f} x {size_y:.1f} м)")
+        except Exception as e:
+            print(f"[WARN] Помилка обчислення scale_factor: {e}")
             scale_factor = None
 
-        # 2.1 Генерація рельєфу (якщо увімкнено) - СПОЧАТКУ, щоб мати TerrainProvider
+        # 2) Контекстний bbox для OSM/Extras (padding навколо зони), щоб бачити мости/перетини біля межі.
+        # Фінальний меш все одно обріжемо строго по полігону зони.
+        ctx_north, ctx_south, ctx_east, ctx_west = request.north, request.south, request.east, request.west
+        try:
+            pad_m = float(getattr(request, "context_padding_m", 0.0) or 0.0)
+            if pad_m > 0 and global_center is not None:
+                # Конвертуємо bbox в UTM, розширюємо на pad_m, повертаємо назад в WGS84
+                x1, y1 = global_center.to_utm(ctx_west, ctx_south)
+                x2, y2 = global_center.to_utm(ctx_east, ctx_north)
+                minx = float(min(x1, x2) - pad_m)
+                maxx = float(max(x1, x2) + pad_m)
+                miny = float(min(y1, y2) - pad_m)
+                maxy = float(max(y1, y2) + pad_m)
+                lon_w, lat_s = global_center.to_wgs84(minx, miny)
+                lon_e, lat_n = global_center.to_wgs84(maxx, maxy)
+                ctx_north, ctx_south, ctx_east, ctx_west = float(lat_n), float(lat_s), float(lon_e), float(lon_w)
+                print(f"[DEBUG] Context bbox (+{pad_m:.0f}m): north={ctx_north:.6f}, south={ctx_south:.6f}, east={ctx_east:.6f}, west={ctx_west:.6f}")
+        except Exception as e:
+            print(f"[WARN] Не вдалося порахувати context bbox: {e}")
+
+        task.update_status("processing", 10, "Завантаження даних OSM (з контекстом)...")
+
+        # 3) Завантаження даних (OSM/Extras) з контекстним bbox
+        gdf_buildings, gdf_water, G_roads = fetch_city_data(ctx_north, ctx_south, ctx_east, ctx_west)
+
+        task.update_status("processing", 20, "Генерація рельєфу...")
+        
+        # Тестування: якщо terrain_only=True, генеруємо тільки рельєф та воду (без будівель, доріг)
+        # ВАЖЛИВО: перевіряємо terrain_only ДО створення рельєфу, щоб не вирівнювати під будівлями/дорогами
+        if request.terrain_only:
+            task.update_status("processing", 25, "Створення рельєфу для тестування (з водою, без будівель, доріг)...")
+            
+            # Створюємо рельєф БЕЗ урахування будівель, доріг, АЛЕ З водою
+            source_crs = None
+            try:
+                if gdf_buildings is not None and not gdf_buildings.empty:
+                    source_crs = gdf_buildings.crs
+                elif G_roads is not None and hasattr(G_roads, "crs"):
+                    source_crs = getattr(G_roads, "crs", None)
+            except Exception:
+                pass
+            
+            # water depth in meters (world units before scaling)
+            # ВАЖЛИВО: обчислюємо water_depth_m ПЕРЕД створенням рельєфу, щоб правильно вирізати depression
+            water_depth_m = None
+            has_water = gdf_water is not None and not gdf_water.empty
+            if has_water:
+                if scale_factor and scale_factor > 0:
+                    water_depth_m = float(request.water_depth) / float(scale_factor)
+                else:
+                    # Fallback: використовуємо приблизну глибину (2мм на моделі = ~0.002м у світі для 100мм моделі)
+                    water_depth_m = float(request.water_depth) / 1000.0  # мм -> метри
+            
+            # Передаємо water_geometries тільки якщо є вода та water_depth_m > 0
+            water_geoms_for_terrain = None
+            water_depth_for_terrain = 0.0
+            if has_water and water_depth_m is not None and water_depth_m > 0:
+                water_geoms_for_terrain = list(gdf_water.geometry.values)
+                water_depth_for_terrain = float(water_depth_m)
+            
+            terrain_mesh, terrain_provider = create_terrain_mesh(
+                bbox_meters,
+                z_scale=request.terrain_z_scale,
+                resolution=request.terrain_resolution,
+                latlon_bbox=latlon_bbox,
+                source_crs=source_crs,
+                terrarium_zoom=request.terrarium_zoom,
+                base_thickness=(float(request.terrain_base_thickness_mm) / float(scale_factor)) if scale_factor else 5.0,
+                flatten_buildings=False,  # Не вирівнюємо під будівлями в тестовому режимі
+                building_geometries=None,  # Немає будівель
+                flatten_roads=False,  # Немає доріг
+                road_geometries=None,
+                smoothing_sigma=float(request.terrain_smoothing_sigma) if request.terrain_smoothing_sigma is not None else 0.0,
+                water_geometries=water_geoms_for_terrain,  # Додаємо воду тільки якщо є вода та depth > 0
+                water_depth_m=water_depth_for_terrain,  # Глибина depression в рельєфі
+                # Subdivision для плавнішого mesh
+                subdivide=bool(request.terrain_subdivide),
+                subdivide_levels=int(request.terrain_subdivide_levels),
+                global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для синхронізації
+            )
+            
+            if terrain_mesh is None:
+                raise ValueError("Terrain mesh не створено, але terrain_only=True. Переконайтеся, що terrain_enabled=True або вказано валідні координати.")
+            
+            # Створюємо water mesh для тестового режиму
+            # ВАЖЛИВО: water_surface має бути на рівні ground + depth_meters, де ground вже включає depression
+            water_mesh = None
+            print(f"[DEBUG] Water check: has_water={has_water}, terrain_provider={'OK' if terrain_provider else 'None'}, water_depth_m={water_depth_m}")
+            if has_water:
+                print(f"[DEBUG] gdf_water: {len(gdf_water)} об'єктів")
+            if has_water and terrain_provider is not None and water_depth_m is not None and water_depth_m > 0:
+                task.update_status("processing", 30, "Створення води для тестування...")
+                from services.water_processor import process_water_surface
+                
+                # Збільшуємо товщину води для кращої видимості (1.5-3.0мм на моделі)
+                # Використовуємо 30-50% від глибини води, але мінімум 1.5мм для видимості
+                min_thickness_mm = 1.5  # Мінімальна товщина для видимості
+                max_thickness_mm = min(request.water_depth * 0.5, 3.0)  # Максимум 50% глибини або 3мм
+                surface_mm = float(max(min_thickness_mm, min(max_thickness_mm, request.water_depth * 0.4)))
+                thickness_m = float(surface_mm) / float(scale_factor) if scale_factor else (water_depth_m * 0.4)
+                water_mesh = process_water_surface(
+                    gdf_water,
+                    thickness_m=float(thickness_m),
+                    depth_meters=float(water_depth_m),
+                    terrain_provider=terrain_provider,
+                    global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для перетворення координат
+                )
+                if water_mesh:
+                    print(f"Вода: {len(water_mesh.vertices)} вершин, {len(water_mesh.faces)} граней")
+                else:
+                    print(f"[WARN] Water mesh не створено! Перевірте gdf_water та параметри")
+            else:
+                print(f"[WARN] Water не створюється: has_water={has_water}, terrain_provider={'OK' if terrain_provider else 'None'}, water_depth_m={water_depth_m}")
+        
+            # Експортуємо рельєф та воду
+            task.update_status("processing", 90, "Експорт рельєфу та води (тестовий режим)...")
+            primary_format = request.export_format.lower()
+            output_file = OUTPUT_DIR / f"{task_id}.{primary_format}"
+            output_file_abs = output_file.resolve()
+            
+            export_scene(
+                terrain_mesh=terrain_mesh,
+                road_mesh=None,
+                building_meshes=None,
+                water_mesh=water_mesh,  # Додаємо воду
+                parks_mesh=None,
+                poi_mesh=None,
+                filename=str(output_file_abs),
+                format=request.export_format,
+                model_size_mm=request.model_size_mm,
+                add_flat_base=True,
+                base_thickness_mm=float(request.terrain_base_thickness_mm),
+            )
+            
+            # STL для preview якщо обрано 3MF
+            if primary_format == "3mf":
+                stl_preview_abs = (OUTPUT_DIR / f"{task_id}.stl").resolve()
+                export_scene(
+                    terrain_mesh=terrain_mesh,
+                    road_mesh=None,
+                    building_meshes=None,
+                    water_mesh=water_mesh,  # Додаємо воду
+                    parks_mesh=None,
+                    poi_mesh=None,
+                    filename=str(stl_preview_abs),
+                    format="stl",
+                    model_size_mm=request.model_size_mm,
+                    add_flat_base=not request.terrain_enabled,
+                    base_thickness_mm=2.0,
+                )
+                task.set_output("stl", str(stl_preview_abs))
+            
+            task.set_output(primary_format, str(output_file_abs))
+            task.complete(str(output_file_abs))
+            task.update_status("completed", 100, "Рельєф та вода готові!")
+            print(f"[OK] Terrain-only задача {task_id} завершена. Файл: {output_file_abs}")
+            return
+        
+        # 2.1 Генерація рельєфу (якщо увімкнено і НЕ terrain_only) - СПОЧАТКУ, щоб мати TerrainProvider
+        # ВИПРАВЛЕННЯ: Перетворюємо координати будівель ОДИН РАЗ на початку
+        gdf_buildings_local = None
+        building_geometries_for_flatten = None
+        if gdf_buildings is not None and not gdf_buildings.empty and global_center is not None:
+            try:
+                print(f"[DEBUG] Перетворюємо координати будівель ОДИН РАЗ для використання в flatten та process_buildings")
+                def to_local_transform(x, y, z=None):
+                    """Трансформер: UTM -> локальні координати"""
+                    x_local, y_local = global_center.to_local(x, y)
+                    if z is not None:
+                        return (x_local, y_local, z)
+                    return (x_local, y_local)
+                
+                # Створюємо копію з перетвореними координатами
+                gdf_buildings_local = gdf_buildings.copy()
+                gdf_buildings_local['geometry'] = gdf_buildings_local['geometry'].apply(
+                    lambda geom: transform(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
+                )
+                
+                # Створюємо список геометрій для flatten (в локальних координатах)
+                building_geometries_for_flatten = []
+                for geom in gdf_buildings_local.geometry.values:
+                    if geom is not None and not geom.is_empty:
+                        building_geometries_for_flatten.append(geom)
+                
+                print(f"[DEBUG] Перетворено {len(building_geometries_for_flatten)} геометрій будівель в локальні координати")
+            except Exception as e:
+                print(f"[WARN] Помилка перетворення координат будівель: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback: використовуємо оригінальні дані
+                gdf_buildings_local = gdf_buildings
+                building_geometries_for_flatten = list(gdf_buildings.geometry.values) if not gdf_buildings.empty else None
+        
         terrain_mesh = None
         terrain_provider = None
-        if request.terrain_enabled:
+        if request.terrain_enabled and not request.terrain_only:
+            task.update_status("processing", 20, "Генерація рельєфу...")
             latlon_bbox = (request.north, request.south, request.east, request.west)
             source_crs = None
             try:
@@ -353,11 +898,18 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
                 # base_thickness в метрах; конвертуємо з "мм на моделі" -> "метри у світі"
                 base_thickness=(float(request.terrain_base_thickness_mm) / float(scale_factor)) if scale_factor else 5.0,
                 flatten_buildings=bool(request.flatten_buildings_on_terrain),
-                building_geometries=list(gdf_buildings.geometry.values) if (gdf_buildings is not None and not gdf_buildings.empty) else None,
+                building_geometries=building_geometries_for_flatten,  # ВИПРАВЛЕННЯ: використовуємо вже перетворені координати
+                flatten_roads=bool(request.flatten_roads_on_terrain),
+                road_geometries=merged_roads_geom,
                 smoothing_sigma=float(request.terrain_smoothing_sigma) if request.terrain_smoothing_sigma is not None else 0.0,
                 # water depression terrain-first
                 water_geometries=list(gdf_water.geometry.values) if (gdf_water is not None and not gdf_water.empty) else None,
                 water_depth_m=float(water_depth_m) if water_depth_m is not None else 0.0,
+                global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для синхронізації
+                bbox_is_local=True,  # ВАЖЛИВО: bbox_meters вже в локальних координатах
+                # Subdivision для плавнішого mesh
+                subdivide=bool(request.terrain_subdivide),
+                subdivide_levels=int(request.terrain_subdivide_levels),
             )
         
         task.update_status("processing", 40, "Обробка доріг...")
@@ -370,14 +922,31 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
             road_height_m = float(request.road_height_mm) / float(scale_factor)
             road_embed_m = float(request.road_embed_mm) / float(scale_factor)
 
-        road_mesh = process_roads(
-            G_roads,
-            request.road_width_multiplier,
-            terrain_provider=terrain_provider,
-            road_height=float(road_height_m) if road_height_m is not None else 1.0,
-            road_embed=float(road_embed_m) if road_embed_m is not None else 0.0,
-            merged_roads=locals().get("merged_roads_geom"),
-        )
+        # Підготовка водних геометрій для визначення мостів
+        water_geoms_for_bridges = None
+        if gdf_water is not None and not gdf_water.empty:
+            try:
+                water_geoms_for_bridges = list(gdf_water.geometry.values)
+            except Exception:
+                water_geoms_for_bridges = None
+        
+        road_mesh = None
+        if G_roads is not None:
+            road_mesh = process_roads(
+                G_roads,
+                request.road_width_multiplier,
+                terrain_provider=terrain_provider,
+                road_height=float(road_height_m) if road_height_m is not None else 1.0,
+                road_embed=float(road_embed_m) if road_embed_m is not None else 0.0,
+                merged_roads=locals().get("merged_roads_geom"),
+                water_geometries=water_geoms_for_bridges,  # Для визначення мостів
+                bridge_height_multiplier=1.0,  # Множник висоти мостів
+                global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для перетворення координат
+            )
+            if road_mesh is None:
+                print("[WARN] process_roads повернув None")
+        else:
+            print("[WARN] G_roads is None, дороги не обробляються")
         
         task.update_status("processing", 50, "Обробка будівель...")
         
@@ -390,14 +959,19 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
             embed_m = float(request.building_embed_mm) / float(scale_factor)
             max_foundation_m = float(request.building_max_foundation_mm) / float(scale_factor)
 
+        # ВИПРАВЛЕННЯ: Передаємо вже перетворені координати (якщо вони були перетворені)
+        buildings_for_processing = gdf_buildings_local if gdf_buildings_local is not None else gdf_buildings
+
         building_meshes = process_buildings(
-            gdf_buildings,
+            buildings_for_processing,  # ВИПРАВЛЕННЯ: використовуємо вже перетворені координати
             min_height=request.building_min_height,
             height_multiplier=request.building_height_multiplier,
             terrain_provider=terrain_provider,
             foundation_depth=float(foundation_m) if foundation_m is not None else 1.0,
             embed_depth=float(embed_m) if embed_m is not None else 0.0,
             max_foundation_depth=float(max_foundation_m) if max_foundation_m is not None else None,
+            global_center=None,  # ВИПРАВЛЕННЯ: координати вже перетворені, не потрібно перетворювати знову
+            coordinates_already_local=True,  # ВИПРАВЛЕННЯ: вказуємо, що координати вже в локальних
         )
         
         task.update_status("processing", 60, "Обробка води...")
@@ -422,6 +996,7 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
                     thickness_m=float(thickness_m),
                     depth_meters=float(water_depth_m),
                     terrain_provider=terrain_provider,
+                    global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для перетворення координат
                 )
             else:
                 water_mesh = process_water(
@@ -435,15 +1010,38 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
         parks_mesh = None
         poi_mesh = None
         try:
-            gdf_green, gdf_pois = fetch_extras(request.north, request.south, request.east, request.west)
+            # Extras також тягнемо з контекстним bbox, щоб не втрачати парки/POI на межі зони
+            gdf_green, gdf_pois = fetch_extras(ctx_north, ctx_south, ctx_east, ctx_west)
             if scale_factor and scale_factor > 0 and terrain_provider is not None:
                 if request.include_parks and gdf_green is not None and not gdf_green.empty:
+                    # ВАЖЛИВО: gdf_green приходить в UTM (метри), але terrain_provider + вся сцена вже в локальних координатах.
+                    # Якщо не перетворити, intersection з clip_box (локальним) обнулить все -> parks_mesh стане None.
+                    try:
+                        def to_local_transform(x, y, z=None):
+                            x_local, y_local = global_center.to_local(x, y)
+                            if z is not None:
+                                return (x_local, y_local, z)
+                            return (x_local, y_local)
+                        gdf_green = gdf_green.copy()
+                        gdf_green["geometry"] = gdf_green["geometry"].apply(
+                            lambda geom: transform(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
+                        )
+                    except Exception as e:
+                        print(f"[WARN] Не вдалося перетворити gdf_green в локальні координати: {e}")
+
                     parks_mesh = process_green_areas(
                         gdf_green,
                         height_m=float(request.parks_height_mm) / float(scale_factor),
                         embed_m=float(request.parks_embed_mm) / float(scale_factor),
                         terrain_provider=terrain_provider,
                     )
+                    if parks_mesh is None:
+                        print(f"[WARN] process_green_areas повернув None для {len(gdf_green)} парків")
+                else:
+                    if not request.include_parks:
+                        print("[INFO] Парки вимкнені (include_parks=False)")
+                    elif gdf_green is None or gdf_green.empty:
+                        print("[INFO] Немає даних про парки (gdf_green порожній)")
                 if request.include_pois and gdf_pois is not None and not gdf_pois.empty:
                     poi_mesh = process_pois(
                         gdf_pois,
@@ -451,18 +1049,142 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
                         height_m=float(request.poi_height_mm) / float(scale_factor),
                         embed_m=float(request.poi_embed_mm) / float(scale_factor),
                         terrain_provider=terrain_provider,
+                        global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для перетворення координат
                     )
         except Exception as e:
             print(f"[WARN] extras layers failed: {e}")
 
-        task.update_status("processing", 80, "Експорт моделі...")
+        task.update_status("processing", 75, "Покращення якості mesh для 3D принтера...")
+        
+        # 5.9 Покращення якості всіх mesh для 3D принтера
+        if terrain_mesh is not None:
+            terrain_mesh = improve_mesh_for_3d_printing(terrain_mesh, aggressive=True)
+            is_valid, mesh_warnings = validate_mesh_for_3d_printing(terrain_mesh, scale_factor=scale_factor, model_size_mm=request.model_size_mm)
+            if mesh_warnings:
+                print(f"[INFO] Попередження щодо якості terrain mesh:")
+                for w in mesh_warnings:
+                    print(f"  - {w}")
+        
+        if road_mesh is not None:
+            # Вже покращено в road_processor, але перевіряємо
+            is_valid, mesh_warnings = validate_mesh_for_3d_printing(road_mesh, scale_factor=scale_factor, model_size_mm=request.model_size_mm)
+            if mesh_warnings:
+                print(f"[INFO] Попередження щодо якості road mesh:")
+                for w in mesh_warnings:
+                    print(f"  - {w}")
+        
+        if building_meshes is not None:
+            improved_buildings = []
+            for i, bmesh in enumerate(building_meshes):
+                if bmesh is not None:
+                    improved = improve_mesh_for_3d_printing(bmesh, aggressive=True)
+                    improved_buildings.append(improved)
+            building_meshes = improved_buildings
+        
+        if water_mesh is not None:
+            water_mesh = improve_mesh_for_3d_printing(water_mesh, aggressive=True)
+        
+        if parks_mesh is not None:
+            parks_mesh = improve_mesh_for_3d_printing(parks_mesh, aggressive=True)
+        
+        if poi_mesh is not None:
+            poi_mesh = improve_mesh_for_3d_printing(poi_mesh, aggressive=True)
+        
+        task.update_status("processing", 80, "Обрізання мешів по bbox...")
+        
+        # 5.10 ВИПРАВЛЕННЯ: Обрізаємо всі меші по bbox зони (якщо він відрізняється від OSM bounds)
+        # Використовуємо більший tolerance для зон, щоб не втратити дані
+        from services.mesh_clipper import clip_mesh_to_bbox
+        
+        # Перевіряємо, чи bbox_meters відрізняється від зони (може бути більший через OSM bounds)
+        # Якщо так, обрізаємо меші по формі зони (полігон) або bbox зони
+        clip_tolerance = 10.0  # Збільшений tolerance для зон (10 метрів)
+        
+        # ВАЖЛИВО: Якщо є форма зони (полігон), обрізаємо по ній, інакше по bbox
+        from services.mesh_clipper import clip_mesh_to_polygon
+        
+        if terrain_mesh is not None:
+            if zone_polygon_coords is not None:
+                print(f"[DEBUG] Обрізання terrain по полігону зони ({len(zone_polygon_coords)} точок)")
+                clipped_terrain = clip_mesh_to_polygon(terrain_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+            else:
+                print(f"[DEBUG] Обрізання terrain по bbox (полігон зони не передано)")
+                clipped_terrain = clip_mesh_to_bbox(terrain_mesh, bbox_meters, tolerance=clip_tolerance)
+            if clipped_terrain is not None and len(clipped_terrain.vertices) > 0:
+                terrain_mesh = clipped_terrain
+            else:
+                print(f"[WARN] Terrain mesh став порожнім після обрізання, залишаємо оригінальний")
+        
+        if road_mesh is not None:
+            if zone_polygon_coords is not None:
+                clipped_road = clip_mesh_to_polygon(road_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+            else:
+                clipped_road = clip_mesh_to_bbox(road_mesh, bbox_meters, tolerance=clip_tolerance)
+            if clipped_road is not None and len(clipped_road.vertices) > 0 and len(clipped_road.faces) > 0:
+                road_mesh = clipped_road
+            else:
+                # Для zone_polygon_coords ми очікуємо строгий клип (бо OSM підвантажується з контекстом).
+                road_mesh = None
+        
+        if building_meshes is not None:
+            clipped_buildings = []
+            for i, bmesh in enumerate(building_meshes):
+                if bmesh is not None:
+                    if zone_polygon_coords is not None:
+                        clipped = clip_mesh_to_polygon(bmesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+                    else:
+                        clipped = clip_mesh_to_bbox(bmesh, bbox_meters, tolerance=clip_tolerance)
+                    if clipped is not None and len(clipped.vertices) > 0 and len(clipped.faces) > 0:
+                        clipped_buildings.append(clipped)
+                    else:
+                        # Якщо будівля поза зоною — відкидаємо (OSM підвантажується з контекстом)
+                        continue
+            building_meshes = clipped_buildings if clipped_buildings else None
+        
+        if water_mesh is not None:
+            if zone_polygon_coords is not None:
+                clipped_water = clip_mesh_to_polygon(water_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+            else:
+                clipped_water = clip_mesh_to_bbox(water_mesh, bbox_meters, tolerance=clip_tolerance)
+            if clipped_water is not None and len(clipped_water.vertices) > 0 and len(clipped_water.faces) > 0:
+                water_mesh = clipped_water
+            else:
+                water_mesh = None
+        
+        if parks_mesh is not None:
+            if zone_polygon_coords is not None:
+                clipped_parks = clip_mesh_to_polygon(parks_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+            else:
+                clipped_parks = clip_mesh_to_bbox(parks_mesh, bbox_meters, tolerance=clip_tolerance)
+            if clipped_parks is not None and len(clipped_parks.vertices) > 0 and len(clipped_parks.faces) > 0:
+                parks_mesh = clipped_parks
+            else:
+                parks_mesh = None
+        
+        if poi_mesh is not None:
+            if zone_polygon_coords is not None:
+                clipped_poi = clip_mesh_to_polygon(poi_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+            else:
+                clipped_poi = clip_mesh_to_bbox(poi_mesh, bbox_meters, tolerance=clip_tolerance)
+            if clipped_poi is not None and len(clipped_poi.vertices) > 0:
+                poi_mesh = clipped_poi
+            else:
+                poi_mesh = None
+        
+        task.update_status("processing", 82, "Експорт моделі...")
         
         # 6. Експорт сцени
         primary_format = request.export_format.lower()
         output_file = OUTPUT_DIR / f"{task_id}.{primary_format}"
         output_file_abs = output_file.resolve()
         
-        export_scene(
+        # Діагностика мешів перед експортом
+        print(f"Меші: terrain={'OK' if terrain_mesh else 'None'}, roads={'OK' if road_mesh else 'None'}, "
+              f"buildings={len(building_meshes) if building_meshes else 0}, water={'OK' if water_mesh else 'None'}, "
+              f"parks={'OK' if parks_mesh else 'None'}, poi={'OK' if poi_mesh else 'None'}")
+        
+        # Експортуємо основну модель
+        parts_from_main = export_scene(
             terrain_mesh=terrain_mesh,
             road_mesh=road_mesh,
             building_meshes=building_meshes,
@@ -472,10 +1194,17 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
             filename=str(output_file_abs),
             format=request.export_format,
             model_size_mm=request.model_size_mm,
-            # Плоска база потрібна тільки коли рельєф вимкнено
-            add_flat_base=not request.terrain_enabled,
-            base_thickness_mm=2.0,
+            # ВАЖЛИВО: Плоска "BaseFlat" потрібна лише коли terrain_mesh відсутній.
+            # Якщо terrain_mesh є — він вже включає base_thickness і форму зони,
+            # а прямокутна BaseFlat додає "зайву територію" по боках.
+            add_flat_base=(terrain_mesh is None),
+            base_thickness_mm=float(request.terrain_base_thickness_mm),
         )
+        
+        # Якщо це STL і є окремі частини, зберігаємо їх
+        if parts_from_main and isinstance(parts_from_main, dict) and request.export_format.lower() == "stl":
+            for part_name, path in parts_from_main.items():
+                task.set_output(f"{part_name}_stl", str(Path(path).resolve()))
 
         # ДЛЯ PREVIEW: якщо користувач обрав 3MF, паралельно зберігаємо STL (Three.js стабільно вантажить STL)
         # Це також вирішує проблему, коли 3MF loader падає, а frontend намагається парсити ZIP як STL.
@@ -492,8 +1221,8 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
                 filename=str(stl_preview_abs),
                 format="stl",
                 model_size_mm=request.model_size_mm,
-                add_flat_base=not request.terrain_enabled,
-                base_thickness_mm=2.0,
+                add_flat_base=(terrain_mesh is None),
+                base_thickness_mm=float(request.terrain_base_thickness_mm),
             )
 
         # Кольорове прев'ю: експортуємо STL частини (base/roads/buildings/water) з однаковими трансформаціями
@@ -545,9 +1274,12 @@ async def generate_model_task(task_id: str, request: GenerationRequest):
         
         task.complete(str(output_file_abs))
         task.update_status("completed", 100, "Модель готова!")
-        print(f"[OK] Задача {task_id} завершена. Файл: {output_file_abs}")
+        print(f"[OK] === ЗАВЕРШЕНО ГЕНЕРАЦІЮ МОДЕЛІ === Task ID: {task_id}, Zone ID: {zone_id}, Файл: {output_file_abs}")
         
     except Exception as e:
+        print(f"[ERROR] === ПОМИЛКА ГЕНЕРАЦІЇ МОДЕЛІ === Task ID: {task_id}, Zone ID: {zone_id}, Error: {e}")
+        import traceback
+        traceback.print_exc()
         task.fail(str(e))
         raise
 

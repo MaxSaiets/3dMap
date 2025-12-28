@@ -116,6 +116,93 @@ def get_elevation_mapbox(
         return None
 
 
+def get_elevation_abs_meters_from_api(
+    bbox_latlon: Tuple[float, float, float, float],
+    X_meters: np.ndarray,
+    Y_meters: np.ndarray,
+    source_crs: Optional[object] = None,
+    terrarium_zoom: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    """
+    Отримує абсолютні висоти в метрах над рівнем моря з API (без нормалізації).
+    Використовується для отримання реальних висот перед нормалізацією в terrain_generator.
+    """
+    # Default to terrarium tiles to avoid OpenTopoData rate limits.
+    provider = (os.getenv("ELEVATION_PROVIDER") or "terrarium").lower()
+    if provider in ["none", "synthetic", "fake"]:
+        return None
+
+    if source_crs is None:
+        return None
+
+    try:
+        # 0) Локальний DEM (GeoTIFF) — найточніший варіант
+        dem_path = os.getenv("DEM_PATH")
+        if dem_path:
+            Z = _get_elevation_from_geotiff(dem_path, X_meters, Y_meters, source_crs=source_crs)
+            if Z is not None:
+                _debug(f"[elevation] GeoTIFF '{dem_path}' ok: abs_range={float(np.nanmin(Z)):.2f}..{float(np.nanmax(Z)):.2f}m")
+                return Z
+
+        # Конвертація projected (UTM/метри) -> WGS84 для API
+        from pyproj import Transformer
+
+        transformer = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+
+        xs = X_meters.flatten().astype(float)
+        ys = Y_meters.flatten().astype(float)
+        lons, lats = transformer.transform(xs, ys)
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+
+        if provider == "terrarium":
+            from services.terrarium_tiles import TerrariumTileProvider
+
+            zoom = int(terrarium_zoom if terrarium_zoom is not None else os.getenv("TERRARIUM_ZOOM", "14"))
+            base_url = os.getenv("TERRARIUM_URL", "https://s3.amazonaws.com/elevation-tiles-prod/terrarium")
+            cache_dir = os.getenv("TERRARIUM_CACHE_DIR", "cache/terrarium")
+            timeout = float(os.getenv("TERRARIUM_TIMEOUT", "30"))
+
+            _debug(f"[elevation] Terrarium tiles z={zoom}, points={lats.size}")
+            provider_obj = TerrariumTileProvider(base_url=base_url, cache_dir=cache_dir, timeout=timeout)
+            Z_flat = provider_obj.sample_points(lats, lons, z=zoom)
+            if Z_flat is None or not np.any(np.isfinite(Z_flat)):
+                _debug("[elevation] Terrarium failed -> fallback to synthetic")
+                return None
+
+        else:
+            # OpenTopoData
+            dataset = os.getenv("OPENTOPODATA_DATASET")
+            if not dataset:
+                north, south, east, west = bbox_latlon
+                mid_lat = (north + south) / 2.0
+                mid_lon = (east + west) / 2.0
+                if 35.0 <= mid_lat <= 72.0 and -25.0 <= mid_lon <= 45.0:
+                    dataset = "eudem25m"
+                else:
+                    dataset = "srtm30m"
+            _debug(f"[elevation] OpenTopoData dataset={dataset}, points={lats.size}")
+
+            Z_flat = _get_elevation_opentopodata_batch(lats, lons, dataset=dataset)
+            if Z_flat is None:
+                _debug("[elevation] OpenTopoData failed -> fallback to synthetic")
+                return None
+
+        Z = Z_flat.reshape(X_meters.shape)
+        
+        # Повертаємо абсолютні значення БЕЗ нормалізації
+        zmin = float(np.nanmin(Z)) if np.any(~np.isnan(Z)) else 0.0
+        zmax = float(np.nanmax(Z)) if np.any(~np.isnan(Z)) else 0.0
+        _debug(f"[elevation] {provider} abs_range={zmin:.2f}..{zmax:.2f}m (absolute, not normalized)")
+
+        # Заповнюємо NaN, але зберігаємо абсолютні значення
+        Z = np.where(np.isnan(Z), zmin, Z)
+        return Z
+    except Exception as e:
+        print(f"[WARN] elevation API failed: {e}")
+        return None
+
+
 def get_elevation_data_from_api(
     bbox_latlon: Tuple[float, float, float, float],
     X_meters: np.ndarray,
@@ -368,11 +455,14 @@ def get_elevation_simple_terrain(
     max_distance = np.max(distance) if distance.size > 0 else 1000
     scale = max(max_distance / 10, 100)  # Адаптивний масштаб
     
-    # Хвильовий рельєф (висота в метрах)
-    Z = np.sin(distance / scale) * np.cos(dx / (scale * 0.6)) * 5 * z_scale
+    # Хвильовий рельєф (висота в метрах) - збільшено амплітуду для кращої видимості
+    Z = np.sin(distance / scale) * np.cos(dx / (scale * 0.6)) * 10 * z_scale  # Збільшено з 5 до 10
     
     # Додаємо базову висоту, щоб рельєф був видимий
-    Z = Z + 1.0  # 1 метр базова висота
+    Z = Z + 2.0  # Збільшено з 1.0 до 2.0 метра базова висота
+    
+    # Додаємо додаткові деталі для кращої видимості
+    Z = Z + np.sin(dx / (scale * 0.3)) * np.cos(dy / (scale * 0.3)) * 3 * z_scale
     
     return Z
 

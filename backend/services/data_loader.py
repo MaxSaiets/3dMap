@@ -75,12 +75,22 @@ def fetch_city_data(
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            gdf_buildings = ox.features_from_bbox(*bbox, tags=tags_buildings)
+            # Виправляємо виклик для нової версії osmnx
+            try:
+                # Нова версія osmnx використовує bbox як keyword argument
+                gdf_buildings = ox.features_from_bbox(bbox=bbox, tags=tags_buildings)
+            except TypeError:
+                # Стара версія osmnx використовує позиційні аргументи
+                gdf_buildings = ox.features_from_bbox(bbox[0], bbox[1], bbox[2], bbox[3], tags=tags_buildings)
         # Додатково тягнемо building:part (не завжди присутні, але дають кращу деталізацію)
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
-                gdf_parts = ox.features_from_bbox(*bbox, tags=tags_building_parts)
+                # Виправляємо виклик для нової версії osmnx
+                try:
+                    gdf_parts = ox.features_from_bbox(bbox=bbox, tags=tags_building_parts)
+                except TypeError:
+                    gdf_parts = ox.features_from_bbox(bbox[0], bbox[1], bbox[2], bbox[3], tags=tags_building_parts)
         except Exception:
             gdf_parts = gpd.GeoDataFrame()
         # Фільтрація невалідних геометрій
@@ -161,7 +171,11 @@ def fetch_city_data(
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            gdf_water = ox.features_from_bbox(*bbox, tags=tags_water)
+            # Виправляємо виклик для нової версії osmnx
+            try:
+                gdf_water = ox.features_from_bbox(bbox=bbox, tags=tags_water)
+            except TypeError:
+                gdf_water = ox.features_from_bbox(bbox[0], bbox[1], bbox[2], bbox[3], tags=tags_water)
         if not gdf_water.empty:
             gdf_water = gdf_water[gdf_water.geometry.notna()]
             with warnings.catch_warnings():
@@ -181,7 +195,13 @@ def fetch_city_data(
         # 'all' включає всі типи доріг (drive, walk, bike)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            G_roads = ox.graph_from_bbox(*bbox, network_type='all', simplify=True)
+            # Виправляємо виклик для нової версії osmnx
+            try:
+                # Нова версія osmnx використовує bbox як keyword argument
+                G_roads = ox.graph_from_bbox(bbox=bbox, network_type='all', simplify=True)
+            except TypeError:
+                # Стара версія osmnx використовує позиційні аргументи
+                G_roads = ox.graph_from_bbox(bbox[0], bbox[1], bbox[2], bbox[3], network_type='all', simplify=True)
         # Проекція графа в метричну систему
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)

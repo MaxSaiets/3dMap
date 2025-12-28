@@ -280,7 +280,7 @@ function CameraController() {
 type RotateMode = "camera" | "model";
 
 function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
-  const { downloadUrl, taskId, exportFormat } = useGenerationStore();
+  const { downloadUrl, activeTaskId, exportFormat, showAllZones, taskIds, taskStatuses } = useGenerationStore();
   const [model, setModel] = useState<THREE.Group | THREE.Mesh | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -298,6 +298,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
 
   // Завантажуємо тестову модель при старті
   useEffect(() => {
+    if (showAllZones) return;
     if (hasLoadedTestModel || downloadUrl) return;
     
     const loadTestModel = async () => {
@@ -392,10 +393,138 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
     loadTestModel();
   }, [hasLoadedTestModel, downloadUrl]);
 
+  const normalizeModelForPreview = (obj: THREE.Object3D) => {
+    obj.position.set(0, 0, 0);
+    obj.scale.set(1, 1, 1);
+    obj.updateMatrixWorld(true);
+
+    const box = new THREE.Box3().setFromObject(obj);
+    const center = box.getCenter(new THREE.Vector3());
+    const min = box.min.clone();
+
+    obj.position.x -= center.x;
+    obj.position.z -= center.z;
+    obj.position.y -= min.y;
+    obj.updateMatrixWorld(true);
+
+    const boxAfter = new THREE.Box3().setFromObject(obj);
+    const sizeAfter = boxAfter.getSize(new THREE.Vector3());
+    const maxDim = Math.max(sizeAfter.x, sizeAfter.y, sizeAfter.z);
+
+    return { size: sizeAfter, maxDim };
+  };
+
+  const loadZoneModel = async (id: string) => {
+    // 1) Кольорові частини: пробуємо завантажити STL по частинах
+    let loadedModel: THREE.Group | THREE.Mesh;
+    const blobs: any = {};
+    const tryPart = async (p: "base" | "roads" | "buildings" | "water" | "parks" | "poi") => {
+      try {
+        const b = await api.downloadModel(id, "stl", p);
+        if (b && b.size > 100) blobs[p] = b;
+      } catch {
+        // ignore
+      }
+    };
+    await Promise.all([
+      tryPart("base"),
+      tryPart("roads"),
+      tryPart("buildings"),
+      tryPart("water"),
+      tryPart("parks"),
+      tryPart("poi"),
+    ]);
+
+    if (Object.keys(blobs).length > 0) {
+      loadedModel = await loadColoredPartsFromBlobs(blobs);
+    } else {
+      const blob = await api.downloadModel(id, "stl");
+      loadedModel = await loadStlAsMesh(blob, 0x888888);
+    }
+
+    const info = normalizeModelForPreview(loadedModel);
+    return { id, obj: loadedModel, ...info };
+  };
+
+  // Batch preview: показуємо всі готові зони одночасно (розкладаємо на сітці)
   useEffect(() => {
+    if (!showAllZones) return;
+    if (!taskIds || taskIds.length < 2) return;
+
+    const completedIds = taskIds.filter((id) => (taskStatuses as any)?.[id]?.status === "completed");
+    const idsToLoad = completedIds.length ? completedIds : [];
+    if (idsToLoad.length === 0) {
+      // ще нічого не готово
+      setModel(null);
+      return;
+    }
+
+    const run = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const models = (await Promise.all(idsToLoad.map((id) => loadZoneModel(id)))).filter(Boolean) as any[];
+        if (!models.length) {
+          setModel(null);
+          setLoading(false);
+          return;
+        }
+
+        // Уніфікований масштаб для всіх (щоб не було різних “розмірів”)
+        const maxDimGlobal = Math.max(...models.map((m) => m.maxDim || 1));
+        const globalScale = maxDimGlobal > 0 ? 200 / maxDimGlobal : 1;
+
+        const group = new THREE.Group();
+        for (const m of models) {
+          m.obj.scale.setScalar(globalScale);
+          m.obj.updateMatrixWorld(true);
+          group.add(m.obj);
+        }
+
+        // layout
+        const boxes = models.map((m) => new THREE.Box3().setFromObject(m.obj));
+        const sizes = boxes.map((b) => b.getSize(new THREE.Vector3()));
+        const maxW = Math.max(...sizes.map((s) => s.x));
+        const maxD = Math.max(...sizes.map((s) => s.z));
+        const spacingX = maxW + 40;
+        const spacingZ = maxD + 40;
+        const cols = 2;
+
+        models.forEach((m, i) => {
+          const col = i % cols;
+          const row = Math.floor(i / cols);
+          m.obj.position.x += col * spacingX;
+          m.obj.position.z += row * spacingZ;
+          m.obj.updateMatrixWorld(true);
+        });
+
+        // center whole group
+        const groupBox = new THREE.Box3().setFromObject(group);
+        const gCenter = groupBox.getCenter(new THREE.Vector3());
+        const gMin = groupBox.min.clone();
+        group.position.x -= gCenter.x;
+        group.position.z -= gCenter.z;
+        group.position.y -= gMin.y;
+        group.updateMatrixWorld(true);
+
+        (group as any).userData = { batch: true, ids: idsToLoad };
+        setModel(group);
+      } catch (e: any) {
+        setError(e?.message || "Помилка завантаження batch превʼю");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAllZones, taskIds.join(","), JSON.stringify(taskStatuses)]);
+
+  useEffect(() => {
+    if (showAllZones) return;
     // ВАЖЛИВО: Не скидаємо модель, якщо вона вже завантажена
     // Модель може зникнути, якщо downloadUrl тимчасово стає null під час оновлення стану
-    if (!downloadUrl || !taskId) {
+    if (!downloadUrl || !activeTaskId) {
       // Не скидаємо модель, якщо вже завантажена тестова або інша модель
       // Це запобігає зникненню моделі під час оновлення стану
       if (!hasLoadedTestModel && !model) {
@@ -408,7 +537,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
     
     // Якщо модель вже завантажена для цього taskId, не перезавантажуємо
     const currentTaskId = (model as any)?.userData?.taskId;
-    if (model && currentTaskId === taskId) {
+    if (model && currentTaskId === activeTaskId) {
       console.log("Модель вже завантажена для цього taskId, пропускаємо перезавантаження");
       return;
     }
@@ -423,14 +552,14 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
       setLoading(true);
       setError(null);
       try {
-        console.log("Завантаження моделі...", { taskId, downloadUrl, exportFormat });
+        console.log("Завантаження моделі...", { taskId: activeTaskId, downloadUrl, exportFormat });
 
         // 1) Кольорові частини: пробуємо завантажити STL по частинах
         let loadedModel: THREE.Group | THREE.Mesh;
         const blobs: any = {};
         const tryPart = async (p: "base" | "roads" | "buildings" | "water" | "parks" | "poi") => {
           try {
-            const b = await api.downloadModel(taskId, "stl", p);
+            const b = await api.downloadModel(activeTaskId, "stl", p);
             if (b && b.size > 100) blobs[p] = b;
           } catch {
             // ignore missing part
@@ -449,7 +578,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
           loadedModel = await loadColoredPartsFromBlobs(blobs);
         } else {
           // 2) Fallback на один STL
-          const blob = await api.downloadModel(taskId, "stl");
+          const blob = await api.downloadModel(activeTaskId, "stl");
           loadedModel = await loadStlAsMesh(blob, 0x888888);
         }
 
@@ -499,7 +628,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
           size: sizeAfter,
           center: centerAfter,
           maxDim: Math.max(sizeAfter.x, sizeAfter.y, sizeAfter.z),
-          taskId: taskId,  // Зберігаємо taskId, щоб не перезавантажувати
+          taskId: activeTaskId,  // Зберігаємо taskId, щоб не перезавантажувати
           exportFormat: exportFormat
         };
         
@@ -515,7 +644,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
     };
 
     loadModel();
-  }, [downloadUrl, taskId, exportFormat]);
+  }, [downloadUrl, activeTaskId, exportFormat, showAllZones]);
 
   if (loading) {
     return (
@@ -566,7 +695,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
   }
 
   console.log("ModelLoader: відображаємо модель", model);
-  console.log("ModelLoader: downloadUrl:", downloadUrl, "taskId:", taskId, "loading:", loading, "error:", error);
+  console.log("ModelLoader: downloadUrl:", downloadUrl, "taskId:", activeTaskId, "loading:", loading, "error:", error);
   
   // Перевіряємо, чи модель має геометрію
   let hasGeometry = false;

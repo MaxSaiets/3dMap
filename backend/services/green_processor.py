@@ -17,6 +17,8 @@ import trimesh
 from shapely.geometry import Polygon, MultiPolygon, box
 
 from services.terrain_provider import TerrainProvider
+from services.global_center import GlobalCenter
+from shapely.ops import transform
 
 
 def process_green_areas(
@@ -24,9 +26,30 @@ def process_green_areas(
     height_m: float,
     embed_m: float,
     terrain_provider: Optional[TerrainProvider] = None,
+    global_center: Optional[GlobalCenter] = None,  # UTM -> local
 ) -> Optional[trimesh.Trimesh]:
     if gdf_green is None or gdf_green.empty:
         return None
+
+    # In the main pipeline (PBF mode), geometries are in projected CRS (UTM meters),
+    # while terrain_provider operates in LOCAL coordinates relative to global_center.
+    # Convert green polygons to local so clipping + draping are consistent.
+    if global_center is not None:
+        try:
+            def to_local_transform(x, y, z=None):
+                x_local, y_local = global_center.to_local(x, y)
+                if z is not None:
+                    return (x_local, y_local, z)
+                return (x_local, y_local)
+
+            gdf_local = gdf_green.copy()
+            gdf_local["geometry"] = gdf_local["geometry"].apply(
+                lambda geom: transform(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
+            )
+            gdf_green = gdf_local
+        except Exception:
+            # If transform fails, keep original (best effort)
+            pass
 
     # clip to terrain bounds if available
     clip_box = None

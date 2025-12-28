@@ -43,8 +43,21 @@ export interface TaskStatus {
     roads?: string | null;
     buildings?: string | null;
     water?: string | null;
+    parks?: string | null;
+    poi?: string | null;
   };
 }
+
+export interface BatchTaskStatusResponse {
+  task_id: string;
+  status: "multiple";
+  tasks: TaskStatus[];
+  total: number;
+  completed: number;
+  all_task_ids: string[];
+}
+
+export type StatusResponse = TaskStatus | BatchTaskStatusResponse;
 
 export const api = {
   async generateModel(request: GenerationRequest): Promise<GenerationResponse> {
@@ -55,8 +68,8 @@ export const api = {
     return response.data;
   },
 
-  async getStatus(taskId: string): Promise<TaskStatus> {
-    const response = await axios.get<TaskStatus>(
+  async getStatus(taskId: string): Promise<StatusResponse> {
+    const response = await axios.get<StatusResponse>(
       `${API_BASE_URL}/api/status/${taskId}`
     );
     return response.data;
@@ -74,6 +87,44 @@ export const api = {
     const response = await axios.get(
       `${API_BASE_URL}/api/download/${taskId}${qs ? `?${qs}` : ""}`,
       { responseType: "blob" }
+    );
+    return response.data;
+  },
+
+  async generateHexagonalGrid(bounds: {
+    north: number;
+    south: number;
+    east: number;
+    west: number;
+    hex_size_m?: number;
+    grid_type?: "hexagonal" | "square";
+  }): Promise<{
+    geojson: any;
+    hex_count: number;
+    is_valid: boolean;
+    validation_errors: string[];
+  }> {
+    const response = await axios.post(
+      `${API_BASE_URL}/api/hexagonal-grid`,
+      {
+        ...bounds,
+        hex_size_m: bounds.hex_size_m || 1000.0,
+        grid_type: bounds.grid_type || "hexagonal",
+      }
+    );
+    return response.data;
+  },
+
+  async generateZones(
+    zones: any[],
+    params: GenerationRequest
+  ): Promise<GenerationResponse & { all_task_ids?: string[] }> {
+    const response = await axios.post(
+      `${API_BASE_URL}/api/generate-zones`,
+      {
+        zones,
+        ...params,
+      }
     );
     return response.data;
   },
