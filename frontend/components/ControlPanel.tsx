@@ -185,14 +185,19 @@ export function ControlPanel({
         terrarium_zoom: terrariumZoom,
         // Terrain-first стабілізація (backend default=true, але явно передаємо)
         flatten_buildings_on_terrain: true,
+        flatten_roads_on_terrain: false,
         export_format: exportFormat,
         model_size_mm: modelSizeMm,
+        context_padding_m: 400.0, // Додаємо контекстний padding для визначення мостів
       };
 
+      console.log("[DEBUG] Відправляємо запит на генерацію:", request);
       const response = await api.generateModel(request);
+      console.log("[DEBUG] Отримано відповідь:", response);
       setTaskGroup(response.task_id, [response.task_id]);
       setActiveTaskId(response.task_id);
     } catch (err: any) {
+      console.error("[ERROR] Помилка генерації моделі:", err);
       setError(err.message || "Помилка генерації моделі");
       setGenerating(false);
     }

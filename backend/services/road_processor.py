@@ -698,7 +698,7 @@ def process_roads(
                         else:
                             # Fallback: використовуємо стару логіку
                         # Піднімаємо міст над найвищою точкою рельєфу під ним
-                        vertices[:, 2] = min_ground_z + old_z + bridge_height_offset * 0.5
+                            vertices[:, 2] = min_ground_z + old_z + bridge_height_offset * 0.5
                             print(f"  [BRIDGE] Fallback: min_ground={min_ground_z:.2f}м, offset={bridge_height_offset:.2f}м")
                     else:
                         # ПОКРАЩЕНА ЛОГІКА ДЛЯ ЗВИЧАЙНИХ ДОРОГ:

@@ -161,14 +161,22 @@ async def generate_model(request: GenerationRequest, background_tasks: Backgroun
     """
     Створює задачу генерації 3D моделі
     """
-    task_id = str(uuid.uuid4())
-    task = GenerationTask(task_id=task_id, request=request)
-    tasks[task_id] = task
-    
-    # Запускаємо генерацію в фоні
-    background_tasks.add_task(generate_model_task, task_id, request)
-    
-    return GenerationResponse(task_id=task_id, status="processing")
+    try:
+        print(f"[INFO] Отримано запит на генерацію: north={request.north}, south={request.south}, east={request.east}, west={request.west}")
+        task_id = str(uuid.uuid4())
+        task = GenerationTask(task_id=task_id, request=request)
+        tasks[task_id] = task
+        
+        # Запускаємо генерацію в фоні
+        background_tasks.add_task(generate_model_task, task_id, request)
+        
+        print(f"[INFO] Створено задачу {task_id} для генерації моделі")
+        return GenerationResponse(task_id=task_id, status="processing", message="Задача створена")
+    except Exception as e:
+        print(f"[ERROR] Помилка створення задачі: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Помилка створення задачі: {str(e)}")
 
 
 @app.get("/api/status/{task_id}")

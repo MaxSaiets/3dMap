@@ -159,11 +159,13 @@ def process_buildings(
                                 pts.append([x, y])
                     except Exception:
                         # Fallback: хоча б центроїд
-                        try:
-                            c = poly.centroid
-                            pts.append([c.x, c.y])
+                        pass
+                    try:
+                        c = poly.centroid
+                        pts.append([c.x, c.y])
                     except Exception:
                         pass
+                    pass
 
             if len(pts) == 0:
                 return np.array([0.0], dtype=float)
@@ -233,8 +235,8 @@ def process_buildings(
                     print(f"  [WARN] Будівля {idx}: не вдалося отримати висоти рельєфу")
                 else:
                     # Використовуємо мінімальну висоту рельєфу (рельєф вирівняний, тому різниця мінімальна)
-                ground_min = float(np.min(heights))
-                ground_max = float(np.max(heights))
+                    ground_min = float(np.min(heights))
+                    ground_max = float(np.max(heights))
                     ground_mean = float(np.mean(heights))
                     
                     # ВИПРАВЛЕННЯ: Правильна логіка з safety_margin та embed_depth
@@ -367,15 +369,10 @@ def process_buildings(
                     import traceback
                     traceback.print_exc()
                     # Fallback на старий метод
-                    try:
                     mesh = extrude_building(geom, height)
-                    if mesh:
-                        mesh.apply_translation([0, 0, translate_z])
-                        if len(mesh.faces) > 0:
-                            building_meshes.append(mesh)
-                    except Exception as fallback_error:
-                        print(f"  [SKIP] Будівля {idx}: fallback також не вдався: {fallback_error}")
-                        continue
+                    mesh.apply_translation([0, 0, translate_z])
+                    if len(mesh.faces) > 0:
+                        building_meshes.append(mesh)
             # ВИПРАВЛЕННЯ: Якщо MultiPolygon, обробляємо кожен полігон окремо з ОКРЕМИМ translate_z
             elif hasattr(geom, 'geoms') or isinstance(geom, MultiPolygon):
                 geoms_list = geom.geoms if hasattr(geom, 'geoms') else [geom]
@@ -417,7 +414,7 @@ def process_buildings(
                                 poly_translate_z = min_allowed_z
                     
                     try:
-                            mesh = trimesh.creation.extrude_polygon(poly, height=height)
+                        mesh = trimesh.creation.extrude_polygon(poly, height=height)
                         
                         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
                             # Fallback
@@ -487,9 +484,9 @@ def process_buildings(
                             pass
                         
                         if mesh and len(mesh.faces) > 0 and len(mesh.vertices) > 0:
-                                building_meshes.append(mesh)
-                        except Exception as e:
-                            # Fallback
+                            building_meshes.append(mesh)
+                    except Exception as e:
+                        # Fallback
                         try:
                             mesh = extrude_building(poly, height)
                             if mesh:
