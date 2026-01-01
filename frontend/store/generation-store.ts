@@ -16,6 +16,8 @@ interface GenerationState {
   downloadUrl: string | null;
   taskStatuses: Record<string, TaskStatus>;
   showAllZones: boolean;
+  // Batch preview: mapping taskId -> zone meta (so we can place tiles like on the map)
+  batchZoneMetaByTaskId: Record<string, { zoneId: string; row?: number; col?: number }>;
   
   // Параметри генерації
   roadWidthMultiplier: number;
@@ -41,6 +43,7 @@ interface GenerationState {
   setActiveTaskId: (taskId: string | null) => void;
   setTaskStatuses: (statuses: Record<string, TaskStatus>) => void;
   setShowAllZones: (value: boolean) => void;
+  setBatchZoneMetaByTaskId: (value: Record<string, { zoneId: string; row?: number; col?: number }>) => void;
   updateProgress: (progress: number, status: string) => void;
   setDownloadUrl: (url: string | null) => void;
   
@@ -75,6 +78,7 @@ const initialState = {
   downloadUrl: null,
   taskStatuses: {} as Record<string, TaskStatus>,
   showAllZones: false,
+  batchZoneMetaByTaskId: {} as Record<string, { zoneId: string; row?: number; col?: number }>,
   // На 10×10см “реальні” ширини доріг часто виглядають надто товстими — ставимо мʼякший дефолт.
   roadWidthMultiplier: 0.8,
   // Дороги: менша висота + трохи більше втиснення дають кращий вигляд і менше z-fighting
@@ -120,6 +124,7 @@ export const useGenerationStore = create<GenerationState>((set) => ({
   setActiveTaskId: (activeTaskId) => set({ activeTaskId }),
   setTaskStatuses: (taskStatuses) => set({ taskStatuses }),
   setShowAllZones: (showAllZones) => set({ showAllZones }),
+  setBatchZoneMetaByTaskId: (batchZoneMetaByTaskId) => set({ batchZoneMetaByTaskId }),
   updateProgress: (progress, status) => set({ progress, status }),
   setDownloadUrl: (url) => set({ downloadUrl: url }),
   

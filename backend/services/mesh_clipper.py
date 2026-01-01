@@ -196,13 +196,14 @@ def clip_mesh_to_polygon(
             print(f"[WARN] Помилка створення полігону: {e}")
             return mesh
 
-        # Трохи розширюємо полігон, щоб не "зрізати" рівно по межі (особливо після simplification)
-        tol = float(tolerance or 0.0)
-        if tol > 0:
-            try:
-                polygon = polygon.buffer(tol)
-            except Exception:
-                pass
+        # ВАЖЛИВО: Не розширюємо полігон для точного обрізання біля країв
+        # Це забезпечує правильне обрізання будинків та terrain
+        # tol = float(tolerance or 0.0)
+        # if tol > 0:
+        #     try:
+        #         polygon = polygon.buffer(tol)
+        #     except Exception:
+        #         pass
 
         # ВАЖЛИВО: vertex-only фільтр лишає "висячі" трикутники поза зоною.
         # Краще: залишаємо faces, у яких centroid (XY) всередині полігону.
@@ -211,7 +212,7 @@ def clip_mesh_to_polygon(
         if faces.size == 0:
             return None
 
-        print(f"[DEBUG] Обрізання меша по полігону (face-centroid): {len(vertices)} вершин, {len(faces)} faces, полігон: {len(local_coords)} точок")
+        # print(f"[DEBUG] Обрізання меша по полігону (face-centroid): {len(vertices)} вершин, {len(faces)} faces, полігон: {len(local_coords)} точок")
         try:
             geom = prep(polygon)
         except Exception:

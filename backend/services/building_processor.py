@@ -264,9 +264,9 @@ def process_buildings(
                         base_z = translate_z + float(foundation_depth_eff)
                     
                     # Діагностика для складних випадків
-                    if ground_max - ground_min > 0.5:
-                        print(f"  [DEBUG] Будівля {idx}: великий ухил рельєфу {ground_max - ground_min:.2f}м, "
-                              f"ground_min={ground_min:.2f}м, base_z={base_z:.2f}м, translate_z={translate_z:.2f}м")
+                    # if ground_max - ground_min > 0.5:
+                    #     print(f"  [DEBUG] Будівля {idx}: великий ухил рельєфу {ground_max - ground_min:.2f}м, "
+                    #           f"ground_min={ground_min:.2f}м, base_z={base_z:.2f}м, translate_z={translate_z:.2f}м")
             
             # Екструзія полігону (використовуємо trimesh.creation.extrude_polygon)
             if isinstance(geom, Polygon):
@@ -323,8 +323,8 @@ def process_buildings(
                                     vertices[:, 2] += elevation_adjustment
                                     translate_z = required_bottom_z
                                     
-                                    print(f"  [FIX] Будівля {idx}: піднято на {elevation_adjustment:.3f}м "
-                                          f"(current_bottom={current_bottom_z:.3f}, required={required_bottom_z:.3f})")
+                                    # print(f"  [FIX] Будівля {idx}: піднято на {elevation_adjustment:.3f}м "
+                                    #       f"(current_bottom={current_bottom_z:.3f}, required={required_bottom_z:.3f})")
                             
                             mesh.vertices = vertices
                         
@@ -346,8 +346,8 @@ def process_buildings(
                                     vertices[:, 2] += elevation_adjustment
                                     translate_z += elevation_adjustment
                                     
-                                    print(f"  [FIX] Будівля {idx}: агресивне виправлення - піднято на {elevation_adjustment:.3f}м "
-                                          f"({np.sum(vertices_below_ground)} вершин під землею)")
+                                    # print(f"  [FIX] Будівля {idx}: агресивне виправлення - піднято на {elevation_adjustment:.3f}м "
+                                    #       f"({np.sum(vertices_below_ground)} вершин під землею)")
                                 
                                 mesh.vertices = vertices
                     

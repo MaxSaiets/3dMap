@@ -19,6 +19,8 @@ const HexagonalGrid = dynamic(() => import("@/components/HexagonalGrid"), {
 export default function Home() {
   const [showHexGrid, setShowHexGrid] = useState(false);
   const [selectedZones, setSelectedZones] = useState<any[]>([]);
+  const [gridType, setGridType] = useState<"hexagonal" | "square">("hexagonal");
+  const [hexSizeM, setHexSizeM] = useState(500.0);
   
   // Координати Києва
   const kyivBounds = {
@@ -37,6 +39,10 @@ export default function Home() {
           setShowHexGrid={setShowHexGrid}
           selectedZones={selectedZones}
           setSelectedZones={setSelectedZones}
+          gridType={gridType}
+          setGridType={setGridType}
+          hexSizeM={hexSizeM}
+          setHexSizeM={setHexSizeM}
         />
       </div>
 
@@ -45,30 +51,13 @@ export default function Home() {
         {/* Карта - замінюємо на HexagonalGrid якщо showHexGrid = true */}
         <div className="h-1/2 border-b border-gray-300 dark:border-gray-700 min-h-0">
           {showHexGrid ? (
-            <div className="w-full h-full relative">
-              <div className="absolute top-2 left-2 z-[1000] bg-white p-2 rounded shadow-lg">
-                <button
-                  onClick={() => {
-                    setShowHexGrid(false);
-                    setSelectedZones([]);
-                  }}
-                  className="px-3 py-1 bg-gray-500 text-white rounded hover:bg-gray-600 text-sm"
-                >
-                  ✕ Закрити сітку
-                </button>
-                {selectedZones.length > 0 && (
-                  <div className="mt-2 text-sm space-y-1">
-                    <p className="font-semibold text-blue-600">Вибрано: {selectedZones.length} зон</p>
-                    <p className="text-xs text-gray-600">Клікніть по зонах на карті для вибору/зняття вибору</p>
-                  </div>
-                )}
-              </div>
-              <HexagonalGrid
-                key="hex-grid-kyiv" // Key для перемонтування при відкритті
-                bounds={kyivBounds}
-                onZonesSelected={setSelectedZones}
-              />
-            </div>
+            <HexagonalGrid
+              key={`hex-grid-${gridType}-${hexSizeM}`} // Key для перемонтування при зміні налаштувань
+              bounds={kyivBounds}
+              onZonesSelected={setSelectedZones}
+              gridType={gridType}
+              hexSizeM={hexSizeM}
+            />
           ) : (
             <MapSelector />
           )}

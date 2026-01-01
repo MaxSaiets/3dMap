@@ -15,6 +15,8 @@ def export_preview_parts_stl(
     add_flat_base: bool = True,
     base_thickness_mm: float = 2.0,
     rotate_to_ground: bool = False,
+    reference_xy_m: Optional[Tuple[float, float]] = None,  # (width_m, height_m) to ensure consistent scale across tiles
+    preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
 ) -> dict[str, str]:
     """
     Експортує окремі STL частини для стабільного прев'ю у браузері (з кольорами на фронтенді).
@@ -65,14 +67,24 @@ def export_preview_parts_stl(
 
     # 1) Центр по centroid
     center = combined_work.centroid
-    t0 = trimesh.transformations.translation_matrix(-center)
-    combined_work.apply_translation(-center)
+    if preserve_z:
+        t0 = trimesh.transformations.translation_matrix([-center[0], -center[1], 0.0])
+        combined_work.apply_translation([-center[0], -center[1], 0.0])
+    else:
+        t0 = trimesh.transformations.translation_matrix(-center)
+        combined_work.apply_translation(-center)
     transforms.append(t0)
 
     # 2) Scale XY до model_size_mm
     bounds_after = combined_work.bounds
     size_after = bounds_after[1] - bounds_after[0]
-    avg_xy_dimension = (size_after[0] + size_after[1]) / 2.0
+    if reference_xy_m is not None:
+        try:
+            avg_xy_dimension = (float(reference_xy_m[0]) + float(reference_xy_m[1])) / 2.0
+        except Exception:
+            avg_xy_dimension = (size_after[0] + size_after[1]) / 2.0
+    else:
+        avg_xy_dimension = (size_after[0] + size_after[1]) / 2.0
     if avg_xy_dimension > 0:
         scale_factor = model_size_mm / avg_xy_dimension
         s = trimesh.transformations.scale_matrix(scale_factor)
@@ -92,8 +104,12 @@ def export_preview_parts_stl(
     # 5) Center by bounds, minZ->0, center XY only (Z=0 лишається платформою)
     final_bounds = combined_work.bounds
     final_center_from_bounds = (final_bounds[0] + final_bounds[1]) / 2.0
-    t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
-    combined_work.apply_translation(-final_center_from_bounds)
+    if preserve_z:
+        t_center = trimesh.transformations.translation_matrix([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
+        combined_work.apply_translation([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
+    else:
+        t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
+        combined_work.apply_translation(-final_center_from_bounds)
     transforms.append(t_center)
 
     final_bounds_after = combined_work.bounds
@@ -145,6 +161,8 @@ def export_scene(
     base_thickness_mm: float = 2.0,
     parks_mesh: Optional[trimesh.Trimesh] = None,
     poi_mesh: Optional[trimesh.Trimesh] = None,
+    reference_xy_m: Optional[Tuple[float, float]] = None,  # (width_m, height_m) for consistent tiling scale
+    preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
 ) -> Optional[dict]:
     """
     Експортує 3D сцену у файл
@@ -260,20 +278,35 @@ def export_scene(
         mesh_items = [("FallbackTerrain", fallback_mesh)]
         print("[INFO] Створено мінімальний fallback рельєф")
     
-    print(f"Всього мешів для експорту: {len(mesh_items)}")
+    # print(f"Всього мешів для експорту: {len(mesh_items)}")
     # Діагностика: виводимо всі додані частини
-    mesh_names = [name for name, _ in mesh_items]
-    print(f"Експорт: {', '.join(sorted(set(mesh_names)))}")
-    total_vertices = sum(len(m.vertices) for _, m in mesh_items)
-    total_faces = sum(len(m.faces) for _, m in mesh_items)
-    print(f"Загальна статистика: {total_vertices} вершин, {total_faces} граней")
+    # mesh_names = [name for name, _ in mesh_items]
+    # print(f"Експорт: {', '.join(sorted(set(mesh_names)))}")
+    # total_vertices = sum(len(m.vertices) for _, m in mesh_items)
+    # total_faces = sum(len(m.faces) for _, m in mesh_items)
+    # print(f"Загальна статистика: {total_vertices} вершин, {total_faces} граней")
     
     # Експорт
     if format.lower() == "3mf":
-        export_3mf(filename, mesh_items, model_size_mm, add_flat_base=add_flat_base, base_thickness_mm=base_thickness_mm)
+        export_3mf(
+            filename,
+            mesh_items,
+            model_size_mm,
+            add_flat_base=add_flat_base,
+            base_thickness_mm=base_thickness_mm,
+            reference_xy_m=reference_xy_m,
+            preserve_z=preserve_z,
+        )
         return None
     elif format.lower() == "stl":
-        outputs = export_stl(filename, mesh_items, model_size_mm, add_flat_base=add_flat_base, base_thickness_mm=base_thickness_mm)
+        outputs = export_stl(
+            filename,
+            mesh_items,
+            model_size_mm,
+            add_flat_base=add_flat_base,
+            base_thickness_mm=base_thickness_mm,
+            reference_xy_m=reference_xy_m,
+        )
         return outputs
     else:
         raise ValueError(f"Невідомий формат: {format}")
@@ -286,6 +319,8 @@ def export_3mf(
     add_flat_base: bool = True,
     base_thickness_mm: float = 2.0,  # тонша база, щоб не перекривати модель
     rotate_to_ground: bool = False,  # Не крутимо, щоб не ламати орієнтацію
+    reference_xy_m: Optional[Tuple[float, float]] = None,
+    preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
 ) -> None:
     """
     Експортує сцену у формат 3MF з підтримкою окремих об'єктів
@@ -392,14 +427,24 @@ def export_3mf(
 
         # 1) Центрування за centroid
         center = combined.centroid
-        t0 = trimesh.transformations.translation_matrix(-center)
-        combined.apply_translation(-center)
+        if preserve_z:
+            t0 = trimesh.transformations.translation_matrix([-center[0], -center[1], 0.0])
+            combined.apply_translation([-center[0], -center[1], 0.0])
+        else:
+            t0 = trimesh.transformations.translation_matrix(-center)
+            combined.apply_translation(-center)
         transforms.append(("translate", t0))
 
         # 2) Масштабування XY до model_size_mm
         bounds_after = combined.bounds
         size_after = bounds_after[1] - bounds_after[0]
-        avg_xy_dimension = (size_after[0] + size_after[1]) / 2.0
+        if reference_xy_m is not None:
+            try:
+                avg_xy_dimension = (float(reference_xy_m[0]) + float(reference_xy_m[1])) / 2.0
+            except Exception:
+                avg_xy_dimension = (size_after[0] + size_after[1]) / 2.0
+        else:
+            avg_xy_dimension = (size_after[0] + size_after[1]) / 2.0
         if avg_xy_dimension > 0:
             scale_factor = model_size_mm / avg_xy_dimension
             s = trimesh.transformations.scale_matrix(scale_factor)
@@ -423,8 +468,12 @@ def export_3mf(
         try:
             final_bounds = combined.bounds
             final_center_from_bounds = (final_bounds[0] + final_bounds[1]) / 2.0
-            t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
-            combined.apply_translation(-final_center_from_bounds)
+            if preserve_z:
+                t_center = trimesh.transformations.translation_matrix([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
+                combined.apply_translation([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
+            else:
+                t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
+                combined.apply_translation(-final_center_from_bounds)
 
             final_bounds_after = combined.bounds
             min_z = final_bounds_after[0][2]
@@ -537,6 +586,7 @@ def export_stl(
     add_flat_base: bool = True,
     base_thickness_mm: float = 2.0,  # тонша база
     rotate_to_ground: bool = False,  # Не крутимо, щоб не ламати орієнтацію
+    reference_xy_m: Optional[Tuple[float, float]] = None,
 ) -> dict:
     """
     Експортує сцену у формат STL
@@ -694,7 +744,13 @@ def export_stl(
         # Масштабуємо модель до заданого розміру (в міліметрах)
         # Використовуємо середнє арифметичне X та Y для більш збалансованого масштабування
         # Це запобігає створенню дуже вузьких моделей
-        avg_xy_dimension = (size_after[0] + size_after[1]) / 2
+        if reference_xy_m is not None:
+            try:
+                avg_xy_dimension = (float(reference_xy_m[0]) + float(reference_xy_m[1])) / 2.0
+            except Exception:
+                avg_xy_dimension = (size_after[0] + size_after[1]) / 2
+        else:
+            avg_xy_dimension = (size_after[0] + size_after[1]) / 2
         
         # Перевіряємо, чи модель не занадто мала (менше 0.1 мм) - це може бути помилка
         if avg_xy_dimension < 0.001:

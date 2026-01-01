@@ -179,6 +179,9 @@ class GlobalCenter:
 
 # Глобальна змінна для зберігання центру (можна перевизначити через API)
 _global_center: Optional[GlobalCenter] = None
+# Глобальний bbox (WGS84) для DEM-семплінгу у batch режимі (north, south, east, west).
+# Важливо: всі зони повинні семплити висоти з однакового bbox, інакше на межах можуть бути NaN/різні тайли.
+_global_dem_bbox_latlon: Optional[Tuple[float, float, float, float]] = None
 
 
 def set_global_center(
@@ -210,6 +213,22 @@ def get_global_center() -> Optional[GlobalCenter]:
         GlobalCenter об'єкт або None, якщо не встановлено
     """
     return _global_center
+
+
+def set_global_dem_bbox_latlon(bbox_latlon: Tuple[float, float, float, float]) -> None:
+    """
+    Зберігає глобальний bbox (WGS84) для DEM-семплінгу у batch режимі.
+    Формат: (north, south, east, west)
+    """
+    global _global_dem_bbox_latlon
+    _global_dem_bbox_latlon = tuple(map(float, bbox_latlon))
+
+
+def get_global_dem_bbox_latlon() -> Optional[Tuple[float, float, float, float]]:
+    """
+    Повертає глобальний bbox (WGS84) для DEM-семплінгу у batch режимі, якщо встановлено.
+    """
+    return _global_dem_bbox_latlon
 
 
 def get_or_create_global_center(

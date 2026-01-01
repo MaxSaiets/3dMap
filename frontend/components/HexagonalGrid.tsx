@@ -1,15 +1,17 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { MapContainer, TileLayer, GeoJSON, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-// Компонент для автоматичного fitBounds
+// Компонент для автоматичного fitBounds (тільки при першому завантаженні)
 function MapBounds({ bounds }: { bounds: { north: number; south: number; east: number; west: number } }) {
   const map = useMap();
+  const hasFittedRef = useRef(false);
+  
   useEffect(() => {
-    if (bounds && map) {
+    if (bounds && map && !hasFittedRef.current) {
       try {
         map.fitBounds([
           [bounds.south, bounds.west],
@@ -18,6 +20,7 @@ function MapBounds({ bounds }: { bounds: { north: number; south: number; east: n
           padding: [20, 20],
           maxZoom: 13,
         });
+        hasFittedRef.current = true; // Виконуємо тільки один раз
       } catch (e) {
         console.error("Помилка fitBounds:", e);
       }
@@ -34,39 +37,78 @@ interface HexagonalGridProps {
     west: number;
   };
   onZonesSelected: (zones: any[]) => void;
+  gridType?: "hexagonal" | "square";
+  hexSizeM?: number;
 }
 
 // Стилі для шестикутників
 const defaultStyle = {
   color: "#3388ff",
-  weight: 2,
-  opacity: 0.7,
-  fillOpacity: 0.1,
+  weight: 1.5,
+  opacity: 0.8,
+  fillOpacity: 0.15,
 };
 
 const selectedStyle = {
-  color: "#ff0000",
-  weight: 4,
+  color: "#dc2626",
+  weight: 3,
   opacity: 1,
-  fillOpacity: 0.5,
-  fillColor: "#ff0000",
+  fillOpacity: 0.6,
+  fillColor: "#ef4444",
 };
 
 const hoverStyle = {
-  color: "#00ff00",
-  weight: 2,
-  opacity: 0.9,
-  fillOpacity: 0.2,
+  color: "#10b981",
+  weight: 2.5,
+  opacity: 1,
+  fillOpacity: 0.3,
+  fillColor: "#34d399",
 };
 
-export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGridProps) {
+export default function HexagonalGrid({ 
+  bounds, 
+  onZonesSelected,
+  gridType: externalGridType = "hexagonal",
+  hexSizeM: externalHexSizeM = 500.0,
+}: HexagonalGridProps) {
+  const normalizeId = (id: any): string => String(id ?? "");
   const [hexGrid, setHexGrid] = useState<any>(null);
   const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
+  // Ordered selection (so zones can be generated and previewed "one after another")
+  const [selectedOrder, setSelectedOrder] = useState<string[]>([]);
   const [hoveredZone, setHoveredZone] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isValid, setIsValid] = useState(true);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
-  const [gridType, setGridType] = useState<"hexagonal" | "square">("hexagonal");
+
+  // IMPORTANT: Leaflet feature handlers are attached once and keep stale React closures.
+  // Use refs as the source of truth for click/hover handlers.
+  const hexGridRef = useRef<any>(null);
+  const selectedZonesRef = useRef<Set<string>>(new Set());
+  const selectedOrderRef = useRef<string[]>([]);
+  const hoveredZoneRef = useRef<string | null>(null);
+  const onZonesSelectedRef = useRef(onZonesSelected);
+
+  useEffect(() => {
+    hexGridRef.current = hexGrid;
+  }, [hexGrid]);
+  useEffect(() => {
+    selectedZonesRef.current = new Set(selectedZones);
+  }, [selectedZones]);
+  useEffect(() => {
+    selectedOrderRef.current = [...selectedOrder];
+  }, [selectedOrder]);
+  useEffect(() => {
+    hoveredZoneRef.current = hoveredZone;
+  }, [hoveredZone]);
+  useEffect(() => {
+    onZonesSelectedRef.current = onZonesSelected;
+  }, [onZonesSelected]);
+  
+  // Використовуємо зовнішні значення якщо передані, інакше внутрішні
+  const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square">("hexagonal");
+  const gridType = externalGridType || internalGridType;
+  const hexSizeM = externalHexSizeM || 500.0;
 
   const generateGrid = async () => {
     if (isLoading) return; // Запобігаємо подвійній генерації
@@ -83,13 +125,13 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
         throw new Error(`Невірні координати bounds: north=${bounds?.north}, south=${bounds?.south}, east=${bounds?.east}, west=${bounds?.west}`);
       }
       
-      console.log("[HexagonalGrid] Відправляємо запит до API з bounds:", bounds);
+      console.log("[HexagonalGrid] Відправляємо запит до API з bounds:", bounds, "gridType:", gridType, "hexSizeM:", hexSizeM);
       const data = await api.generateHexagonalGrid({
         north: bounds.north,
         south: bounds.south,
         east: bounds.east,
         west: bounds.west,
-        hex_size_m: 1000.0, // 1 км
+        hex_size_m: hexSizeM,
         grid_type: gridType,
       });
       
@@ -124,62 +166,97 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
     }
   };
 
-  const handleZoneClick = (zoneId: string, feature: any, event?: L.LeafletMouseEvent) => {
-    console.log(`[HexagonalGrid] handleZoneClick called for zoneId: ${zoneId}, current selected:`, Array.from(selectedZones));
+  const handleZoneClick = (zoneIdRaw: any) => {
+    const zoneId = normalizeId(zoneIdRaw);
+    const currentSelected = selectedZonesRef.current;
+    const currentOrder = selectedOrderRef.current;
+    console.log(`[HexagonalGrid] handleZoneClick called for zoneId: ${zoneId}, current selected:`, Array.from(currentSelected));
     
     if (!zoneId) {
       console.error("[HexagonalGrid] zoneId is empty!");
       return;
     }
     
-    const newSelected = new Set(selectedZones);
+    const nextSelected = new Set(currentSelected);
+    let nextOrder = [...currentOrder];
     
     // Перемикаємо стан зони
-    if (newSelected.has(zoneId)) {
-      newSelected.delete(zoneId);
-      console.log(`[HexagonalGrid] Zone ${zoneId} deselected. Total selected: ${newSelected.size}`);
+    if (nextSelected.has(zoneId)) {
+      nextSelected.delete(zoneId);
+      nextOrder = nextOrder.filter((id) => id !== zoneId);
+      console.log(`[HexagonalGrid] Zone ${zoneId} deselected. Total selected: ${nextSelected.size}`);
     } else {
-      newSelected.add(zoneId);
-      console.log(`[HexagonalGrid] Zone ${zoneId} selected. Total selected: ${newSelected.size}`);
+      nextSelected.add(zoneId);
+      // Add to the end to preserve click order
+      if (!nextOrder.includes(zoneId)) nextOrder.push(zoneId);
+      console.log(`[HexagonalGrid] Zone ${zoneId} selected. Total selected: ${nextSelected.size}`);
     }
-    setSelectedZones(newSelected);
+    // Sync refs immediately (so next click sees updated state even before React renders)
+    selectedZonesRef.current = nextSelected;
+    selectedOrderRef.current = nextOrder;
+    setSelectedZones(nextSelected);
+    setSelectedOrder(nextOrder);
     
-    // Оновлюємо список вибраних зон - використовуємо правильний ID
-    const selectedFeatures = hexGrid.features.filter((f: any) => {
-      const fId = f.id || f.properties?.id;
-      return newSelected.has(fId);
-    });
+    // Оновлюємо список вибраних зон у стабільному порядку (click-order),
+    // щоб backend створював задачі у тій же послідовності.
+    const featureById = new Map<string, any>();
+    for (const f of (hexGridRef.current?.features || [])) {
+      const fId = normalizeId(f.id || f.properties?.id);
+      if (fId) featureById.set(fId, f);
+    }
+    const selectedFeatures = nextOrder.map((id) => featureById.get(id)).filter(Boolean);
     
     console.log(`[HexagonalGrid] Selected features count: ${selectedFeatures.length}`);
-    onZonesSelected(selectedFeatures);
+    onZonesSelectedRef.current(selectedFeatures);
   };
 
   const handleSelectAll = () => {
     if (!hexGrid || !hexGrid.features) return;
-    const allZoneIds = new Set(hexGrid.features.map((f: any) => f.id || f.properties?.id));
+    const all = (hexGrid.features || [])
+      .map((f: any) => ({ id: normalizeId(f.id || f.properties?.id), feature: f }))
+      .filter((x: any) => !!x.id);
+    // Default order: by row/col if present (better UX for "in a row" selections), else original order
+    all.sort((a: any, b: any) => {
+      const ar = a.feature?.properties?.row;
+      const br = b.feature?.properties?.row;
+      const ac = a.feature?.properties?.col;
+      const bc = b.feature?.properties?.col;
+      if (ar != null && br != null && ar !== br) return ar - br;
+      if (ac != null && bc != null && ac !== bc) return ac - bc;
+      return String(a.id).localeCompare(String(b.id));
+    });
+    const allZoneIds = new Set(all.map((x: any) => x.id));
+    selectedZonesRef.current = allZoneIds;
+    selectedOrderRef.current = all.map((x: any) => x.id);
     setSelectedZones(allZoneIds);
-    onZonesSelected(hexGrid.features);
+    setSelectedOrder(all.map((x: any) => x.id));
+    onZonesSelectedRef.current(all.map((x: any) => x.feature));
     console.log(`[HexagonalGrid] All ${allZoneIds.size} zones selected`);
   };
 
   const handleDeselectAll = () => {
+    selectedZonesRef.current = new Set();
+    selectedOrderRef.current = [];
     setSelectedZones(new Set());
-    onZonesSelected([]);
+    setSelectedOrder([]);
+    onZonesSelectedRef.current([]);
     console.log("[HexagonalGrid] All zones deselected");
   };
 
   const handleZoneHover = (zoneId: string | null) => {
+    hoveredZoneRef.current = zoneId;
     setHoveredZone(zoneId);
   };
 
   const getZoneStyle = (zoneId: string) => {
-    if (!zoneId) {
+    const zid = normalizeId(zoneId);
+    if (!zid) {
       console.warn("[HexagonalGrid] getZoneStyle called with empty zoneId");
       return defaultStyle;
     }
     
-    const isSelected = selectedZones.has(zoneId);
-    const isHovered = hoveredZone === zoneId;
+    const isSelected = selectedZonesRef.current.has(zid);
+    const isHovered = hoveredZoneRef.current === zid;
     
     if (isSelected) {
       return selectedStyle;
@@ -220,79 +297,55 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
       return () => clearTimeout(timer);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bounds?.north, bounds?.south, bounds?.east, bounds?.west, hexGrid, isLoading, gridType]); // перегенеруємо при зміні bounds/gridType
+  }, [bounds?.north, bounds?.south, bounds?.east, bounds?.west, hexGrid, isLoading, gridType, hexSizeM]); // перегенеруємо при зміні bounds/gridType/hexSizeM
 
   const zoom = 11; // Оптимальний zoom для Києва
 
   return (
     <div className="w-full h-full flex flex-col">
-      <div className="p-3 bg-gray-50 border-b flex-shrink-0">
+      <div className="px-2 py-1.5 bg-white border-b border-gray-200 flex-shrink-0 shadow-sm">
         {isLoading ? (
-          <div className="flex items-center gap-2 text-sm">
-            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-500"></div>
-            <span>Генерація сітки...</span>
+          <div className="flex items-center gap-1.5 text-[11px]">
+            <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-blue-500"></div>
+            <span className="text-gray-700">Генерація сітки...</span>
           </div>
         ) : hexGrid ? (
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <label className="text-xs font-semibold text-gray-700">Тип сітки:</label>
-              <select
-                className="text-xs border rounded px-2 py-1"
-                value={gridType}
-                onChange={(e) => {
-                  const next = e.target.value as "hexagonal" | "square";
-                  // скидаємо вибір, щоб не було міксу id/feature різних сіток
-                  setSelectedZones(new Set());
-                  onZonesSelected([]);
-                  setHexGrid(null);
-                  setGridType(next);
-                }}
-              >
-                <option value="hexagonal">Шестикутники</option>
-                <option value="square">Квадрати</option>
-              </select>
-            </div>
-            <div className="text-xs space-y-1">
-              <p className="font-semibold">Клітинок: {hexGrid.features.length}</p>
-              <p className="font-semibold text-blue-600">Вибрано: {selectedZones.size}</p>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 text-[11px]">
+              <span className="font-medium text-gray-700">
+                Клітинок: <span className="text-gray-900 font-semibold">{hexGrid.features.length}</span>
+              </span>
+              <span className="font-medium text-blue-700">
+                Вибрано: <span className="text-blue-800 font-bold">{selectedZones.size}</span>
+              </span>
               {selectedZones.size > 0 && (
-                <p className="text-green-600 font-medium">Готово до генерації!</p>
+                <span className="text-green-700 font-semibold">✓ Готово</span>
               )}
               {!isValid && validationErrors.length > 0 && (
-                <div className="text-red-500 mt-1 text-xs">
-                  <p>Попередження: {validationErrors.length} помилок</p>
-                </div>
+                <span className="text-red-600 text-[10px]">
+                  ⚠ {validationErrors.length} помилок
+                </span>
               )}
             </div>
-            <div className="space-y-2">
-              <div className="flex gap-2 flex-wrap">
-                <button
-                  onClick={handleSelectAll}
-                  className="px-2 py-1 text-xs bg-blue-500 text-white rounded hover:bg-blue-600"
-                  title="Вибрати всі зони"
-                >
-                  Вибрати всі
-                </button>
-                <button
-                  onClick={handleDeselectAll}
-                  className="px-2 py-1 text-xs bg-gray-500 text-white rounded hover:bg-gray-600"
-                  title="Зняти вибір з усіх зон"
-                >
-                  Зняти вибір
-                </button>
-              </div>
-              <div className="text-xs text-gray-600 space-y-1 border-t pt-2">
-                <p className="font-semibold">Як вибрати зони:</p>
-                <ul className="list-disc list-inside space-y-0.5 text-[10px]">
-                  <li>Клікніть по зоні для вибору/зняття вибору</li>
-                  <li>Можна вибрати будь-яку кількість зон</li>
-                  <li>Вибрані зони виділені <span className="text-red-600 font-bold">червоним</span> кольором</li>
-                </ul>
-              </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={handleSelectAll}
+                className="px-2 py-0.5 text-[10px] bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                title="Вибрати всі зони"
+              >
+                Всі
+              </button>
+              <button
+                onClick={handleDeselectAll}
+                className="px-2 py-0.5 text-[10px] bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors"
+                title="Зняти вибір з усіх зон"
+              >
+                Очистити
+              </button>
             </div>
           </div>
         ) : (
-          <div className="text-xs text-gray-600">Генерація сітки...</div>
+          <div className="text-[11px] text-gray-600">Генерація сітки...</div>
         )}
       </div>
 
@@ -314,10 +367,11 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
           
           {hexGrid && hexGrid.features && hexGrid.features.length > 0 && (
             <GeoJSON
-              key={`hex-grid-${hexGrid.features.length}-${selectedZones.size}`}
+              // IMPORTANT: Do NOT remount on selection changes, otherwise the map/tiles can "jump back".
+              key={`hex-grid-${hexGrid.features.length}-${gridType}-${hexSizeM}`}
               data={hexGrid}
               style={(feature) => {
-                const zoneId = feature?.properties?.id || feature?.id;
+                const zoneId = normalizeId(feature?.properties?.id || feature?.id);
                 if (!zoneId) {
                   console.warn("[HexagonalGrid] Feature without ID in style function:", feature);
                   return defaultStyle;
@@ -326,7 +380,7 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
                 return style;
               }}
               onEachFeature={(feature, layer) => {
-                const zoneId = feature?.properties?.id || feature?.id;
+                const zoneId = normalizeId(feature?.properties?.id || feature?.id);
                 
                 if (!zoneId) {
                   console.error("[HexagonalGrid] Feature without ID:", feature);
@@ -341,12 +395,18 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
                 layer.on({
                   click: (e: L.LeafletMouseEvent) => {
                     e.originalEvent?.stopPropagation?.();
+                    e.originalEvent?.preventDefault?.();
                     console.log(`[HexagonalGrid] Zone ${zoneId} clicked, event:`, e);
-                    handleZoneClick(zoneId, feature, e);
+                    // Apply immediate visual feedback based on ref state (no stale closures)
+                    const willSelect = !selectedZonesRef.current.has(zoneId);
+                    handleZoneClick(zoneId);
                     
                     // Оновлюємо стиль після кліку
                     setTimeout(() => {
-                      layer.setStyle(getZoneStyle(zoneId));
+                      // Use immediate decision first, then fallback to state-driven style
+                      layer.setStyle(willSelect ? selectedStyle : defaultStyle);
+                      // After state settles, sync with computed style
+                      setTimeout(() => layer.setStyle(getZoneStyle(zoneId)), 0);
                     }, 0);
                   },
                   mouseover: () => {
@@ -359,11 +419,17 @@ export default function HexagonalGrid({ bounds, onZonesSelected }: HexagonalGrid
                   },
                 });
 
-                // Додаємо popup з інформацією
+                // Додаємо popup з інформацією (тільки при наведенні, не при кліку)
                 const props = feature.properties || {};
                 const isSelected = selectedZones.has(zoneId);
-                layer.bindPopup(
-                  `<b>Зона ${zoneId}</b><br/>Ряд: ${props.row}, Колонка: ${props.col}<br/>${isSelected ? '<span style="color: red; font-weight: bold;">✓ Вибрано</span>' : '<span style="color: gray;">Клікніть для вибору</span>'}`
+                layer.bindTooltip(
+                  `<b>Зона ${zoneId}</b><br/>Ряд: ${props.row}, Колонка: ${props.col}<br/>${isSelected ? '<span style="color: red; font-weight: bold;">✓ Вибрано</span>' : '<span style="color: gray;">Клікніть для вибору</span>'}`,
+                  {
+                    permanent: false,
+                    direction: 'top',
+                    offset: [0, -10],
+                    className: 'zone-tooltip'
+                  }
                 );
               }}
             />

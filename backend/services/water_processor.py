@@ -165,7 +165,7 @@ def process_water_surface(
         try:
             min_x, max_x, min_y, max_y = terrain_provider.get_bounds()
             clip_box = box(min_x, min_y, max_x, max_y)
-            print(f"[DEBUG] Water clip_box (локальні): x=[{min_x:.2f}, {max_x:.2f}], y=[{min_y:.2f}, {max_y:.2f}]")
+            # print(f"[DEBUG] Water clip_box (локальні): x=[{min_x:.2f}, {max_x:.2f}], y=[{min_y:.2f}, {max_y:.2f}]")
         except Exception as e:
             print(f"[WARN] Не вдалося створити clip_box для води: {e}")
             clip_box = None
@@ -175,20 +175,20 @@ def process_water_surface(
     for idx, row in gdf_water.iterrows():
         geom = row.geometry
         if geom is None:
-            print(f"[DEBUG] Water geometry {idx} is None, пропускаємо")
+            # print(f"[DEBUG] Water geometry {idx} is None, пропускаємо")
             skipped_count += 1
             continue
         
         # Діагностика геометрії
         try:
             geom_bounds = geom.bounds if hasattr(geom, 'bounds') else None
-            print(f"[DEBUG] Water geometry {idx} bounds: {geom_bounds}, valid={geom.is_valid if hasattr(geom, 'is_valid') else 'unknown'}")
+            # print(f"[DEBUG] Water geometry {idx} bounds: {geom_bounds}, valid={geom.is_valid if hasattr(geom, 'is_valid') else 'unknown'}")
         except:
             pass
         
         try:
             if not geom.is_valid:
-                print(f"[DEBUG] Water geometry {idx} невалідна, виправляємо через buffer(0)")
+                # print(f"[DEBUG] Water geometry {idx} невалідна, виправляємо через buffer(0)")
                 geom = geom.buffer(0)
                 if geom.is_empty:
                     print(f"[WARN] Water geometry {idx} стала порожньою після buffer(0)")
@@ -225,7 +225,7 @@ def process_water_surface(
             pass
 
         polys = [geom] if isinstance(geom, Polygon) else list(getattr(geom, "geoms", []))
-        print(f"[DEBUG] Water geometry {idx} розбито на {len(polys)} полігонів")
+        # print(f"[DEBUG] Water geometry {idx} розбито на {len(polys)} полігонів")
         
         for poly_idx, poly in enumerate(polys):
             if not isinstance(poly, Polygon) or poly.is_empty:
@@ -265,7 +265,7 @@ def process_water_surface(
                 # Замість цього використовуємо оригінальний mesh з extrude_polygon
                 # Якщо потрібна більша деталізація - краще збільшити кількість точок в полігоні
                 # mesh = mesh.subdivide()  # ВИМКНЕНО - створює нерегулярну сітку
-                print(f"[DEBUG] Water mesh: {len(mesh.vertices)} вершин (без subdivision для регулярної сітки)")
+                # print(f"[DEBUG] Water mesh: {len(mesh.vertices)} вершин (без subdivision для регулярної сітки)")
             except Exception as e:
                 print(f"[WARN] Помилка extrude_polygon для poly {idx}_{poly_idx}: {e}")
                 import traceback
@@ -281,7 +281,7 @@ def process_water_surface(
                 # Це забезпечує регулярну сітку без "розділених" точок
                 # Всі точки семплінгу відповідають вершинам mesh, що гарантує узгодженість
                 points_array = v[:, :2]  # Використовуємо тільки вершини mesh (регулярна сітка)
-                print(f"[DEBUG] Water polygon {idx}_{poly_idx}: використовуємо {len(points_array)} вершин mesh для семплінгу (регулярна сітка)")
+                # print(f"[DEBUG] Water polygon {idx}_{poly_idx}: використовуємо {len(points_array)} вершин mesh для семплінгу (регулярна сітка)")
                 
                 # ВАЖЛИВО: для правильного розміщення води потрібно використовувати ОРИГІНАЛЬНІ висоти рельєфу
                 # (до вирізання depression), а не дно depression
@@ -348,11 +348,11 @@ def process_water_surface(
                             original_ground - 0.02  # Але не вище оригінального рельєфу мінус 2см
                         )
                         surface_levels = np.maximum(surface_levels, base_water_level)
-                        print(f"[DEBUG] Water protrusion занадто великий ({max_protrusion:.3f}м), зменшено до {water_protrusion_m:.3f}м")
+                        # print(f"[DEBUG] Water protrusion занадто великий ({max_protrusion:.3f}м), зменшено до {water_protrusion_m:.3f}м")
                     
-                    print(f"[DEBUG] Water analysis: depression=[{min_depression:.3f}, {max_depression:.3f}], avg={avg_depression:.3f}м")
-                    print(f"[DEBUG] Water surface levels: range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}], median={np.median(surface_levels):.3f}")
-                    print(f"[DEBUG] Water protrusion над дном depression: min={min_protrusion:.3f}м, max={max_protrusion:.3f}м, target={water_protrusion_m:.3f}м")
+                    # print(f"[DEBUG] Water analysis: depression=[{min_depression:.3f}, {max_depression:.3f}], avg={avg_depression:.3f}м")
+                    # print(f"[DEBUG] Water surface levels: range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}], median={np.median(surface_levels):.3f}")
+                    # print(f"[DEBUG] Water protrusion над дном depression: min={min_protrusion:.3f}м, max={max_protrusion:.3f}м, target={water_protrusion_m:.3f}м")
                 else:
                     # Fallback: використовуємо дно depression + глибина
                     ground = terrain_provider.get_heights_for_points(points_array if len(points_array) > 0 else v[:, :2])
@@ -383,7 +383,7 @@ def process_water_surface(
                             surface_levels - (thickness - old_z)  # Проміжні: інтерполяція
                         )
                     )
-                    print(f"[DEBUG] Water mesh: використано {len(surface_levels)} значень для вершин (верх: {np.sum(is_top_surface)}, низ: {np.sum(is_bottom_surface)})")
+                    # print(f"[DEBUG] Water mesh: використано {len(surface_levels)} значень для вершин (верх: {np.sum(is_top_surface)}, низ: {np.sum(is_bottom_surface)})")
                 elif len(surface_levels) > 0:
                     # Якщо кількість не співпадає (не повинно бути, але на всяк випадок)
                     # Використовуємо медіанне значення для всіх вершин
@@ -435,7 +435,7 @@ def process_water_surface(
             if len(mesh.faces) > 0 and len(mesh.vertices) > 0:
                 meshes.append(mesh)
                 processed_count += 1
-                print(f"[DEBUG] Water polygon оброблено: {len(mesh.vertices)} вершин, {len(mesh.faces)} граней")
+                # print(f"[DEBUG] Water polygon оброблено: {len(mesh.vertices)} вершин, {len(mesh.faces)} граней")
             else:
                 print(f"[WARN] Water polygon пропущено: vertices={len(mesh.vertices)}, faces={len(mesh.faces)}")
                 skipped_count += 1

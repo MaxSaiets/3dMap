@@ -119,6 +119,10 @@ async function loadColoredPartsFromBlobs(blobs: Partial<Record<"base" | "roads" 
       mat.flatShading = false;
       mat.roughness = 1.0;
       mat.metalness = 0.0;
+      // Prevent z-fighting “thin green lines” on top of terrain in preview
+      mat.polygonOffset = true;
+      mat.polygonOffsetFactor = -0.2;
+      mat.polygonOffsetUnits = -2;
       mat.needsUpdate = true;
     } else if (part === "poi") {
       mat.flatShading = true;
@@ -246,24 +250,36 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
 
 // Компонент для автоматичного позиціювання камери
 function CameraController() {
-  const { downloadUrl } = useGenerationStore();
+  const { downloadUrl, showAllZones, taskIds } = useGenerationStore();
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   
   useEffect(() => {
-    // Налаштовуємо камеру для кращого перегляду (навіть без моделі)
+    // Налаштовуємо камеру для кращого перегляду
     const timer = setTimeout(() => {
       if (cameraRef.current) {
-        // Позиція камери для перегляду моделі розміром ~200-300 одиниць
-        const distance = 300;
-        cameraRef.current.position.set(distance, distance, distance);
-        cameraRef.current.lookAt(0, 0, 0);
+        // Для batch preview (всі зони) - більша відстань для кращого огляду
+        if (showAllZones && taskIds && taskIds.length > 1) {
+          const zoneCount = taskIds.length;
+          // Відстань залежить від кількості зон (більше зон = більша відстань)
+          const baseDistance = 300;
+          const distanceMultiplier = Math.max(1, Math.sqrt(zoneCount) * 0.5);
+          const distance = baseDistance * distanceMultiplier;
+          cameraRef.current.position.set(distance, distance * 0.8, distance);
+          cameraRef.current.lookAt(0, 0, 0);
+          console.log(`Камера налаштована для batch preview (${zoneCount} зон):`, cameraRef.current.position);
+        } else {
+          // Для однієї зони - стандартна відстань
+          const distance = 300;
+          cameraRef.current.position.set(distance, distance, distance);
+          cameraRef.current.lookAt(0, 0, 0);
+          console.log("Камера налаштована для однієї зони:", cameraRef.current.position);
+        }
         cameraRef.current.updateProjectionMatrix();
-        console.log("Камера налаштована:", cameraRef.current.position);
       }
     }, 100);
     
     return () => clearTimeout(timer);
-  }, [downloadUrl]);
+  }, [downloadUrl, showAllZones, taskIds]);
   
   return (
     <PerspectiveCamera 
@@ -280,7 +296,7 @@ function CameraController() {
 type RotateMode = "camera" | "model";
 
 function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
-  const { downloadUrl, activeTaskId, exportFormat, showAllZones, taskIds, taskStatuses } = useGenerationStore();
+  const { downloadUrl, activeTaskId, exportFormat, showAllZones, taskIds, taskStatuses, batchZoneMetaByTaskId } = useGenerationStore();
   const [model, setModel] = useState<THREE.Group | THREE.Mesh | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -470,7 +486,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
           return;
         }
 
-        // Уніфікований масштаб для всіх (щоб не було різних “розмірів”)
+        // Уніфікований масштаб для всіх (щоб не було різних "розмірів")
         const maxDimGlobal = Math.max(...models.map((m) => m.maxDim || 1));
         const globalScale = maxDimGlobal > 0 ? 200 / maxDimGlobal : 1;
 
@@ -481,24 +497,75 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
           group.add(m.obj);
         }
 
-        // layout
-        const boxes = models.map((m) => new THREE.Box3().setFromObject(m.obj));
-        const sizes = boxes.map((b) => b.getSize(new THREE.Vector3()));
-        const maxW = Math.max(...sizes.map((s) => s.x));
-        const maxD = Math.max(...sizes.map((s) => s.z));
-        const spacingX = maxW + 40;
-        const spacingZ = maxD + 40;
-        const cols = 2;
-
-        models.forEach((m, i) => {
-          const col = i % cols;
-          const row = Math.floor(i / cols);
-          m.obj.position.x += col * spacingX;
-          m.obj.position.z += row * spacingZ;
-          m.obj.updateMatrixWorld(true);
+        // Покращена логіка компактного розміщення зон
+        // 1. Обчислюємо розміри кожної зони після масштабування
+        const zoneInfo = models.map((m) => {
+          const box = new THREE.Box3().setFromObject(m.obj);
+          return {
+            size: box.getSize(new THREE.Vector3()),
+            center: box.getCenter(new THREE.Vector3()),
+            min: box.min.clone(),
+            model: m
+          };
         });
 
-        // center whole group
+        // 2) Layout like on the map (row/col) when available. Otherwise fallback to compact rows.
+        const metaByTaskId = batchZoneMetaByTaskId || {};
+        const canUseMapLayout = models.every((m) => {
+          const meta = (metaByTaskId as any)[m.id];
+          return meta && (meta.row != null || meta.col != null);
+        });
+
+        if (canUseMapLayout) {
+          const rows = models.map((m) => Number((metaByTaskId as any)[m.id].row ?? 0));
+          const cols = models.map((m) => Number((metaByTaskId as any)[m.id].col ?? 0));
+          const minRow = Math.min(...rows);
+          const minCol = Math.min(...cols);
+
+          const maxW = Math.max(...zoneInfo.map((z) => z.size.x));
+          const maxD = Math.max(...zoneInfo.map((z) => z.size.z));
+          // No gaps: slight overlap hides micro seams in preview
+          const stepX = maxW * 0.98;
+          const stepZ = maxD * 0.98;
+
+          zoneInfo.forEach((item) => {
+            const meta = (metaByTaskId as any)[item.model.id] || {};
+            const r = Number(meta.row ?? 0) - minRow;
+            const c = Number(meta.col ?? 0) - minCol;
+            const xShift = (r % 2) ? stepX * 0.5 : 0.0;
+
+            item.model.obj.position.x = c * stepX + xShift - item.center.x;
+            item.model.obj.position.z = r * stepZ - item.center.z;
+            item.model.obj.position.y = -item.min.y;
+            item.model.obj.updateMatrixWorld(true);
+          });
+        } else {
+          const minSpacing = 0.0;
+          const totalZones = models.length;
+          const cols = totalZones <= 6 ? totalZones : Math.ceil(Math.sqrt(totalZones));
+
+          let currentX = 0;
+          let currentZ = 0;
+          let maxDepthInRow = 0;
+
+          zoneInfo.forEach((item, i) => {
+            const col = i % cols;
+            if (col === 0 && i > 0) {
+              currentX = 0;
+              currentZ += maxDepthInRow + minSpacing;
+              maxDepthInRow = 0;
+            }
+            item.model.obj.position.x = currentX - item.center.x;
+            item.model.obj.position.z = currentZ - item.center.z;
+            item.model.obj.position.y = -item.min.y;
+            item.model.obj.updateMatrixWorld(true);
+
+            currentX += item.size.x + minSpacing;
+            maxDepthInRow = Math.max(maxDepthInRow, item.size.z);
+          });
+        }
+
+        // 5. Центруємо всю групу
         const groupBox = new THREE.Box3().setFromObject(group);
         const gCenter = groupBox.getCenter(new THREE.Vector3());
         const gMin = groupBox.min.clone();
@@ -507,7 +574,10 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
         group.position.y -= gMin.y;
         group.updateMatrixWorld(true);
 
-        (group as any).userData = { batch: true, ids: idsToLoad };
+        // Додаємо легкі візуальні індикатори для кожної зони (опціонально)
+        // Для продуктивності не додаємо складні об'єкти, але зберігаємо інформацію
+        
+        (group as any).userData = { batch: true, ids: idsToLoad, zoneCount: idsToLoad.length };
         setModel(group);
       } catch (e: any) {
         setError(e?.message || "Помилка завантаження batch превʼю");

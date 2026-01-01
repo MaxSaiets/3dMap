@@ -33,7 +33,7 @@ def hexagon_center_to_corner(center_x: float, center_y: float, size: float) -> L
 
 def generate_square_grid(
     bbox: Tuple[float, float, float, float],
-    square_size_m: float = 1000.0  # 1 км = 1000 м
+    square_size_m: float = 500.0  # 0.5 км = 500 м
 ) -> List[Dict]:
     """
     Генерує квадратну сітку для заданого bbox.
@@ -91,7 +91,7 @@ def generate_square_grid(
 
 def generate_hexagonal_grid(
     bbox: Tuple[float, float, float, float],
-    hex_size_m: float = 1000.0  # 1 км = 1000 м
+    hex_size_m: float = 500.0  # 0.5 км = 500 м
 ) -> List[Dict]:
     """
     Генерує гексагональну сітку для заданого bbox.
@@ -238,6 +238,56 @@ def hexagons_to_geojson(cells: List[Dict], to_wgs84=None) -> Dict:
         'type': 'FeatureCollection',
         'features': features
     }
+
+
+def calculate_grid_center_from_geojson(geojson: Dict, to_wgs84=None) -> Tuple[float, float]:
+    """
+    Обчислює оптимальний центр для всієї сітки на основі GeoJSON features.
+    Це забезпечує, що всі клітинки використовують одну точку відліку (0,0).
+    
+    Args:
+        geojson: GeoJSON FeatureCollection з клітинками сітки
+        to_wgs84: Функція для конвертації координат в WGS84 (якщо координати в UTM)
+    
+    Returns:
+        Tuple (center_lat, center_lon) - центр всієї сітки в WGS84
+    """
+    if not geojson or 'features' not in geojson:
+        raise ValueError("GeoJSON не містить features")
+    
+    features = geojson['features']
+    if not features:
+        raise ValueError("GeoJSON не містить жодних features")
+    
+    # Збираємо всі координати з усіх features
+    all_lons = []
+    all_lats = []
+    
+    for feature in features:
+        geometry = feature.get('geometry', {})
+        if geometry.get('type') != 'Polygon':
+            continue
+        
+        coordinates = geometry.get('coordinates', [])
+        if not coordinates or len(coordinates) == 0:
+            continue
+        
+        # Знаходимо координати з feature
+        all_coords = [coord for ring in coordinates for coord in ring]
+        feature_lons = [coord[0] for coord in all_coords]
+        feature_lats = [coord[1] for coord in all_coords]
+        
+        all_lons.extend(feature_lons)
+        all_lats.extend(feature_lats)
+    
+    if len(all_lons) == 0 or len(all_lats) == 0:
+        raise ValueError("Не вдалося отримати координати з features")
+    
+    # Обчислюємо центр (середнє значення)
+    center_lon = (min(all_lons) + max(all_lons)) / 2.0
+    center_lat = (min(all_lats) + max(all_lats)) / 2.0
+    
+    return (center_lat, center_lon)
 
 
 def validate_hexagonal_grid(hexagons: List[Dict], tolerance: float = 0.01) -> Tuple[bool, List[str]]:

@@ -193,6 +193,7 @@ def detect_bridges(
     G_roads,
     water_geometries: Optional[List] = None,
     bridge_tag: str = 'bridge',
+    bridge_buffer_m: float = 12.0,  # buffer around bridge centerline to mark only the bridge area
 ) -> List[Tuple[object, float]]:
     """
     Визначає мости: дороги, які перетинають воду або мають тег bridge=yes
@@ -203,7 +204,7 @@ def detect_bridges(
         bridge_tag: Тег для визначення мостів в OSM
         
     Returns:
-        Список кортежів (edge_geometry, bridge_height_offset) - геометрія дороги та зміщення висоти для моста
+        Список кортежів (bridge_area_geometry, bridge_height_offset) - геометрія ОБЛАСТІ моста та зміщення висоти
     """
     bridges = []
     
@@ -299,7 +300,28 @@ def detect_bridges(
                     print(f"[WARN] Помилка перевірки перетину дороги з водою: {e}")
             
             if is_bridge:
-                bridges.append((geom, bridge_height))
+                # IMPORTANT: return an AREA geometry for bridge marking.
+                # Using raw edge LineString causes almost all buffered road polygons to "intersect a bridge".
+                try:
+                    bridge_area = geom
+                    # If bridge is detected by water intersection, constrain to the water-crossing portion.
+                    if water_union is not None:
+                        try:
+                            inter = geom.intersection(water_union)
+                            if inter is not None and not inter.is_empty:
+                                bridge_area = inter
+                        except Exception:
+                            pass
+                    # Buffer into an area (polygon) so later intersection is spatially tight.
+                    try:
+                        bridge_area = bridge_area.buffer(float(bridge_buffer_m), cap_style=2, join_style=2)
+                    except Exception:
+                        bridge_area = geom.buffer(float(bridge_buffer_m))
+                    if bridge_area is not None and not bridge_area.is_empty:
+                        bridges.append((bridge_area, bridge_height))
+                except Exception:
+                    # Fallback to raw geometry if buffering fails
+                    bridges.append((geom, bridge_height))
                 
         except Exception as e:
             print(f"[WARN] Помилка обробки дороги для визначення моста: {e}")
@@ -312,6 +334,7 @@ def detect_bridges(
 def build_road_polygons(
     G_roads,
     width_multiplier: float = 1.0,
+    min_width_m: Optional[float] = None,
 ) -> Optional[object]:
     """
     Builds merged road polygons (2D) from a roads graph/edges gdf.
@@ -361,7 +384,14 @@ def build_road_polygons(
         elif not highway:
             return 3.0
         width = width_map.get(highway, 3.0)
-        return width * width_multiplier
+        width = width * width_multiplier
+        # Ensure minimum printable width (in world meters)
+        try:
+            if min_width_m is not None:
+                width = max(float(width), float(min_width_m))
+        except Exception:
+            pass
+        return width
 
     if 'highway' in gdf_edges.columns:
         gdf_edges = gdf_edges.copy()
@@ -403,6 +433,8 @@ def process_roads(
     water_geometries: Optional[List] = None,  # Геометрії водних об'єктів для визначення мостів
     bridge_height_multiplier: float = 1.0,  # Множник для висоти мостів
     global_center: Optional[GlobalCenter] = None,  # Глобальний центр для перетворення координат
+    min_width_m: Optional[float] = None,  # Мінімальна ширина дороги (в метрах у world units)
+    clip_polygon: Optional[object] = None,  # Zone polygon in LOCAL coords (for pre-clipping)
 ) -> Optional[trimesh.Trimesh]:
     """
     Обробляє дорожню мережу, створюючи 3D меші з правильною шириною
@@ -430,34 +462,51 @@ def process_roads(
             warnings.simplefilter("ignore", DeprecationWarning)
             gdf_edges = ox.graph_to_gdfs(G_roads, nodes=False)
     
-    # Build or reuse merged road geometry
-    if merged_roads is None:
-        print("Створення буферів доріг...")
-        merged_roads = build_road_polygons(G_roads, width_multiplier=width_multiplier)
-    if merged_roads is None:
-        return None
-    
-    # ВАЖЛИВО: Перетворюємо merged_roads з UTM в локальні координати, якщо використовується глобальний центр
-    # merged_roads приходить з pbf_loader в UTM координатах, але terrain_provider працює з локальними координатами
-    if global_center is not None:
+    # Helper: decide if geometry looks like UTM (huge coordinates) and convert to local if needed
+    def _looks_like_utm(g) -> bool:
         try:
-            print(f"[DEBUG] Перетворюємо merged_roads з UTM в локальні координати (глобальний центр)")
-            # Створюємо функцію трансформації для Shapely
+            b = g.bounds
+            return max(abs(float(b[0])), abs(float(b[1])), abs(float(b[2])), abs(float(b[3]))) > 100000.0
+        except Exception:
+            return False
+
+    def _to_local_geom(g):
+        if g is None or global_center is None:
+            return g
+        try:
+            if not _looks_like_utm(g):
+                return g
             def to_local_transform(x, y, z=None):
-                """Трансформер: UTM -> локальні координати"""
                 x_local, y_local = global_center.to_local(x, y)
                 if z is not None:
                     return (x_local, y_local, z)
                 return (x_local, y_local)
-            
-            # Перетворюємо геометрію доріг в локальні координати
-            merged_roads = transform(to_local_transform, merged_roads)
-            print(f"[DEBUG] Перетворено merged_roads в локальні координати")
-        except Exception as e:
-            print(f"[WARN] Не вдалося перетворити merged_roads в локальні координати: {e}")
-            import traceback
-            traceback.print_exc()
+            return transform(to_local_transform, g)
+        except Exception:
+            return g
+
+    # Build or reuse merged road geometry
+    if merged_roads is None:
+        print("Створення буферів доріг...")
+        merged_roads = build_road_polygons(G_roads, width_multiplier=width_multiplier, min_width_m=min_width_m)
+    if merged_roads is None:
+        return None
     
+    # Ensure merged_roads are in LOCAL coords if we have global_center
+    merged_roads = _to_local_geom(merged_roads)
+    
+    # Pre-clip to zone polygon (LOCAL coords) to prevent roads outside the zone.
+    if clip_polygon is not None:
+        try:
+            clip_poly_local = clip_polygon
+            # If clip_polygon came in UTM, convert too
+            clip_poly_local = _to_local_geom(clip_poly_local)
+            merged_roads = merged_roads.intersection(clip_poly_local)
+            if merged_roads is None or merged_roads.is_empty:
+                return None
+        except Exception:
+            pass
+
     # Якщо є рельєф — кліпимо дороги в межі рельєфу (буферизація може виходити за bbox і давати "провали")
     if terrain_provider is not None:
         try:
@@ -506,34 +555,46 @@ def process_roads(
     
     # ВАЖЛИВО: Перетворюємо water_geometries в локальні координати для визначення мостів
     water_geoms_local = None
-    if water_geometries is not None and global_center is not None:
+    if water_geometries is not None:
         try:
-            print(f"[DEBUG] Перетворюємо water_geometries для мостів з UTM в локальні координати")
-            def to_local_transform(x, y, z=None):
-                """Трансформер: UTM -> локальні координати"""
-                x_local, y_local = global_center.to_local(x, y)
-                if z is not None:
-                    return (x_local, y_local, z)
-                return (x_local, y_local)
-            
-            water_geoms_local = []
-            for geom in water_geometries:
-                if geom is not None and not geom.is_empty:
-                    local_geom = transform(to_local_transform, geom)
-                    if local_geom is not None and not local_geom.is_empty:
-                        water_geoms_local.append(local_geom)
-            print(f"[DEBUG] Перетворено {len(water_geoms_local)} water geometries для мостів в локальні координати")
-        except Exception as e:
-            print(f"[WARN] Не вдалося перетворити water_geometries для мостів: {e}")
-            water_geoms_local = water_geometries  # Використовуємо оригінальні як fallback
-    else:
-        water_geoms_local = water_geometries
+            water_geoms_local = [_to_local_geom(g) for g in water_geometries if g is not None and not getattr(g, "is_empty", False)]
+        except Exception:
+            water_geoms_local = water_geometries
+
+    # Ensure edges are in local coords for bridge detection (otherwise intersects never match)
+    try:
+        if global_center is not None and gdf_edges is not None and not gdf_edges.empty:
+            # If edges look like UTM, convert to local
+            sample_geom = gdf_edges.iloc[0].geometry if len(gdf_edges) else None
+            if sample_geom is not None and _looks_like_utm(sample_geom):
+                def to_local_transform(x, y, z=None):
+                    x_local, y_local = global_center.to_local(x, y)
+                    if z is not None:
+                        return (x_local, y_local, z)
+                    return (x_local, y_local)
+                gdf_edges = gdf_edges.copy()
+                gdf_edges["geometry"] = gdf_edges["geometry"].apply(lambda g: transform(to_local_transform, g) if g is not None and not g.is_empty else g)
+                # Also convert G_roads to edges gdf mode for bridge detection
+                G_roads = gdf_edges
+    except Exception:
+        pass
     
     # Визначаємо мости перед обробкою (використовуємо локальні координати)
+    # NOTE: detect_bridges returns bridge AREAS (buffered), not raw edge lines.
     bridges = detect_bridges(G_roads, water_geometries=water_geoms_local)
-    bridge_geoms = {geom: height for geom, height in bridges} if bridges else {}
     
-    print(f"Створення 3D мешу доріг з {len(road_geoms)} полігонів (мостів: {len(bridge_geoms)})...")
+    # Precompute bridge union for splitting polygons: generate bridge deck only where needed.
+    bridge_areas = [g for g, _h in (bridges or []) if g is not None and not getattr(g, "is_empty", False)]
+    bridge_union = None
+    if bridge_areas:
+        try:
+            bridge_union = unary_union(bridge_areas)
+            if bridge_union is not None and getattr(bridge_union, "is_empty", False):
+                bridge_union = None
+        except Exception:
+            bridge_union = None
+
+    print(f"Створення 3D мешу доріг з {len(road_geoms)} полігонів (мостів: {len(bridges) if bridges else 0})...")
     road_meshes = []
     
     for poly in road_geoms:
@@ -541,256 +602,162 @@ def process_roads(
             # Використовуємо trimesh.creation.extrude_polygon для надійної екструзії
             # Це автоматично обробляє дірки (holes) та правильно тріангулює
             try:
-                # Перевіряємо чи це міст
-                is_bridge = False
-                bridge_height_offset = 0.0
-                
-                # Перевіряємо чи полігон перетинається з мостами
-                for bridge_geom, bridge_h in bridge_geoms.items():
+                def _iter_polys(g):
+                    if g is None or getattr(g, "is_empty", False):
+                        return []
+                    gt = getattr(g, "geom_type", "")
+                    if gt == "Polygon":
+                        return [g]
+                    if gt == "MultiPolygon":
+                        return list(g.geoms)
+                    if gt == "GeometryCollection":
+                        return [gg for gg in g.geoms if getattr(gg, "geom_type", "") == "Polygon"]
+                    return []
+
+                def _process_one(poly_part: Polygon, is_bridge: bool, bridge_height_offset: float):
+                    # embed not > road height
+                    rh = max(float(road_height), 0.0001)
+                    re = float(road_embed) if road_embed is not None else 0.0
+                    re = max(0.0, min(re, rh * 0.8))
+
+                    if poly_part is None or poly_part.is_empty:
+                        return
+
+                    # Clean polygon if needed
                     try:
-                        if poly.intersects(bridge_geom):
-                            is_bridge = True
-                            bridge_height_offset = bridge_h * bridge_height_multiplier
-                            break
-                    except:
-                        continue
-                
-                # Екструдуємо полігон на висоту road_height (для мостів додаємо зміщення)
-                rh = max(float(road_height), 0.0001)
-                if is_bridge:
-                    # ВИПРАВЛЕННЯ: Для мостів використовуємо bridge_height_offset як основну висоту
-                    # bridge_height_offset вже містить правильну висоту моста (2-5м залежно від типу)
-                    # Додаємо базову висоту дороги для товщини
-                    total_height = max(rh + bridge_height_offset, bridge_height_offset, 0.5)
-                    print(f"  [BRIDGE] Висота моста: {total_height:.2f}м (базова дорога: {rh:.2f}м + висота моста: {bridge_height_offset:.2f}м)")
-                else:
-                    total_height = rh
-                
-                # embed не має бути > road_height, інакше вся дорога "піде під землю"
-                re = float(road_embed) if road_embed is not None else 0.0
-                re = max(0.0, min(re, rh * 0.8))
-                
-                # ВИПРАВЛЕННЯ: Виправляємо полігон перед екструзією для уникнення помилки ring_end_indices
-                try:
-                    if not poly.is_valid:
-                        poly = poly.buffer(0)
-                        if poly.is_empty:
-                            print(f"  [SKIP] Полігон дороги став порожнім після виправлення")
-                            continue
-                    
-                    # Перевіряємо структуру полігону
-                    if hasattr(poly, 'exterior') and len(poly.exterior.coords) < 3:
-                        print(f"  [SKIP] Полігон дороги має менше 3 точок")
-                        continue
-                    
-                    # Перевіряємо внутрішні кільця (holes)
-                    if hasattr(poly, 'interiors'):
-                        for i, interior in enumerate(poly.interiors):
-                            if len(interior.coords) < 3:
-                                print(f"  [WARN] Внутрішнє кільце {i} має менше 3 точок, видаляємо")
-                                # Створюємо новий полігон без цього кільця
-                                # ВАЖЛИВО: Polygon вже імпортовано на початку файлу, не імпортуємо знову
-                                new_exterior = poly.exterior
-                                new_interiors = [interior for j, interior in enumerate(poly.interiors) if j != i]
-                                poly = Polygon(new_exterior, new_interiors)
-                except Exception as e:
-                    print(f"  [WARN] Помилка виправлення полігону дороги: {e}")
-                    continue
-                
-                mesh = trimesh.creation.extrude_polygon(poly, height=total_height)
-                
-                # Проектуємо дорогу на рельєф, якщо TerrainProvider доступний
-                if terrain_provider is not None:
-                    # ВАЖЛИВО: не "вбиваємо" екструзію.
-                    # extrude_polygon дає вершини з old_z у [0..total_height].
-                    # Потрібно додати рельєф: new_z = ground_z + old_z
-                    vertices = mesh.vertices.copy()
-                    old_z = vertices[:, 2].copy()
-                    ground_z_values = terrain_provider.get_heights_for_points(vertices[:, :2])
-                    
-                    if is_bridge:
-                        # РОЗУМНА ЛОГІКА ДЛЯ МОСТІВ:
-                        # 1. Знаходимо висоту води під мостом (якщо є terrain_provider з original_heights_provider)
-                        # 2. Розміщуємо міст на достатній висоті над водою (мінімум 3-5 метрів)
-                        # 3. Враховуємо оригінальний рельєф та висоту води
-                        
-                        # Знаходимо мінімальну та максимальну висоту рельєфу під мостом
-                        min_ground_z = float(np.min(ground_z_values))
-                        max_ground_z = float(np.max(ground_z_values))
-                        
-                        # ПОКРАЩЕНА ЛОГІКА ДЛЯ МОСТІВ:
-                        # 1. Розраховуємо висоту води для кожної точки моста окремо
-                        # 2. Використовуємо медіанне значення для стабільності
-                        # 3. Адаптуємо висоту моста до нахилу
-                        
-                        water_level_under_bridge = None
-                        if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
-                            # Отримуємо оригінальні висоти (до depression) для КОЖНОЇ точки моста
-                            original_ground_z = terrain_provider.original_heights_provider.get_heights_for_points(vertices[:, :2])
-                            
-                            # Розраховуємо висоту води для кожної точки окремо
-                            # Вода зазвичай на 0.15-0.2м нижче оригінального рельєфу (з water_processor)
-                            water_levels_per_point = original_ground_z - 0.2  # Вода для кожної точки
-                            
-                            # Використовуємо медіанне значення для стабільності (менш чутливе до викидів)
-                            # Але також враховуємо мінімальне значення для забезпечення мінімального зазору
-                            median_water_level = float(np.median(water_levels_per_point))
-                            min_water_level = float(np.min(water_levels_per_point))
-                            max_water_level = float(np.max(water_levels_per_point))
-                            
-                            # Використовуємо медіанне значення як базове, але перевіряємо мінімальне
-                            water_level_under_bridge = median_water_level
-                            
-                            # ВИПРАВЛЕННЯ: Мінімальний зазор над водою має враховувати bridge_height_offset
-                            # bridge_height_offset - це висота моста над водою/рельєфом (2-5м)
-                            # Використовуємо його як мінімальний clearance
-                            min_clearance_above_water = max(3.0, bridge_height_offset)  # Мінімум 3м, або висота моста
-                            
-                            # Розраховуємо базову висоту моста для кожної точки окремо
-                            # Верхня частина моста має бути на bridge_height_offset над водою
-                            bridge_base_z_per_point = water_levels_per_point + min_clearance_above_water
-                            
-                            # Але також враховуємо рельєф (береги) - міст не може бути нижче рельєфу + bridge_height_offset
-                            bridge_base_z_per_point = np.maximum(
-                                bridge_base_z_per_point,
-                                ground_z_values + bridge_height_offset  # Мінімум bridge_height_offset над рельєфом
-                            )
-                            
-                            # Використовуємо медіанне значення для стабільності (але можна залишити per-point для нахилу)
-                            # Для стабільності використовуємо медіанне, але можна використати per-point для нахилу
-                            use_median = True  # Використовувати медіанне значення для всіх точок
-                            
-                            if use_median:
-                                # Використовуємо медіанне значення для всіх точок (стабільніше для 3D друку)
+                        if not poly_part.is_valid:
+                            poly_part = poly_part.buffer(0)
+                        if poly_part.is_empty:
+                            return
+                        if hasattr(poly_part, "exterior") and len(poly_part.exterior.coords) < 3:
+                            return
+                    except Exception:
+                        return
+
+                    mesh = trimesh.creation.extrude_polygon(poly_part, height=rh)
+                    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+                        return
+
+                    # Project onto terrain
+                    if terrain_provider is not None:
+                        vertices = mesh.vertices.copy()
+                        old_z = vertices[:, 2].copy()
+                        ground_z_values = terrain_provider.get_heights_for_points(vertices[:, :2])
+
+                        if is_bridge:
+                            water_level_under_bridge = None
+                            if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
+                                original_ground_z = terrain_provider.original_heights_provider.get_heights_for_points(vertices[:, :2])
+                                water_levels_per_point = original_ground_z - 0.2
+                                median_water_level = float(np.median(water_levels_per_point))
+                                min_water_level = float(np.min(water_levels_per_point))
+                                max_water_level = float(np.max(water_levels_per_point))
+
+                                min_clearance_above_water = max(float(bridge_height_offset), float(rh) * 2.0)
+                                bridge_base_z_per_point = water_levels_per_point + min_clearance_above_water
+                                bridge_base_z_per_point = np.maximum(
+                                    bridge_base_z_per_point,
+                                    ground_z_values + float(bridge_height_offset)
+                                )
                                 bridge_base_z = float(np.median(bridge_base_z_per_point))
                                 vertices[:, 2] = bridge_base_z + old_z
+
+                                print(f"  [BRIDGE] Розрахунок: water_level=[{min_water_level:.2f}, {median_water_level:.2f}, {max_water_level:.2f}]м (median), clearance={min_clearance_above_water:.2f}м, bridge_base={bridge_base_z:.2f}м (median)")
+                                water_level_under_bridge = median_water_level
+
+                                try:
+                                    support_spacing = max(20.0, float(rh) * 20.0)
+                                    support_width = max(2.0, float(rh) * 3.0)
+                                    min_support_height = max(1.0, float(rh) * 2.0)
+                                    bridge_supports = create_bridge_supports(
+                                        poly_part,
+                                        bridge_base_z,
+                                        terrain_provider,
+                                        water_level_under_bridge,
+                                        support_spacing=float(support_spacing),
+                                        support_width=float(support_width),
+                                        min_support_height=float(min_support_height),
+                                    )
+                                    if bridge_supports:
+                                        road_meshes.extend(bridge_supports)
+                                        print(f"  [BRIDGE] Створено {len(bridge_supports)} опор для моста")
+                                except Exception as e:
+                                    print(f"  [WARN] Не вдалося створити опори для моста: {e}")
                             else:
-                                # Використовуємо per-point значення (враховує нахил, але може бути нестабільним)
-                                vertices[:, 2] = bridge_base_z_per_point + old_z
-                            
-                            print(f"  [BRIDGE] Розрахунок: water_level=[{min_water_level:.2f}, {median_water_level:.2f}, {max_water_level:.2f}]м (median), clearance={min_clearance_above_water:.2f}м, bridge_base={bridge_base_z:.2f}м (median)")
-                            
-                            # Зберігаємо water_level_under_bridge для опор
-                            water_level_under_bridge = median_water_level
-                            
-                            # КРИТИЧНО ДЛЯ 3D ДРУКУ: Створюємо опори для моста
-                            # Мости мають стояти на опорах, які йдуть до землі/води
-                            # Це необхідно для стабільності при 3D друку
-                            try:
-                                bridge_supports = create_bridge_supports(
-                                    poly,  # Полігон моста
-                                    bridge_base_z,  # Висота моста
-                                    terrain_provider,  # Для отримання висот землі
-                                    water_level_under_bridge,  # Рівень води
-                                    support_spacing=20.0,  # Відстань між опорами (метри)
-                                    support_width=2.0,  # Ширина опори (метри)
-                                    min_support_height=1.0,  # Мінімальна висота опори (метри)
-                                )
-                                
-                                if bridge_supports is not None and len(bridge_supports) > 0:
-                                    # Додаємо опори до списку мешів
-                                    road_meshes.extend(bridge_supports)
-                                    print(f"  [BRIDGE] Створено {len(bridge_supports)} опор для моста")
-                            except Exception as e:
-                                print(f"  [WARN] Не вдалося створити опори для моста: {e}")
-                                import traceback
-                                traceback.print_exc()
+                                # Fallback: small lift relative to bridge_height_offset
+                                min_ground_z = float(np.min(ground_z_values))
+                                vertices[:, 2] = min_ground_z + old_z + float(bridge_height_offset) * 0.5
                         else:
-                            # Fallback: використовуємо стару логіку
-                        # Піднімаємо міст над найвищою точкою рельєфу під ним
-                            vertices[:, 2] = min_ground_z + old_z + bridge_height_offset * 0.5
-                            print(f"  [BRIDGE] Fallback: min_ground={min_ground_z:.2f}м, offset={bridge_height_offset:.2f}м")
-                    else:
-                        # ПОКРАЩЕНА ЛОГІКА ДЛЯ ЗВИЧАЙНИХ ДОРОГ:
-                        # 1. Розраховуємо нахил рельєфу для адаптивного road_embed
-                        # 2. Додаємо мінімальну висоту над рельєфом
-                        # 3. Захищаємо від "під землею" на крутих схилах
-                        
-                        # Розраховуємо нахил рельєфу (різниця між мінімальною та максимальною висотою)
-                        min_ground_z = float(np.min(ground_z_values))
-                        max_ground_z = float(np.max(ground_z_values))
-                        slope = max_ground_z - min_ground_z  # Різниця висот
-                        
-                        # Адаптивний road_embed: на крутих схилах зменшуємо embed
-                        # Якщо нахил більший за road_embed * 2, зменшуємо embed
-                        adaptive_embed = float(re)
-                        if slope > float(re) * 2.0:
-                            # На крутих схилах зменшуємо embed пропорційно
-                            adaptive_embed = float(re) * (1.0 - min(0.5, (slope - float(re) * 2.0) / (slope + 1.0)))
-                            print(f"  [ROAD] Адаптивний embed: slope={slope:.2f}м, original={re:.2f}м, adaptive={adaptive_embed:.2f}м")
-                        
-                        # Мінімальна висота над рельєфом (для захисту від "під землею")
-                        min_height_above_ground = 0.1  # Мінімум 0.1м над рельєфом
-                        
-                        # Розміщуємо дорогу з адаптивним embed та мінімальною висотою
-                        road_z = ground_z_values + old_z - adaptive_embed
-                        min_road_z = ground_z_values + min_height_above_ground
-                        
-                        # Використовуємо максимум між road_z та min_road_z (захист від "під землею")
-                        vertices[:, 2] = np.maximum(road_z, min_road_z)
-                        
-                        # Діагностика
-                        final_min_z = float(np.min(vertices[:, 2]))
-                        final_max_z = float(np.max(vertices[:, 2]))
-                        ground_min_z = float(np.min(ground_z_values))
-                        ground_max_z = float(np.max(ground_z_values))
-                        
-                        if final_min_z < ground_min_z - 0.05:  # Дорога нижче рельєфу більше ніж на 5см
-                            print(f"  [WARN] Дорога може бути нижче рельєфу: road_z={final_min_z:.2f}м, ground={ground_min_z:.2f}м")
-                        else:
-                            print(f"  [ROAD] Дорога розміщена: road_z=[{final_min_z:.2f}, {final_max_z:.2f}]м, ground=[{ground_min_z:.2f}, {ground_max_z:.2f}]м, embed={adaptive_embed:.2f}м")
-                    mesh.vertices = vertices
-                else:
-                    # Без рельєфу: "втиснемо" дороги трохи вниз, щоб не було щілин з плоскою базою
-                    if float(re) > 0:
-                        vertices = mesh.vertices.copy()
-                        vertices[:, 2] = vertices[:, 2] - float(re)
+                            min_ground_z = float(np.min(ground_z_values))
+                            max_ground_z = float(np.max(ground_z_values))
+                            slope = max_ground_z - min_ground_z
+                            adaptive_embed = float(re)
+                            if slope > float(re) * 2.0:
+                                adaptive_embed = float(re) * (1.0 - min(0.5, (slope - float(re) * 2.0) / (slope + 1.0)))
+                            min_height_above_ground = float(rh) * 0.05
+                            road_z = ground_z_values + old_z - adaptive_embed
+                            min_road_z = ground_z_values + min_height_above_ground
+                            vertices[:, 2] = np.maximum(road_z, min_road_z)
                         mesh.vertices = vertices
-                
-                # Перевірка на валідність та покращення для 3D принтера
-                if len(mesh.faces) > 0 and len(mesh.vertices) > 0:
-                    # Виправлення mesh для 3D принтера
+                    else:
+                        if float(re) > 0:
+                            vertices = mesh.vertices.copy()
+                            vertices[:, 2] = vertices[:, 2] - float(re)
+                            mesh.vertices = vertices
+
+                    # Cleanup + color
                     try:
-                        # Виправляємо нормалі
                         mesh.fix_normals()
-                        # Видаляємо дегенеровані грані
                         mesh.remove_duplicate_faces()
                         mesh.remove_unreferenced_vertices()
-                        # Заповнюємо дірки
                         if not mesh.is_volume:
                             mesh.fill_holes()
-                        # Об'єднуємо близькі вершини для чистоти
                         mesh.merge_vertices(merge_tex=True, merge_norm=True)
-                    except Exception as fix_error:
-                        print(f"  Попередження при виправленні мешу: {fix_error}")
-                    
-                    # Перевірка мінімальних розмірів для 3D принтера
-                    try:
-                        bounds = mesh.bounds
-                        min_dim = min(bounds[1] - bounds[0])  # Мінімальний розмір
-                        if min_dim < 0.001:  # Менше 1мм - занадто тонко
-                            print(f"  [WARN] Дорога занадто тонка для друку: {min_dim*1000:.2f}мм")
-                    except:
+                    except Exception:
                         pass
-                    
-                    # Застосовуємо колір до доріг та мостів
-                    if is_bridge:
-                        # Темно-сірий колір для мостів
-                        road_color = np.array([60, 60, 60, 255], dtype=np.uint8)  # Темно-сірий
-                    else:
-                        # Сіро-чорний колір для доріг (асфальт)
-                        road_color = np.array([40, 40, 40, 255], dtype=np.uint8)  # Темно-сірий/чорний
-                    
+
                     if len(mesh.faces) > 0:
+                        road_color = np.array([60, 60, 60, 255], dtype=np.uint8) if is_bridge else np.array([40, 40, 40, 255], dtype=np.uint8)
                         face_colors = np.tile(road_color, (len(mesh.faces), 1))
                         mesh.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
-                    
+
                     road_meshes.append(mesh)
-                    bridge_label = "[BRIDGE]" if is_bridge else "[ROAD]"
-                    print(f"  [OK] {bridge_label} Створено меш: {len(mesh.vertices)} вершин, {len(mesh.faces)} граней, volume={mesh.is_volume}")
+
+                # Build parts: bridge pieces + remainder
+                parts_to_process: List[Tuple[Polygon, bool, float]] = []
+                if bridges and bridge_union is not None:
+                    # bridge pieces per bridge area
+                    for bridge_area, bridge_h in bridges:
+                        if bridge_area is None or bridge_area.is_empty:
+                            continue
+                        try:
+                            inter = poly.intersection(bridge_area)
+                        except Exception:
+                            continue
+                        for g in _iter_polys(inter):
+                            if g is None or g.is_empty:
+                                continue
+                            if float(getattr(g, "area", 0.0) or 0.0) < 1.0:
+                                continue
+                            parts_to_process.append((g, True, float(bridge_h) * float(bridge_height_multiplier)))
+                    # normal remainder
+                    try:
+                        remainder = poly.difference(bridge_union)
+                    except Exception:
+                        remainder = poly
+                    for g in _iter_polys(remainder):
+                        if g is None or g.is_empty:
+                            continue
+                        if float(getattr(g, "area", 0.0) or 0.0) < 1.0:
+                            continue
+                        parts_to_process.append((g, False, 0.0))
                 else:
-                    print(f"  ❌ Меш дороги невалідний: {len(mesh.faces)} граней, {len(mesh.vertices)} вершин")
-                    
+                    parts_to_process = [(poly, False, 0.0)]
+                
+                # Process parts
+                for part_poly, is_bridge, bridge_height_offset in parts_to_process:
+                    _process_one(part_poly, is_bridge, bridge_height_offset)
+                
             except Exception as extrude_error:
                 print(f"  Помилка екструзії полігону: {extrude_error}")
                 # Fallback: спробуємо створити простий меш

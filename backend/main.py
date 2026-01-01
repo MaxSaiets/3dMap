@@ -29,7 +29,8 @@ from services.model_exporter import export_scene, export_preview_parts_stl
 from services.generation_task import GenerationTask
 from services.mesh_quality import improve_mesh_for_3d_printing, validate_mesh_for_3d_printing
 from services.global_center import get_or_create_global_center, set_global_center, get_global_center, GlobalCenter
-from services.hexagonal_grid import generate_hexagonal_grid, hexagons_to_geojson, validate_hexagonal_grid
+from services.hexagonal_grid import generate_hexagonal_grid, hexagons_to_geojson, validate_hexagonal_grid, calculate_grid_center_from_geojson
+from services.elevation_sync import calculate_global_elevation_reference, calculate_optimal_base_thickness
 from shapely.ops import transform
 
 app = FastAPI(title="3D Map Generator API", version="1.0.0")
@@ -117,7 +118,7 @@ class GenerationRequest(BaseModel):
     terrain_enabled: bool = True
     terrain_z_scale: float = 3.0  # Збільшено для кращої видимості рельєфу
     # Тонка основа для друку: за замовчуванням 2мм (користувач може збільшити).
-    terrain_base_thickness_mm: float = Field(default=2.0, ge=1.0, le=20.0)
+    terrain_base_thickness_mm: float = Field(default=2.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
     # Деталізація рельєфу
     # - terrain_resolution: кількість точок по осі (mesh деталь). Вища = детальніше, повільніше.
     terrain_resolution: int = Field(default=350, ge=80, le=600)  # Висока деталізація для максимально плавного рельєфу
@@ -141,6 +142,9 @@ class GenerationRequest(BaseModel):
     context_padding_m: float = Field(default=400.0, ge=0.0, le=5000.0)
     # Тестування: генерувати тільки рельєф без будівель/доріг/води (за замовчуванням False - повна модель)
     terrain_only: bool = False  # Тестовий режим вимкнено за замовчуванням
+    # Синхронізація висот між зонами (для гексагональної сітки)
+    elevation_ref_m: Optional[float] = None  # Глобальна базова висота (метри над рівнем моря)
+    baseline_offset_m: float = 0.0  # Зміщення baseline (метри)
 
 
 class GenerationResponse(BaseModel):
@@ -418,7 +422,7 @@ class HexagonalGridRequest(BaseModel):
     south: float
     east: float
     west: float
-    hex_size_m: float = Field(default=1000.0, ge=100.0, le=10000.0)  # 1 км за замовчуванням
+    hex_size_m: float = Field(default=500.0, ge=100.0, le=10000.0)  # 0.5 км за замовчуванням
     grid_type: str = Field(default="hexagonal", description="Тип сітки: 'hexagonal' (шестикутники) або 'square' (квадрати)")
 
 
@@ -428,16 +432,41 @@ class HexagonalGridResponse(BaseModel):
     hex_count: int
     is_valid: bool
     validation_errors: List[str] = []
+    grid_center: Optional[dict] = None  # Центр сітки для синхронізації координат
 
 
 @app.post("/api/hexagonal-grid", response_model=HexagonalGridResponse)
 async def generate_hexagonal_grid_endpoint(request: HexagonalGridRequest):
     """
     Генерує гексагональну сітку для заданої області.
-    Шестикутники мають розмір hex_size_m (за замовчуванням 1 км).
+    Шестикутники мають розмір hex_size_m (за замовчуванням 0.5 км).
+    КЕШУЄ сітку після першої генерації для швидшого доступу.
     """
+    import hashlib
+    import json
+    
     try:
-        print(f"[DEBUG] Hexagonal grid request: north={request.north}, south={request.south}, east={request.east}, west={request.west}, hex_size_m={request.hex_size_m}")
+        # Створюємо хеш параметрів для ідентифікації сітки
+        grid_type = request.grid_type.lower() if hasattr(request, 'grid_type') else 'hexagonal'
+        cache_key = f"{request.north:.6f}_{request.south:.6f}_{request.east:.6f}_{request.west:.6f}_{request.hex_size_m:.1f}_{grid_type}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+        
+        # Шлях до кешу сіток
+        cache_dir = Path("cache/grids")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"grid_{cache_hash}.json"
+        
+        # Перевіряємо чи є збережена сітка
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                    print(f"[INFO] Використовується збережена сітка з кешу: {cache_file.name}")
+                    return HexagonalGridResponse(**cached_data)
+            except Exception as e:
+                print(f"[WARN] Помилка читання кешу сітки: {e}, генеруємо нову")
+        
+        print(f"[INFO] Генерація нової сітки: north={request.north}, south={request.south}, east={request.east}, west={request.west}, hex_size_m={request.hex_size_m}")
         
         # Перевірка валідності координат
         if request.north <= request.south or request.east <= request.west:
@@ -451,28 +480,17 @@ async def generate_hexagonal_grid_endpoint(request: HexagonalGridRequest):
         bbox_meters = bbox_utm[:4]  # (minx, miny, maxx, maxy)
         to_wgs84 = bbox_utm[6]  # Функція для конвертації UTM -> WGS84 (індекс 6)
         
-        print(f"[DEBUG] Bbox в UTM: {bbox_meters}")
-        print(f"[DEBUG] to_wgs84 функція доступна: {to_wgs84 is not None}")
-        
         # Генеруємо сітку (шестикутники або квадрати)
-        grid_type = request.grid_type.lower() if hasattr(request, 'grid_type') else 'hexagonal'
         if grid_type == 'square':
             from services.hexagonal_grid import generate_square_grid
             cells = generate_square_grid(bbox_meters, square_size_m=request.hex_size_m)
-            print(f"[DEBUG] Згенеровано {len(cells)} квадратів")
+            print(f"[INFO] Згенеровано {len(cells)} квадратів")
         else:
             cells = generate_hexagonal_grid(bbox_meters, hex_size_m=request.hex_size_m)
-            print(f"[DEBUG] Згенеровано {len(cells)} шестикутників")
+            print(f"[INFO] Згенеровано {len(cells)} шестикутників")
         
         # Конвертуємо в GeoJSON з конвертацією координат UTM -> WGS84
         geojson = hexagons_to_geojson(cells, to_wgs84=to_wgs84)
-        
-        # Перевіряємо перший feature для діагностики
-        if geojson['features']:
-            first_feature = geojson['features'][0]
-            first_coords = first_feature['geometry']['coordinates'][0]
-            if first_coords:
-                print(f"[DEBUG] Перший шестикутник координати (перша точка): {first_coords[0]}")
         
         # Валідуємо сітку (тільки для шестикутників)
         is_valid = True
@@ -482,12 +500,42 @@ async def generate_hexagonal_grid_endpoint(request: HexagonalGridRequest):
             if errors:
                 print(f"[WARN] Помилки валідації сітки: {errors}")
         
-        return HexagonalGridResponse(
+        # Обчислюємо центр сітки для синхронізації координат
+        grid_center = None
+        try:
+            center_lat, center_lon = calculate_grid_center_from_geojson(geojson, to_wgs84=to_wgs84)
+            grid_center = {
+                "lat": center_lat,
+                "lon": center_lon
+            }
+            print(f"[INFO] Центр сітки: lat={center_lat:.6f}, lon={center_lon:.6f}")
+        except Exception as e:
+            print(f"[WARN] Не вдалося обчислити центр сітки: {e}")
+        
+        response = HexagonalGridResponse(
             geojson=geojson,
             hex_count=len(cells),
             is_valid=is_valid,
-            validation_errors=errors
+            validation_errors=errors,
+            grid_center=grid_center
         )
+        
+        # Зберігаємо сітку в кеш
+        try:
+            cache_data = {
+                "geojson": response.geojson,
+                "hex_count": response.hex_count,
+                "is_valid": response.is_valid,
+                "validation_errors": response.validation_errors,
+                "grid_center": response.grid_center
+            }
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            print(f"[INFO] Сітка збережена в кеш: {cache_file.name}")
+        except Exception as e:
+            print(f"[WARN] Не вдалося зберегти сітку в кеш: {e}")
+        
+        return response
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
@@ -500,6 +548,13 @@ class ZoneGenerationRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     
     zones: List[dict]  # Список зон (GeoJSON features)
+    # IMPORTANT: city/area bbox (WGS84) for a stable global reference across sessions.
+    # If provided, global_center + DEM bbox + elevation_ref are computed/cached from this bbox,
+    # so later "add more zones" runs stitch perfectly with earlier prints.
+    north: Optional[float] = None
+    south: Optional[float] = None
+    east: Optional[float] = None
+    west: Optional[float] = None
     # Всі інші параметри як у GenerationRequest
     model_size_mm: float = Field(default=100.0, ge=10.0, le=500.0)
     road_width_multiplier: float = Field(default=0.8, ge=0.1, le=5.0)
@@ -513,7 +568,7 @@ class ZoneGenerationRequest(BaseModel):
     water_depth: float = Field(default=2.0, ge=0.1, le=10.0)
     terrain_enabled: bool = True
     terrain_z_scale: float = Field(default=0.5, ge=0.1, le=10.0)
-    terrain_base_thickness_mm: float = Field(default=2.0, ge=1.0, le=20.0)
+    terrain_base_thickness_mm: float = Field(default=2.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
     terrain_resolution: int = Field(default=180, ge=50, le=500)
     terrarium_zoom: int = Field(default=15, ge=10, le=18)
     terrain_smoothing_sigma: Optional[float] = Field(default=None, ge=0.0, le=5.0)
@@ -530,9 +585,167 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
     """
     Генерує 3D моделі для вибраних зон гексагональної сітки.
     Кожна зона генерується як окрема модель.
+    ВАЖЛИВО: Всі зони використовують ОДИН глобальний центр для синхронізації координат.
     """
     if not request.zones or len(request.zones) == 0:
         raise HTTPException(status_code=400, detail="Не вибрано жодної зони")
+    
+    # КРИТИЧНО: Визначаємо глобальний центр для ВСІЄЇ сітки.
+    # If client provides city bbox, use it for a stable reference; otherwise fallback to selected zones bbox.
+    # Це забезпечує, що всі зони використовують одну точку відліку (0,0)
+    # і ідеально підходять одна до одної
+    print(f"[INFO] Визначення глобального центру для всієї сітки ({len(request.zones)} зон)...")
+    
+    grid_bbox = None
+    # 1) Prefer explicit city bbox (stable across later zone additions)
+    try:
+        if request.north is not None and request.south is not None and request.east is not None and request.west is not None:
+            if float(request.north) > float(request.south) and float(request.east) > float(request.west):
+                grid_bbox = {
+                    "north": float(request.north),
+                    "south": float(request.south),
+                    "east": float(request.east),
+                    "west": float(request.west),
+                }
+    except Exception:
+        grid_bbox = None
+
+    # 2) Fallback: compute bbox from selected zones (old behavior)
+    if grid_bbox is None:
+        all_lons = []
+        all_lats = []
+        for zone in request.zones:
+            geometry = zone.get('geometry', {})
+            if geometry.get('type') != 'Polygon':
+                continue
+            coordinates = geometry.get('coordinates', [])
+            if not coordinates or len(coordinates) == 0:
+                continue
+            all_coords = [coord for ring in coordinates for coord in ring]
+            zone_lons = [coord[0] for coord in all_coords]
+            zone_lats = [coord[1] for coord in all_coords]
+            all_lons.extend(zone_lons)
+            all_lats.extend(zone_lats)
+        if len(all_lons) == 0 or len(all_lats) == 0:
+            raise HTTPException(status_code=400, detail="Не вдалося визначити координати зон")
+        grid_bbox = {
+            'north': max(all_lats),
+            'south': min(all_lats),
+            'east': max(all_lons),
+            'west': min(all_lons)
+        }
+    
+    # Визначаємо центр всієї сітки
+    grid_center_lat = (grid_bbox['north'] + grid_bbox['south']) / 2.0
+    grid_center_lon = (grid_bbox['east'] + grid_bbox['west']) / 2.0
+    
+    print(f"[INFO] Глобальний центр сітки: lat={grid_center_lat:.6f}, lon={grid_center_lon:.6f}")
+    print(f"[INFO] Bbox всієї сітки: north={grid_bbox['north']:.6f}, south={grid_bbox['south']:.6f}, east={grid_bbox['east']:.6f}, west={grid_bbox['west']:.6f}")
+    
+    # Cache global city reference so future "add more zones" uses the same values.
+    grid_bbox_latlon = (grid_bbox['north'], grid_bbox['south'], grid_bbox['east'], grid_bbox['west'])
+    import hashlib, json
+    cache_dir = Path("cache/cities")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    city_key = f"{grid_bbox_latlon[0]:.6f}_{grid_bbox_latlon[1]:.6f}_{grid_bbox_latlon[2]:.6f}_{grid_bbox_latlon[3]:.6f}_z{int(request.terrarium_zoom)}_zs{float(request.terrain_z_scale):.3f}_ms{float(request.model_size_mm):.1f}"
+    city_hash = hashlib.md5(city_key.encode()).hexdigest()
+    city_cache_file = cache_dir / f"city_{city_hash}.json"
+
+    cached = None
+    if city_cache_file.exists():
+        try:
+            cached = json.loads(city_cache_file.read_text(encoding="utf-8"))
+            print(f"[INFO] Використовуємо кеш міста: {city_cache_file.name}")
+        except Exception:
+            cached = None
+
+    if cached and isinstance(cached, dict) and "center" in cached:
+        try:
+            c = cached.get("center") or {}
+            global_center = set_global_center(float(c["lat"]), float(c["lon"]))
+        except Exception:
+            global_center = set_global_center(grid_center_lat, grid_center_lon)
+    else:
+        global_center = set_global_center(grid_center_lat, grid_center_lon)
+    print(f"[INFO] Глобальний центр встановлено: lat={global_center.center_lat:.6f}, lon={global_center.center_lon:.6f}, UTM zone={global_center.utm_zone}")
+
+    # CRITICAL: store global DEM bbox so all zones sample elevations from the same tile set (and it is stable across sessions)
+    try:
+        from services.global_center import set_global_dem_bbox_latlon
+        set_global_dem_bbox_latlon(grid_bbox_latlon)
+    except Exception:
+        pass
+    
+    # КРИТИЧНО: Обчислюємо глобальний elevation_ref_m для всієї сітки
+    # Це забезпечує, що всі зони використовують одну базову висоту для нормалізації
+    # і ідеально стикуються одна з одною
+    print(f"[INFO] Обчислення глобального elevation_ref для синхронізації висот між зонами...")
+    
+    # Визначаємо source_crs для обчислення elevation_ref
+    source_crs = None
+    try:
+        from services.crs_utils import bbox_latlon_to_utm
+        bbox_utm_result = bbox_latlon_to_utm(*grid_bbox_latlon)
+        source_crs = bbox_utm_result[4]  # CRS
+    except Exception as e:
+        print(f"[WARN] Не вдалося визначити source_crs для elevation_ref: {e}")
+    
+    # Обчислюємо глобальний elevation_ref_m та baseline_offset_m
+    # Guard against corrupted/invalid cached refs (we've seen Terrarium outlier pixels produce huge negative mins).
+    cached_elev = None
+    if cached and isinstance(cached, dict):
+        try:
+            ce = cached.get("elevation_ref_m")
+            if ce is not None:
+                ce = float(ce)
+                if -500.0 <= ce <= 9000.0:
+                    cached_elev = ce
+        except Exception:
+            cached_elev = None
+
+    if cached_elev is not None:
+        global_elevation_ref_m = float(cached.get("elevation_ref_m"))
+        global_baseline_offset_m = float(cached.get("baseline_offset_m") or 0.0)
+        print(f"[INFO] Глобальний elevation_ref_m (кеш): {global_elevation_ref_m:.2f}м")
+        print(f"[INFO] Глобальний baseline_offset_m (кеш): {global_baseline_offset_m:.3f}м")
+    else:
+        global_elevation_ref_m, global_baseline_offset_m = calculate_global_elevation_reference(
+            zones=request.zones,
+            source_crs=source_crs,
+            terrarium_zoom=request.terrarium_zoom if hasattr(request, 'terrarium_zoom') else 15,
+            z_scale=float(request.terrain_z_scale),
+            sample_points_per_zone=25,  # Кількість точок для семплінгу в кожній зоні
+            global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для конвертації координат
+        )
+    
+    if global_elevation_ref_m is not None:
+        print(f"[INFO] Глобальний elevation_ref_m: {global_elevation_ref_m:.2f}м (висота над рівнем моря)")
+        print(f"[INFO] Глобальний baseline_offset_m: {global_baseline_offset_m:.3f}м")
+    else:
+        print(f"[WARN] Не вдалося обчислити глобальний elevation_ref_m, кожна зона використовуватиме локальну нормалізацію")
+    
+    # Обчислюємо оптимальну товщину підложки для всіх зон
+    # Мінімізуємо товщину, але забезпечуємо стабільність
+    # CRITICAL (stitching across sessions): base thickness must be stable across "add more zones".
+    # Do not make it depend on how many zones were selected in this request.
+    final_base_thickness_mm = max(float(request.terrain_base_thickness_mm), 0.5)
+    print(f"[INFO] Фінальна товщина підложки: {final_base_thickness_mm:.2f}мм (користувацька: {request.terrain_base_thickness_mm:.2f}мм)")
+
+    # Save/refresh city cache for future requests
+    try:
+        cache_payload = {
+            "bbox": {"north": grid_bbox_latlon[0], "south": grid_bbox_latlon[1], "east": grid_bbox_latlon[2], "west": grid_bbox_latlon[3]},
+            "center": {"lat": float(global_center.center_lat), "lon": float(global_center.center_lon)},
+            "terrarium_zoom": int(request.terrarium_zoom),
+            "terrain_z_scale": float(request.terrain_z_scale),
+            "model_size_mm": float(request.model_size_mm),
+            "elevation_ref_m": float(global_elevation_ref_m) if global_elevation_ref_m is not None else None,
+            "baseline_offset_m": float(global_baseline_offset_m) if global_baseline_offset_m is not None else 0.0,
+            "terrain_base_thickness_mm": float(final_base_thickness_mm),
+        }
+        city_cache_file.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     
     task_ids = []
     
@@ -579,7 +792,7 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
             water_depth=request.water_depth,
             terrain_enabled=request.terrain_enabled,
             terrain_z_scale=request.terrain_z_scale,
-            terrain_base_thickness_mm=request.terrain_base_thickness_mm,
+            terrain_base_thickness_mm=final_base_thickness_mm,  # Використовуємо оптимальну товщину
             terrain_resolution=request.terrain_resolution,
             terrarium_zoom=request.terrarium_zoom,
             terrain_smoothing_sigma=terrain_smoothing_sigma,
@@ -589,7 +802,10 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
             flatten_roads_on_terrain=request.flatten_roads_on_terrain if request.flatten_roads_on_terrain is not None else False,
             export_format=request.export_format,
             context_padding_m=request.context_padding_m,
-            terrain_only=False
+            terrain_only=False,
+            # КРИТИЧНО: Передаємо глобальні параметри для синхронізації висот
+            elevation_ref_m=global_elevation_ref_m,  # Глобальна базова висота для всіх зон
+            baseline_offset_m=global_baseline_offset_m,  # Глобальне зміщення baseline
         )
         
         # Генеруємо модель для зони
@@ -648,11 +864,51 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
     
     try:
         # 0) Глобальний центр (потрібний для коректної локальної системи координат + padding bbox)
-        latlon_bbox = (request.north, request.south, request.east, request.west)
-        global_center = get_or_create_global_center(bbox_latlon=latlon_bbox)
-        print(f"[INFO] Використовується глобальний центр: lat={global_center.center_lat:.6f}, lon={global_center.center_lon:.6f}")
+        # ВАЖЛИВО: Якщо глобальний центр вже встановлено (наприклад, для сітки зон),
+        # використовуємо його. Інакше створюємо новий на основі bbox цієї зони.
+        # For batch zones: use a single global DEM bbox so heights are consistent and seams don't appear.
+        try:
+            from services.global_center import get_global_dem_bbox_latlon
+            latlon_bbox = get_global_dem_bbox_latlon() or (request.north, request.south, request.east, request.west)
+        except Exception:
+            latlon_bbox = (request.north, request.south, request.east, request.west)
+        
+        # Перевіряємо, чи вже є встановлений глобальний центр (для сітки зон)
+        existing_global_center = get_global_center()
+        if existing_global_center is not None:
+            global_center = existing_global_center
+            print(f"[INFO] Використовується ВЖЕ ВСТАНОВЛЕНИЙ глобальний центр (для сітки): lat={global_center.center_lat:.6f}, lon={global_center.center_lon:.6f}")
+        else:
+            # Якщо немає встановленого центру, створюємо новий для цієї зони
+            global_center = get_or_create_global_center(bbox_latlon=latlon_bbox)
+            print(f"[INFO] Створено новий глобальний центр для зони: lat={global_center.center_lat:.6f}, lon={global_center.center_lon:.6f}")
 
-        # 1) bbox_meters (локальні координати) + scale_factor
+        # 1) zone polygon (local) + bbox_meters + scale_factor
+        # CRITICAL: for stitched zones, scale_factor must be derived from the SAME geometric reference
+        # (zone polygon bounds), not from per-zone bbox (which varies and breaks mm->meters conversions).
+        zone_polygon_local = None
+        reference_xy_m = None
+        if zone_polygon_coords is not None and global_center is not None:
+            try:
+                from shapely.geometry import Polygon as ShapelyPolygon
+                local_coords = []
+                for coord in zone_polygon_coords:
+                    lon, lat = coord[0], coord[1]
+                    x_utm, y_utm = global_center.to_utm(lon, lat)
+                    x_local, y_local = global_center.to_local(x_utm, y_utm)
+                    local_coords.append((x_local, y_local))
+                if len(local_coords) >= 3:
+                    zone_polygon_local = ShapelyPolygon(local_coords)
+                    if not zone_polygon_local.is_valid:
+                        zone_polygon_local = zone_polygon_local.buffer(0)
+                    if zone_polygon_local is not None and not zone_polygon_local.is_empty:
+                        b = zone_polygon_local.bounds  # (minx, miny, maxx, maxy) in LOCAL meters
+                        reference_xy_m = (float(b[2] - b[0]), float(b[3] - b[1]))
+                        print(f"[DEBUG] Полігон зони перетворено в локальні координати ({len(local_coords)} точок), reference_xy_m={reference_xy_m[0]:.2f}x{reference_xy_m[1]:.2f}м")
+            except Exception as e:
+                print(f"[WARN] Помилка створення полігону зони: {e}")
+
+        # bbox_meters (локальні координати)
         from services.crs_utils import bbox_latlon_to_utm
         bbox_utm_result = bbox_latlon_to_utm(request.north, request.south, request.east, request.west)
         bbox_utm_coords = bbox_utm_result[:4]  # (minx, miny, maxx, maxy) в UTM
@@ -666,12 +922,20 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
 
         scale_factor = None
         try:
-            size_x = float(maxx_local - minx_local)
-            size_y = float(maxy_local - miny_local)
-            avg_xy = (size_x + size_y) / 2.0 if (size_x > 0 and size_y > 0) else max(size_x, size_y)
-            if avg_xy and avg_xy > 0:
-                scale_factor = float(request.model_size_mm) / float(avg_xy)
-                print(f"[DEBUG] Scale factor для зони: {scale_factor:.6f} мм/м (розмір зони: {size_x:.1f} x {size_y:.1f} м)")
+            # Prefer polygon bounds for stable scaling across stitched tiles.
+            if reference_xy_m is not None:
+                sx, sy = float(reference_xy_m[0]), float(reference_xy_m[1])
+                avg_xy = (sx + sy) / 2.0 if (sx > 0 and sy > 0) else max(sx, sy)
+                if avg_xy and avg_xy > 0:
+                    scale_factor = float(request.model_size_mm) / float(avg_xy)
+                    print(f"[DEBUG] Scale factor (polygon) для зони: {scale_factor:.6f} мм/м (reference: {sx:.1f} x {sy:.1f} м)")
+            if scale_factor is None:
+                size_x = float(maxx_local - minx_local)
+                size_y = float(maxy_local - miny_local)
+                avg_xy = (size_x + size_y) / 2.0 if (size_x > 0 and size_y > 0) else max(size_x, size_y)
+                if avg_xy and avg_xy > 0:
+                    scale_factor = float(request.model_size_mm) / float(avg_xy)
+                    print(f"[DEBUG] Scale factor (bbox) для зони: {scale_factor:.6f} мм/м (розмір зони: {size_x:.1f} x {size_y:.1f} м)")
         except Exception as e:
             print(f"[WARN] Помилка обчислення scale_factor: {e}")
             scale_factor = None
@@ -736,6 +1000,10 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 water_geoms_for_terrain = list(gdf_water.geometry.values)
                 water_depth_for_terrain = float(water_depth_m)
             
+            # КРИТИЧНО: Використовуємо глобальні параметри для синхронізації висот між зонами
+            elevation_ref_m = getattr(request, 'elevation_ref_m', None)
+            baseline_offset_m = getattr(request, 'baseline_offset_m', 0.0)
+            
             terrain_mesh, terrain_provider = create_terrain_mesh(
                 bbox_meters,
                 z_scale=request.terrain_z_scale,
@@ -743,6 +1011,9 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 latlon_bbox=latlon_bbox,
                 source_crs=source_crs,
                 terrarium_zoom=request.terrarium_zoom,
+                # КРИТИЧНО: Глобальні параметри для синхронізації висот між зонами
+                elevation_ref_m=elevation_ref_m,  # Глобальна базова висота (метри над рівнем моря)
+                baseline_offset_m=baseline_offset_m,  # Глобальне зміщення baseline (метри)
                 base_thickness=(float(request.terrain_base_thickness_mm) / float(scale_factor)) if scale_factor else 5.0,
                 flatten_buildings=False,  # Не вирівнюємо під будівлями в тестовому режимі
                 building_geometries=None,  # Немає будівель
@@ -896,6 +1167,125 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
             if scale_factor and scale_factor > 0:
                 water_depth_m = float(request.water_depth) / float(scale_factor)
 
+            # КРИТИЧНО: Використовуємо глобальні параметри для синхронізації висот між зонами
+            elevation_ref_m = getattr(request, 'elevation_ref_m', None)
+            baseline_offset_m = getattr(request, 'baseline_offset_m', 0.0)
+            
+            if elevation_ref_m is not None:
+                print(f"[INFO] Використовується глобальний elevation_ref_m: {elevation_ref_m:.2f}м для синхронізації висот")
+                print(f"[INFO] Використовується глобальний baseline_offset_m: {baseline_offset_m:.3f}м")
+            else:
+                print(f"[INFO] elevation_ref_m не задано, використовується локальна нормалізація для цієї зони")
+            
+        # NOTE: zone_polygon_local already computed above (before scale_factor), keep using it below.
+
+            # CRITICAL: Clip source geometries to the zone polygon BEFORE meshing.
+            # This prevents broken/degenerate meshes at edges caused by triangle-level mesh clipping.
+            preclipped_to_zone = False
+            if zone_polygon_local is not None and not zone_polygon_local.is_empty:
+                try:
+                    from shapely.geometry import Polygon as _Poly, MultiPolygon as _MultiPoly, GeometryCollection as _GC
+
+                    def _keep_polygons(g):
+                        if g is None or g.is_empty:
+                            return None
+                        gt = getattr(g, "geom_type", None)
+                        if gt in ("Polygon", "MultiPolygon"):
+                            return g
+                        if gt == "GeometryCollection":
+                            polys = [gg for gg in g.geoms if getattr(gg, "geom_type", None) == "Polygon"]
+                            if not polys:
+                                return None
+                            return _MultiPoly(polys) if len(polys) > 1 else polys[0]
+                        return None
+
+                    def _clip_geom(g):
+                        if g is None or g.is_empty:
+                            return None
+                        try:
+                            out = g.intersection(zone_polygon_local)
+                        except Exception:
+                            return g
+                        out = _keep_polygons(out)
+                        if out is None or out.is_empty:
+                            return None
+                        # drop tiny slivers
+                        try:
+                            if hasattr(out, "area") and float(out.area) < 1e-6:
+                                return None
+                        except Exception:
+                            pass
+                        return out
+
+                    # Clip buildings (local)
+                    if gdf_buildings_local is not None and not gdf_buildings_local.empty:
+                        gdf_buildings_local = gdf_buildings_local.copy()
+                        gdf_buildings_local["geometry"] = gdf_buildings_local["geometry"].apply(_clip_geom)
+                        gdf_buildings_local = gdf_buildings_local[gdf_buildings_local.geometry.notna()]
+                        gdf_buildings_local = gdf_buildings_local[~gdf_buildings_local.geometry.is_empty]
+                        # Keep flatten geometries consistent
+                        building_geometries_for_flatten = [
+                            g for g in list(gdf_buildings_local.geometry.values) if g is not None and not g.is_empty
+                        ]
+
+                    # Prepare water geometries in local coords
+                    # - gdf_water_local: clipped to zone (for water carving + water surface meshes)
+                    # - water_geometries_local_for_bridges: NOT clipped to zone (for bridge detection; needs context)
+                    gdf_water_local = None
+                    water_geometries_local = None
+                    water_geometries_local_for_bridges = None
+                    if gdf_water is not None and not gdf_water.empty and global_center is not None:
+                        try:
+                            from shapely.ops import transform as _transform
+
+                            def _to_local(x, y, z=None):
+                                x_local, y_local = global_center.to_local(x, y)
+                                return (x_local, y_local) if z is None else (x_local, y_local, z)
+
+                            gdf_water_local_raw = gdf_water.copy()
+                            gdf_water_local_raw["geometry"] = gdf_water_local_raw["geometry"].apply(
+                                lambda geom: _transform(_to_local, geom) if geom is not None and not geom.is_empty else geom
+                            )
+
+                            # For bridges we MUST keep un-clipped water (context) in local coords
+                            try:
+                                water_geometries_local_for_bridges = list(gdf_water_local_raw.geometry.values)
+                            except Exception:
+                                water_geometries_local_for_bridges = None
+
+                            # clip water to zone for mesh generation/carving
+                            gdf_water_local = gdf_water_local_raw.copy()
+                            gdf_water_local["geometry"] = gdf_water_local["geometry"].apply(_clip_geom)
+                            gdf_water_local = gdf_water_local[gdf_water_local.geometry.notna()]
+                            gdf_water_local = gdf_water_local[~gdf_water_local.geometry.is_empty]
+                            water_geometries_local = list(gdf_water_local.geometry.values)
+                        except Exception:
+                            gdf_water_local = None
+                            water_geometries_local = None
+                            water_geometries_local_for_bridges = None
+
+                    # Convert road polygons to local for terrain flattening + clip to zone
+                    merged_roads_geom_local = None
+                    merged_roads_geom_local_raw = None
+                    if merged_roads_geom is not None and global_center is not None:
+                        try:
+                            from shapely.ops import transform as _transform
+
+                            def _to_local(x, y, z=None):
+                                x_local, y_local = global_center.to_local(x, y)
+                                return (x_local, y_local) if z is None else (x_local, y_local, z)
+
+                            merged_roads_geom_local_raw = _transform(_to_local, merged_roads_geom)
+                            # For terrain flattening we can clip to zone, but for bridges we need the context geometry.
+                            merged_roads_geom_local = merged_roads_geom_local_raw.intersection(zone_polygon_local)
+                        except Exception:
+                            merged_roads_geom_local = None
+                            merged_roads_geom_local_raw = None
+
+                    preclipped_to_zone = True
+                except Exception:
+                    preclipped_to_zone = False
+            
             terrain_mesh, terrain_provider = create_terrain_mesh(
                 bbox_meters,
                 z_scale=request.terrain_z_scale,
@@ -903,22 +1293,31 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 latlon_bbox=latlon_bbox,
                 source_crs=source_crs,
                 terrarium_zoom=request.terrarium_zoom,
+                # КРИТИЧНО: Глобальні параметри для синхронізації висот між зонами
+                elevation_ref_m=elevation_ref_m,  # Глобальна базова висота (метри над рівнем моря)
+                baseline_offset_m=baseline_offset_m,  # Глобальне зміщення baseline (метри)
                 # base_thickness в метрах; конвертуємо з "мм на моделі" -> "метри у світі"
                 base_thickness=(float(request.terrain_base_thickness_mm) / float(scale_factor)) if scale_factor else 5.0,
                 flatten_buildings=bool(request.flatten_buildings_on_terrain),
                 building_geometries=building_geometries_for_flatten,  # ВИПРАВЛЕННЯ: використовуємо вже перетворені координати
                 flatten_roads=bool(request.flatten_roads_on_terrain),
-                road_geometries=merged_roads_geom,
+                road_geometries=locals().get("merged_roads_geom_local") or merged_roads_geom,
                 smoothing_sigma=float(request.terrain_smoothing_sigma) if request.terrain_smoothing_sigma is not None else 0.0,
                 # water depression terrain-first
-                water_geometries=list(gdf_water.geometry.values) if (gdf_water is not None and not gdf_water.empty) else None,
+                water_geometries=locals().get("water_geometries_local")
+                or (list(gdf_water.geometry.values) if (gdf_water is not None and not gdf_water.empty) else None),
                 water_depth_m=float(water_depth_m) if water_depth_m is not None else 0.0,
                 global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для синхронізації
                 bbox_is_local=True,  # ВАЖЛИВО: bbox_meters вже в локальних координатах
                 # Subdivision для плавнішого mesh
                 subdivide=bool(request.terrain_subdivide),
                 subdivide_levels=int(request.terrain_subdivide_levels),
+                # КРИТИЧНО: Передаємо полігон зони для форми base та стінок
+                zone_polygon=zone_polygon_local,
             )
+            
+            # ВАЖЛИВО: Terrain обрізається в create_terrain_mesh перед створенням стінок
+            # Не обрізаємо тут, щоб уникнути подвійного обрізання
         
         task.update_status("processing", 40, "Обробка доріг...")
         
@@ -940,16 +1339,34 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
         
         road_mesh = None
         if G_roads is not None:
+            # For roads+bridges we keep everything consistent:
+            # - pass UTM merged_roads + UTM water_geometries
+            # - pass global_center so road_processor converts edges+roads+water to LOCAL consistently
+            merged_roads_for_mesh = locals().get("merged_roads_geom")
+            gc_for_roads = global_center
+            water_geoms_for_bridges_final = water_geoms_for_bridges
+
+            # Minimum printable road width (mm on model) -> meters in world units
+            min_road_width_m = None
+            try:
+                if scale_factor and scale_factor > 0:
+                    # Slightly thicker minimum so roads don't become hairlines on small models
+                    min_road_width_m = float(1.5) / float(scale_factor)  # 1.5mm мінімум
+            except Exception:
+                min_road_width_m = None
+
             road_mesh = process_roads(
                 G_roads,
                 request.road_width_multiplier,
                 terrain_provider=terrain_provider,
                 road_height=float(road_height_m) if road_height_m is not None else 1.0,
                 road_embed=float(road_embed_m) if road_embed_m is not None else 0.0,
-                merged_roads=locals().get("merged_roads_geom"),
-                water_geometries=water_geoms_for_bridges,  # Для визначення мостів
+                merged_roads=merged_roads_for_mesh,
+                water_geometries=water_geoms_for_bridges_final,  # Для визначення мостів
                 bridge_height_multiplier=1.0,  # Множник висоти мостів
-                global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для перетворення координат
+                global_center=gc_for_roads,
+                min_width_m=min_road_width_m,
+                clip_polygon=zone_polygon_local,  # pre-clip roads to zone BEFORE extrusion
             )
             if road_mesh is None:
                 print("[WARN] process_roads повернув None")
@@ -1000,15 +1417,16 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 surface_mm = float(min(max(request.water_depth, 0.2), 0.6))
                 thickness_m = float(surface_mm) / float(scale_factor) if scale_factor else 0.001
                 water_mesh = process_water_surface(
-                    gdf_water,
+                    (locals().get("gdf_water_local") if locals().get("gdf_water_local") is not None else gdf_water),
                     thickness_m=float(thickness_m),
                     depth_meters=float(water_depth_m),
                     terrain_provider=terrain_provider,
-                    global_center=global_center,  # ВАЖЛИВО: передаємо глобальний центр для перетворення координат
+                    # If we already converted gdf_water to local coords, don't convert again.
+                    global_center=None if locals().get("gdf_water_local") is not None else global_center,
                 )
             else:
                 water_mesh = process_water(
-                    gdf_water,
+                    (locals().get("gdf_water_local") if locals().get("gdf_water_local") is not None else gdf_water),
                     depth_mm=float(request.water_depth),
                     depth_meters=float(water_depth_m) if water_depth_m is not None else None,
                     terrain_provider=terrain_provider,
@@ -1037,11 +1455,39 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                     except Exception as e:
                         print(f"[WARN] Не вдалося перетворити gdf_green в локальні координати: {e}")
 
+                    # CRITICAL: Clip parks to zone polygon BEFORE extrusion to avoid huge triangle sheets at edges.
+                    if zone_polygon_local is not None and not zone_polygon_local.is_empty:
+                        try:
+                            def _clip_to_zone(geom):
+                                if geom is None or geom.is_empty:
+                                    return None
+                                try:
+                                    out = geom.intersection(zone_polygon_local)
+                                except Exception:
+                                    return geom
+                                if out is None or out.is_empty:
+                                    return None
+                                # drop tiny artifacts
+                                try:
+                                    if hasattr(out, "area") and float(out.area) < 10.0:
+                                        return None
+                                except Exception:
+                                    pass
+                                return out
+
+                            gdf_green = gdf_green.copy()
+                            gdf_green["geometry"] = gdf_green["geometry"].apply(_clip_to_zone)
+                            gdf_green = gdf_green[gdf_green.geometry.notna()]
+                            gdf_green = gdf_green[~gdf_green.geometry.is_empty]
+                        except Exception:
+                            pass
+
                     parks_mesh = process_green_areas(
                         gdf_green,
                         height_m=float(request.parks_height_mm) / float(scale_factor),
                         embed_m=float(request.parks_embed_mm) / float(scale_factor),
                         terrain_provider=terrain_provider,
+                        global_center=None,  # already in local coords
                     )
                     if parks_mesh is None:
                         print(f"[WARN] process_green_areas повернув None для {len(gdf_green)} парків")
@@ -1106,68 +1552,76 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
         
         # Перевіряємо, чи bbox_meters відрізняється від зони (може бути більший через OSM bounds)
         # Якщо так, обрізаємо меші по формі зони (полігон) або bbox зони
-        clip_tolerance = 10.0  # Збільшений tolerance для зон (10 метрів)
+        # КРИТИЧНО: Використовуємо мінімальний tolerance для точного обрізання біля країв
+        clip_tolerance = 0.1  # Tolerance для обрізання (0.1 метра) - точне обрізання біля країв
         
         # ВАЖЛИВО: Якщо є форма зони (полігон), обрізаємо по ній, інакше по bbox
         from services.mesh_clipper import clip_mesh_to_polygon
         
         if terrain_mesh is not None:
-            if zone_polygon_coords is not None:
-                print(f"[DEBUG] Обрізання terrain по полігону зони ({len(zone_polygon_coords)} точок)")
-                clipped_terrain = clip_mesh_to_polygon(terrain_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
-            else:
-                print(f"[DEBUG] Обрізання terrain по bbox (полігон зони не передано)")
+            # CRITICAL: terrain is generated with zone_polygon-aware base/walls; mesh-level clipping re-introduces
+            # edge artifacts (big thin triangles). Only bbox-clip when polygon is NOT provided.
+            if zone_polygon_coords is None:
                 clipped_terrain = clip_mesh_to_bbox(terrain_mesh, bbox_meters, tolerance=clip_tolerance)
-            if clipped_terrain is not None and len(clipped_terrain.vertices) > 0:
-                terrain_mesh = clipped_terrain
-            else:
-                print(f"[WARN] Terrain mesh став порожнім після обрізання, залишаємо оригінальний")
+                if clipped_terrain is not None and len(clipped_terrain.vertices) > 0:
+                    terrain_mesh = clipped_terrain
+                else:
+                    print(f"[WARN] Terrain mesh став порожнім після обрізання, залишаємо оригінальний")
         
         if road_mesh is not None:
-            if zone_polygon_coords is not None:
-                clipped_road = clip_mesh_to_polygon(road_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
-            else:
+            # CRITICAL: roads are already pre-clipped to zone polygon BEFORE extrusion (clip_polygon=zone_polygon_local).
+            # Mesh-level clipping here causes "curtains"/huge vertical sheets because it keeps triangles by centroid
+            # and does not rebuild boundary caps.
+            if zone_polygon_coords is None:
                 clipped_road = clip_mesh_to_bbox(road_mesh, bbox_meters, tolerance=clip_tolerance)
-            if clipped_road is not None and len(clipped_road.vertices) > 0 and len(clipped_road.faces) > 0:
-                road_mesh = clipped_road
-            else:
-                # Для zone_polygon_coords ми очікуємо строгий клип (бо OSM підвантажується з контекстом).
-                road_mesh = None
+                if clipped_road is not None and len(clipped_road.vertices) > 0 and len(clipped_road.faces) > 0:
+                    road_mesh = clipped_road
+                else:
+                    road_mesh = None
         
         if building_meshes is not None:
-            clipped_buildings = []
-            for i, bmesh in enumerate(building_meshes):
-                if bmesh is not None:
-                    if zone_polygon_coords is not None:
-                        clipped = clip_mesh_to_polygon(bmesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
-                    else:
-                        clipped = clip_mesh_to_bbox(bmesh, bbox_meters, tolerance=clip_tolerance)
-                    if clipped is not None and len(clipped.vertices) > 0 and len(clipped.faces) > 0:
-                        clipped_buildings.append(clipped)
-                    else:
-                        # Якщо будівля поза зоною — відкидаємо (OSM підвантажується з контекстом)
-                        continue
-            building_meshes = clipped_buildings if clipped_buildings else None
+            # If we already clipped building geometries to zone polygon before meshing, avoid triangle-level clipping (creates spikes).
+            if locals().get("preclipped_to_zone"):
+                pass
+            else:
+                clipped_buildings = []
+                for i, bmesh in enumerate(building_meshes):
+                    if bmesh is not None:
+                        if zone_polygon_coords is not None:
+                            clipped = clip_mesh_to_polygon(bmesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+                        else:
+                            clipped = clip_mesh_to_bbox(bmesh, bbox_meters, tolerance=clip_tolerance)
+                        if clipped is not None and len(clipped.vertices) > 0 and len(clipped.faces) > 0:
+                            clipped_buildings.append(clipped)
+                        else:
+                            continue
+                building_meshes = clipped_buildings if clipped_buildings else None
         
         if water_mesh is not None:
-            if zone_polygon_coords is not None:
+            # If we already clipped water geometries to zone polygon before meshing, avoid triangle-level clipping.
+            if locals().get("preclipped_to_zone"):
+                pass
+            elif zone_polygon_coords is not None:
                 clipped_water = clip_mesh_to_polygon(water_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
+                if clipped_water is not None and len(clipped_water.vertices) > 0 and len(clipped_water.faces) > 0:
+                    water_mesh = clipped_water
+                else:
+                    water_mesh = None
             else:
                 clipped_water = clip_mesh_to_bbox(water_mesh, bbox_meters, tolerance=clip_tolerance)
-            if clipped_water is not None and len(clipped_water.vertices) > 0 and len(clipped_water.faces) > 0:
-                water_mesh = clipped_water
-            else:
-                water_mesh = None
+                if clipped_water is not None and len(clipped_water.vertices) > 0 and len(clipped_water.faces) > 0:
+                    water_mesh = clipped_water
+                else:
+                    water_mesh = None
         
         if parks_mesh is not None:
-            if zone_polygon_coords is not None:
-                clipped_parks = clip_mesh_to_polygon(parks_mesh, zone_polygon_coords, global_center=global_center, tolerance=clip_tolerance)
-            else:
+            # CRITICAL: parks are pre-clipped to zone polygon BEFORE extrusion; mesh clipping causes edge sheets.
+            if zone_polygon_coords is None:
                 clipped_parks = clip_mesh_to_bbox(parks_mesh, bbox_meters, tolerance=clip_tolerance)
-            if clipped_parks is not None and len(clipped_parks.vertices) > 0 and len(clipped_parks.faces) > 0:
-                parks_mesh = clipped_parks
-            else:
-                parks_mesh = None
+                if clipped_parks is not None and len(clipped_parks.vertices) > 0 and len(clipped_parks.faces) > 0:
+                    parks_mesh = clipped_parks
+                else:
+                    parks_mesh = None
         
         if poi_mesh is not None:
             if zone_polygon_coords is not None:
@@ -1180,6 +1634,9 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 poi_mesh = None
         
         task.update_status("processing", 82, "Експорт моделі...")
+
+        # Reference XY size for export scaling (so tiles have identical scale and align on edges)
+        # NOTE: reference_xy_m is computed early (before scale_factor) from the zone polygon bounds.
         
         # 6. Експорт сцени
         primary_format = request.export_format.lower()
@@ -1192,6 +1649,7 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
               f"parks={'OK' if parks_mesh else 'None'}, poi={'OK' if poi_mesh else 'None'}")
         
         # Експортуємо основну модель
+        preserve_z = bool(getattr(request, "elevation_ref_m", None) is not None)
         parts_from_main = export_scene(
             terrain_mesh=terrain_mesh,
             road_mesh=road_mesh,
@@ -1207,6 +1665,8 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
             # а прямокутна BaseFlat додає "зайву територію" по боках.
             add_flat_base=(terrain_mesh is None),
             base_thickness_mm=float(request.terrain_base_thickness_mm),
+            reference_xy_m=reference_xy_m,
+            preserve_z=preserve_z,
         )
         
         # Якщо це STL і є окремі частини, зберігаємо їх
@@ -1231,6 +1691,8 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 model_size_mm=request.model_size_mm,
                 add_flat_base=(terrain_mesh is None),
                 base_thickness_mm=float(request.terrain_base_thickness_mm),
+                reference_xy_m=reference_xy_m,
+                preserve_z=preserve_z,
             )
 
         # Кольорове прев'ю: експортуємо STL частини (base/roads/buildings/water) з однаковими трансформаціями
@@ -1264,6 +1726,8 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                     add_flat_base=not request.terrain_enabled,
                     base_thickness_mm=2.0,
                     rotate_to_ground=False,
+                    reference_xy_m=reference_xy_m,
+                    preserve_z=preserve_z,
                 )
                 # Зберігаємо в output_files
                 for part_name, path in parts.items():
@@ -1273,6 +1737,15 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
         
         # Перевіряємо, що файл дійсно створено
         if not output_file_abs.exists():
+            # If 3MF export failed, model_exporter may have fallen back to STL.
+            if primary_format == "3mf":
+                stl_fallback = (OUTPUT_DIR / f"{task_id}.stl").resolve()
+                if stl_fallback.exists():
+                    task.set_output("stl", str(stl_fallback))
+                    task.complete(str(stl_fallback))
+                    task.update_status("completed", 100, "3MF не згенеровано, але STL створено (fallback).")
+                    print(f"[WARN] 3MF не створено для {task_id}, використано STL fallback: {stl_fallback}")
+                    return
             raise FileNotFoundError(f"Файл не було створено: {output_file_abs}")
 
         # Оновлюємо мапу output_files
@@ -1289,7 +1762,9 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
         import traceback
         traceback.print_exc()
         task.fail(str(e))
-        raise
+        # IMPORTANT: don't re-raise from background task, otherwise Starlette logs it as ASGI error
+        # and it can interrupt other tasks. The failure is already recorded in task state.
+        return
 
 
 if __name__ == "__main__":

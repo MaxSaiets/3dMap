@@ -17,6 +17,10 @@ interface ControlPanelProps {
   setShowHexGrid?: (show: boolean) => void;
   selectedZones?: any[];
   setSelectedZones?: (zones: any[]) => void;
+  gridType?: "hexagonal" | "square";
+  setGridType?: (type: "hexagonal" | "square") => void;
+  hexSizeM?: number;
+  setHexSizeM?: (size: number) => void;
 }
 
 export function ControlPanel({ 
@@ -24,6 +28,10 @@ export function ControlPanel({
   setShowHexGrid: externalSetShowHexGrid,
   selectedZones: externalSelectedZones,
   setSelectedZones: externalSetSelectedZones,
+  gridType: externalGridType,
+  setGridType: externalSetGridType,
+  hexSizeM: externalHexSizeM,
+  setHexSizeM: externalSetHexSizeM,
 }: ControlPanelProps = {}) {
   const {
     selectedArea,
@@ -70,6 +78,7 @@ export function ControlPanel({
     setTaskGroup,
     setActiveTaskId,
     setTaskStatuses,
+    setBatchZoneMetaByTaskId,
     setShowAllZones,
     updateProgress,
     setDownloadUrl,
@@ -84,6 +93,18 @@ export function ControlPanel({
   const setShowHexGrid = externalSetShowHexGrid || setInternalShowHexGrid;
   const selectedZones = externalSelectedZones !== undefined ? externalSelectedZones : internalSelectedZones;
   const setSelectedZones = externalSetSelectedZones || setInternalSelectedZones;
+
+  // Налаштування сітки (використовуємо зовнішні якщо передані)
+  const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square">("hexagonal");
+  const [internalHexSizeM, setInternalHexSizeM] = useState(500.0);
+  
+  const gridType = externalGridType !== undefined ? externalGridType : internalGridType;
+  const setGridType = externalSetGridType || setInternalGridType;
+  const hexSizeM = externalHexSizeM !== undefined ? externalHexSizeM : internalHexSizeM;
+  const setHexSizeM = externalSetHexSizeM || setInternalHexSizeM;
+
+  // Стан згортання секцій
+  const [isParamsExpanded, setIsParamsExpanded] = useState(true);
 
   // Перевірка статусу задачі
   useEffect(() => {
@@ -275,6 +296,21 @@ export function ControlPanel({
         : [response.task_id];
       setTaskGroup(response.task_id, ids);
       setActiveTaskId(ids[0] ?? null);
+
+      // Batch preview positioning: keep mapping taskId -> selected zone (row/col) in the same order
+      try {
+        const meta: Record<string, any> = {};
+        for (let i = 0; i < ids.length; i++) {
+          const z = selectedZones[i];
+          const zoneId = String(z?.id || z?.properties?.id || `zone_${i}`);
+          const row = z?.properties?.row;
+          const col = z?.properties?.col;
+          meta[String(ids[i])] = { zoneId, row, col };
+        }
+        setBatchZoneMetaByTaskId(meta);
+      } catch {
+        // ignore
+      }
     } catch (err: any) {
       setError(err.message || "Помилка генерації моделей для зон");
       setGenerating(false);
@@ -282,40 +318,138 @@ export function ControlPanel({
   };
 
   return (
-    <div className="p-4 space-y-6">
+    <div className="p-4 space-y-6 overflow-y-auto h-full">
       <h1 className="text-2xl font-bold">3D Map Generator</h1>
       
-      {/* Кнопка для відкриття гексагональної сітки */}
-      <div className="flex gap-2 flex-wrap">
-        <button
-          onClick={() => {
-            setShowHexGrid(!showHexGrid);
-            setError(null);
-          }}
-          className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 flex items-center gap-2"
-        >
-          <Grid size={20} />
-          {showHexGrid ? "Закрити сітку" : "Відкрити гексагональну сітку (Київ)"}
-        </button>
-        {showHexGrid && selectedZones.length > 0 && (
+      {/* Секція вибору режиму роботи */}
+      <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+        <h2 className="text-lg font-semibold">Режим роботи</h2>
+        <div className="flex gap-2">
           <button
-            onClick={handleGenerateZones}
-            disabled={isGenerating}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400 flex items-center gap-2"
+            onClick={() => {
+              setShowHexGrid(false);
+              setSelectedZones([]);
+              setError(null);
+            }}
+            className={`flex-1 px-4 py-2 rounded transition-colors ${
+              !showHexGrid
+                ? "bg-blue-600 text-white"
+                : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+            }`}
           >
-            <Play size={20} />
-            Генерувати для {selectedZones.length} зон
+            Одна область
           </button>
-        )}
-        {showHexGrid && (
           <button
-            onClick={() => setSelectedZones([])}
-            className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600 flex items-center gap-2"
+            onClick={() => {
+              setShowHexGrid(true);
+              setError(null);
+            }}
+            className={`flex-1 px-4 py-2 rounded transition-colors ${
+              showHexGrid
+                ? "bg-blue-600 text-white"
+                : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+            }`}
           >
-            Очистити вибір
+            <Grid size={16} className="inline mr-1" />
+            Сітка зон
           </button>
-        )}
+        </div>
       </div>
+
+      {/* Секція налаштування сітки (тільки коли сітка увімкнена) */}
+      {showHexGrid && (
+        <div className="space-y-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
+          <h2 className="text-lg font-semibold text-blue-900">Налаштування сітки</h2>
+          
+          <div>
+            <label className="block text-sm font-medium mb-1">
+              Тип сітки
+            </label>
+            <select
+              value={gridType}
+              onChange={(e) => {
+                const newType = e.target.value as "hexagonal" | "square";
+                setGridType(newType);
+                // Скидаємо вибір зон при зміні типу сітки
+                setSelectedZones([]);
+              }}
+              className="w-full p-2 border rounded bg-white"
+            >
+              <option value="hexagonal">Шестикутники</option>
+              <option value="square">Квадрати</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-1">
+              Розмір клітинки: {hexSizeM.toFixed(0)} м
+            </label>
+            <input
+              type="range"
+              min="200"
+              max="2000"
+              step="100"
+              value={hexSizeM}
+              onChange={(e) => {
+                const newSize = parseFloat(e.target.value);
+                setHexSizeM(newSize);
+                // Скидаємо вибір зон при зміні розміру сітки
+                setSelectedZones([]);
+              }}
+              className="w-full"
+            />
+            <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <span>200 м</span>
+              <span>1000 м</span>
+              <span>2000 м</span>
+            </div>
+          </div>
+
+          {/* Статус вибору зон */}
+          <div className="p-2 bg-white rounded border">
+            <div className="text-sm space-y-1">
+              <div className="flex justify-between items-center">
+                <span className="font-medium">Вибрано зон:</span>
+                <span className={`font-bold ${selectedZones.length > 0 ? "text-green-600" : "text-gray-400"}`}>
+                  {selectedZones.length}
+                </span>
+              </div>
+              {selectedZones.length > 0 && (
+                <p className="text-xs text-green-600 font-medium">
+                  ✓ Готово до генерації
+                </p>
+              )}
+              {selectedZones.length === 0 && (
+                <p className="text-xs text-gray-500">
+                  Клікніть по зонах на карті для вибору
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Кнопки дій для сітки */}
+          <div className="flex gap-2 flex-wrap">
+            {selectedZones.length > 0 && (
+              <button
+                onClick={handleGenerateZones}
+                disabled={isGenerating}
+                className="flex-1 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-gray-400 flex items-center justify-center gap-2"
+              >
+                <Play size={18} />
+                Генерувати ({selectedZones.length})
+              </button>
+            )}
+            {selectedZones.length > 0 && (
+              <button
+                onClick={() => setSelectedZones([])}
+                className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600 text-sm"
+              >
+                Очистити
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Batch: список згенерованих зон (дає вибір, яку саме зону показувати/скачувати) */}
       {taskIds.length > 1 && (
@@ -384,7 +518,16 @@ export function ControlPanel({
 
       {/* Параметри генерації */}
       <div className="space-y-4">
-        <h2 className="text-lg font-semibold">Параметри генерації</h2>
+        <button
+          onClick={() => setIsParamsExpanded(!isParamsExpanded)}
+          className="w-full flex items-center justify-between text-lg font-semibold hover:text-blue-600 transition-colors"
+        >
+          <span>Параметри генерації</span>
+          <span className="text-sm">{isParamsExpanded ? "▼" : "▶"}</span>
+        </button>
+        
+        {isParamsExpanded && (
+        <div className="space-y-4">
 
         {/* Дороги */}
         <div>
@@ -631,26 +774,30 @@ export function ControlPanel({
             <span>500 мм (50 см)</span>
           </div>
         </div>
+        </div>
+        )}
       </div>
 
-      {/* Кнопка генерації */}
-      <button
-        onClick={handleGenerate}
-        disabled={!selectedArea || isGenerating}
-        className="w-full bg-blue-600 text-white py-2 px-4 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center justify-center space-x-2"
-      >
-        {isGenerating ? (
-          <>
-            <Loader2 className="w-4 h-4 animate-spin" />
-            <span>Генерація...</span>
-          </>
-        ) : (
-          <>
-            <Play className="w-4 h-4" />
-            <span>Згенерувати модель</span>
-          </>
-        )}
-      </button>
+      {/* Кнопка генерації (тільки для режиму "Одна область") */}
+      {!showHexGrid && (
+        <button
+          onClick={handleGenerate}
+          disabled={!selectedArea || isGenerating}
+          className="w-full bg-blue-600 text-white py-2 px-4 rounded hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed flex items-center justify-center space-x-2"
+        >
+          {isGenerating ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span>Генерація...</span>
+            </>
+          ) : (
+            <>
+              <Play className="w-4 h-4" />
+              <span>Згенерувати модель</span>
+            </>
+          )}
+        </button>
+      )}
 
       {/* Прогрес */}
       {isGenerating && (
