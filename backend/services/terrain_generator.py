@@ -247,27 +247,28 @@ def create_terrain_mesh(
         Z = np.zeros_like(X, dtype=float)
 
     # Опційне згладжування висот (прибирає "грубі грані" та шум DEM).
-    # Виконуємо ДО flatten під будівлями, щоб flatten працював на стабільному heightfield.
-    try:
-        sigma = float(smoothing_sigma or 0.0)
-        if sigma > 0.0:
-            from scipy.ndimage import gaussian_filter
-            # Використовуємо 'reflect' замість 'nearest' для кращої обробки країв
-            Z = gaussian_filter(Z.astype(float, copy=False), sigma=sigma, mode="reflect")
-            # Додаткове легке згладжування для ще плавнішого рельєфу
-            Z = gaussian_filter(Z.astype(float, copy=False), sigma=sigma * 0.5, mode="reflect")
-        
-        # Додаткове згладжування для уникнення фасетованого вигляду
-        # Якщо resolution низький, додаємо легке згладжування навіть без явного sigma
-        if sigma == 0.0 and resolution < 250:
-            # Автоматичне легке згладжування для низької деталізації
-            from scipy.ndimage import gaussian_filter
-            auto_sigma = max(0.8, 2.0 / (resolution / 100.0))  # Збільшено адаптивний sigma
-            Z = gaussian_filter(Z.astype(float, copy=False), sigma=auto_sigma, mode="reflect")
-            # Додаткове згладжування
-            Z = gaussian_filter(Z.astype(float, copy=False), sigma=auto_sigma * 0.6, mode="reflect")
-    except Exception:
-        pass
+    # IMPORTANT (stitching): any per-tile filter with reflect padding creates different seam values.
+    if elevation_ref_m is None or not np.isfinite(float(elevation_ref_m)):
+        try:
+            sigma = float(smoothing_sigma or 0.0)
+            if sigma > 0.0:
+                from scipy.ndimage import gaussian_filter
+                # Використовуємо 'reflect' замість 'nearest' для кращої обробки країв
+                Z = gaussian_filter(Z.astype(float, copy=False), sigma=sigma, mode="reflect")
+                # Додаткове легке згладжування для ще плавнішого рельєфу
+                Z = gaussian_filter(Z.astype(float, copy=False), sigma=sigma * 0.5, mode="reflect")
+            
+            # Додаткове згладжування для уникнення фасетованого вигляду
+            # Якщо resolution низький, додаємо легке згладжування навіть без явного sigma
+            if sigma == 0.0 and resolution < 250:
+                # Автоматичне легке згладжування для низької деталізації
+                from scipy.ndimage import gaussian_filter
+                auto_sigma = max(0.8, 2.0 / (resolution / 100.0))  # Збільшено адаптивний sigma
+                Z = gaussian_filter(Z.astype(float, copy=False), sigma=auto_sigma, mode="reflect")
+                # Додаткове згладжування
+                Z = gaussian_filter(Z.astype(float, copy=False), sigma=auto_sigma * 0.6, mode="reflect")
+        except Exception:
+            pass
 
     # КЛЮЧОВО: "Terrain-first" стабілізація.
     # На шумному DEM або крутих схилах будівлі часто стають "криво":
@@ -290,6 +291,14 @@ def create_terrain_mesh(
             )
         except Exception as e:
             print(f"[WARN] flatten_roads failed: {e}")
+
+    # CRITICAL (stitching): in global elevation sync mode, all tiles must share the same Z floor.
+    # Clamp the heightfield to >= 0 BEFORE carving water, so min_floor is identical across zones.
+    try:
+        if elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)):
+            Z = np.maximum(np.asarray(Z, dtype=float), 0.0)
+    except Exception:
+        pass
 
     # Water depression: carve water directly into the terrain heightfield.
     # This avoids exporting a deep "water box" that visually overlaps everything in preview.
@@ -388,79 +397,65 @@ def create_terrain_mesh(
         Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Додаткова перевірка: якщо всі значення однакові або дуже малі, додаємо мінімальну варіацію
+    # IMPORTANT (stitching): never inject noise/contrast in global mode (breaks seams).
     z_range = float(np.max(Z) - np.min(Z))
-    if z_range < 1e-6:
-        # Дуже плоский рельєф - додаємо помітну варіацію для кращої видимості
-        # Використовуємо детермінований генератор для стабільності
-        rng = np.random.RandomState(42)
-        # Збільшуємо амплітуду шуму для кращої видимості
-        noise_amplitude = max(0.1, z_scale * 0.1)  # Адаптивна амплітуда залежно від z_scale
-        noise = rng.uniform(-noise_amplitude, noise_amplitude, Z.shape)
-        Z = Z + noise
-        # Перевірка після додавання шуму
-        Z = np.clip(Z, -1e6, 1e6)  # Обмежуємо екстремальні значення
-    elif z_range < 0.5:
-        # Рельєф занадто плоский - підсилюємо контраст
-        z_mean = float(np.mean(Z))
-        z_contrast = 2.0  # Множник контрасту
-        Z = (Z - z_mean) * z_contrast + z_mean
+    if elevation_ref_m is None or not np.isfinite(float(elevation_ref_m)):
+        if z_range < 1e-6:
+            rng = np.random.RandomState(42)
+            noise_amplitude = max(0.1, z_scale * 0.1)
+            noise = rng.uniform(-noise_amplitude, noise_amplitude, Z.shape)
+            Z = Z + noise
+            Z = np.clip(Z, -1e6, 1e6)
+        elif z_range < 0.5:
+            z_mean = float(np.mean(Z))
+            z_contrast = 2.0
+            Z = (Z - z_mean) * z_contrast + z_mean
 
     # Фінальне згладжування для уникнення фасетованого вигляду
-    # Додаємо потужне згладжування навіть після всіх модифікацій для плавного рельєфу
-    try:
-        from scipy.ndimage import gaussian_filter, uniform_filter
-        # Потужніше фінальне згладжування (1.0-2.0 sigma) для максимальної плавності
-        # Адаптуємо до resolution: для нижчої resolution - більше згладжування
-        final_smooth = max(1.0, min(2.0, 250.0 / max(resolution, 100.0)))
-        
-        # Комбіноване згладжування: Gaussian + Uniform для кращого результату
-        # Gaussian filter для загального згладжування
-        Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth, mode="reflect")
-        # Друге згладжування для додаткової плавності
-        Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.7, mode="reflect")
-        # Третє легке згладжування для фінальної поліровки
-        Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.4, mode="reflect")
-        
-        # Додаткове edge-preserving smoothing для збереження важливих деталей
-        # Використовуємо більш складний фільтр, який зберігає різкі переходи
+    # IMPORTANT (stitching): disable per-tile reflect smoothing in global mode.
+    if elevation_ref_m is None or not np.isfinite(float(elevation_ref_m)):
         try:
-            # Bilateral-like effect: згладжуємо, але зберігаємо контраст
-            Z_smooth = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.3, mode="reflect")
-            # Змішуємо оригінал зі згладженим (85% згладженого, 15% оригіналу) для кращої плавності
-            Z = Z * 0.85 + Z_smooth * 0.15
-        except Exception:
-            pass
-        
-        # Фінальне дуже легке згладжування для ідеальної плавності
-        try:
-            Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.2, mode="reflect")
-        except Exception:
-            pass
-    except Exception:
-        pass
-    
-    # Підсилення контрасту рельєфу для кращої видимості
-    try:
-        z_range = float(np.max(Z) - np.min(Z))
-        if z_range > 0.01:  # Якщо є хоча б якась варіація
-            z_mean = float(np.mean(Z))
-            # Підсилюємо контраст на 50% для кращої видимості
-            contrast_factor = 1.5
-            Z = (Z - z_mean) * contrast_factor + z_mean
-            
-            # Додаткове покращення: adaptive contrast enhancement
-            # Підсилюємо контраст більше в областях з великими перепадами
+            from scipy.ndimage import gaussian_filter, uniform_filter
+            final_smooth = max(1.0, min(2.0, 250.0 / max(resolution, 100.0)))
+            Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth, mode="reflect")
+            Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.7, mode="reflect")
+            Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.4, mode="reflect")
             try:
-                from scipy.ndimage import gaussian_gradient_magnitude
-                # Обчислюємо градієнт висот
-                gradient = gaussian_gradient_magnitude(Z, sigma=1.0)
-                # Нормалізуємо градієнт
-                gradient_norm = gradient / (np.max(gradient) + 1e-10)
-                # Підсилюємо контраст більше там, де є круті схили
-                adaptive_boost = 1.0 + gradient_norm * 0.3  # До 30% додаткового підсилення
-                Z = (Z - z_mean) * adaptive_boost + z_mean
+                Z_smooth = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.3, mode="reflect")
+                Z = Z * 0.85 + Z_smooth * 0.15
             except Exception:
                 pass
+            try:
+                Z = gaussian_filter(Z.astype(float, copy=False), sigma=final_smooth * 0.2, mode="reflect")
+            except Exception:
+                pass
+        except Exception:
+            pass
+    
+    # Підсилення контрасту рельєфу для кращої видимості
+    # IMPORTANT (stitching): skip in global mode (breaks seams).
+    if elevation_ref_m is None or not np.isfinite(float(elevation_ref_m)):
+        try:
+            z_range = float(np.max(Z) - np.min(Z))
+            if z_range > 0.01:
+                z_mean = float(np.mean(Z))
+                contrast_factor = 1.5
+                Z = (Z - z_mean) * contrast_factor + z_mean
+                try:
+                    from scipy.ndimage import gaussian_gradient_magnitude
+                    gradient = gaussian_gradient_magnitude(Z, sigma=1.0)
+                    gradient_norm = gradient / (np.max(gradient) + 1e-10)
+                    adaptive_boost = 1.0 + gradient_norm * 0.3
+                    Z = (Z - z_mean) * adaptive_boost + z_mean
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # CRITICAL (stitching): keep a shared global Z floor across zones even after contrast/smoothing.
+    try:
+        if elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)):
+            Z = np.maximum(np.asarray(Z, dtype=float), 0.0)
     except Exception:
         pass
     
@@ -554,38 +549,56 @@ def create_terrain_mesh(
                     poly = poly.buffer(0)
                 prep_poly = prep(poly)
 
-                # 1) interior points: take grid points that are inside/touch the polygon
+                stitching_mode = bool(elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)))
+
+                # 1) interior points: take grid points that are inside the polygon.
+                # NOTE: in stitching_mode we do NOT include points that merely "touch" the boundary,
+                # because those grid-touch points differ per-tile and create jagged borders / spikes.
                 xy_grid = np.column_stack([X.flatten(), Y.flatten()])
                 inside_mask = np.array(
-                    [prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y))) for x, y in xy_grid],
+                    [
+                        (prep_poly.contains(Point(float(x), float(y))) if stitching_mode else (prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y)))))
+                        for x, y in xy_grid
+                    ],
                     dtype=bool,
                 )
                 pts_xy = [tuple(map(float, p)) for p in xy_grid[inside_mask]]
 
-                # 2) boundary densification: add points along polygon edges for a clean boundary
+                # 2) boundary points:
+                # - stitching_mode: ONLY polygon vertices (so shared borders have identical vertex sets)
+                # - non-stitching: densify along edges for nicer looking borders in single-tile preview
                 try:
                     coords = list(poly.exterior.coords)
                 except Exception:
                     coords = []
 
-                # choose spacing based on zone size (meters)
-                try:
-                    b = poly.bounds
-                    zone_size = max(float(b[2] - b[0]), float(b[3] - b[1]))
-                    spacing = max(2.0, min(10.0, zone_size / 200.0))  # 2..10m
-                except Exception:
-                    spacing = 5.0
-
                 boundary_pts = []
-                for i in range(max(0, len(coords) - 1)):
-                    x1, y1 = coords[i][0], coords[i][1]
-                    x2, y2 = coords[i + 1][0], coords[i + 1][1]
-                    seg_len = float(np.hypot(x2 - x1, y2 - y1))
-                    n = max(2, int(seg_len / spacing) + 1)
-                    for t in np.linspace(0.0, 1.0, n, dtype=float):
-                        p = (float(x1 + (x2 - x1) * t), float(y1 + (y2 - y1) * t))
-                        pts_xy.append(p)
-                        boundary_pts.append(p)
+                if coords:
+                    if stitching_mode:
+                        # Use only polygon vertices (drop closure point)
+                        if len(coords) >= 2 and coords[0] == coords[-1]:
+                            coords = coords[:-1]
+                        for x, y, *_ in coords:
+                            p = (float(x), float(y))
+                            pts_xy.append(p)
+                            boundary_pts.append(p)
+                    else:
+                        # choose spacing based on zone size (meters)
+                        try:
+                            b = poly.bounds
+                            zone_size = max(float(b[2] - b[0]), float(b[3] - b[1]))
+                            spacing = max(2.0, min(10.0, zone_size / 200.0))  # 2..10m
+                        except Exception:
+                            spacing = 5.0
+                        for i in range(max(0, len(coords) - 1)):
+                            x1, y1 = coords[i][0], coords[i][1]
+                            x2, y2 = coords[i + 1][0], coords[i + 1][1]
+                            seg_len = float(np.hypot(x2 - x1, y2 - y1))
+                            n = max(2, int(seg_len / spacing) + 1)
+                            for t in np.linspace(0.0, 1.0, n, dtype=float):
+                                p = (float(x1 + (x2 - x1) * t), float(y1 + (y2 - y1) * t))
+                                pts_xy.append(p)
+                                boundary_pts.append(p)
 
                 # de-dupe
                 pts_xy_arr = np.unique(np.round(np.asarray(pts_xy, dtype=float), 3), axis=0)
@@ -597,7 +610,7 @@ def create_terrain_mesh(
                 # so adjacent zones share identical border vertex heights (perfect stitching).
                 # We only re-sample the boundary points (cheap), not the full interior grid (expensive).
                 try:
-                    if boundary_pts and latlon_bbox is not None and source_crs is not None:
+                    if boundary_pts and latlon_bbox is not None:
                         boundary_set = {tuple(np.round(np.asarray(p, dtype=float), 3)) for p in boundary_pts}
                         rounded_all = np.round(pts_xy_arr, 3)
                         boundary_mask = np.array([tuple(p) in boundary_set for p in rounded_all], dtype=bool)
@@ -633,15 +646,37 @@ def create_terrain_mesh(
                     pass
                 pts3 = np.column_stack([pts_xy_arr[:, 0], pts_xy_arr[:, 1], zs.astype(float)])
 
-                # Triangulate and keep triangles inside/touching polygon
+                # Triangulate and keep triangles inside/touching polygon.
+                # CRITICAL: centroid-only filtering keeps triangles that cross outside the polygon boundary
+                # (centroid inside, but part of triangle outside) -> edge spikes / extra triangles on tile borders.
                 tri = Delaunay(pts_xy_arr)
                 tri_faces = np.asarray(tri.simplices, dtype=np.int32)
-                centroids = pts_xy_arr[tri_faces].mean(axis=1)
-                keep = np.array(
-                    [prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y))) for x, y in centroids],
+
+                tri_pts = pts_xy_arr[tri_faces]  # (F,3,2)
+                centroids = tri_pts.mean(axis=1)  # (F,2)
+                centroid_keep = np.array(
+                    [
+                        (prep_poly.contains(Point(float(x), float(y))) if stitching_mode else (prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y)))))
+                        for x, y in centroids
+                    ],
                     dtype=bool,
                 )
-                tri_faces = tri_faces[keep]
+                if np.any(centroid_keep):
+                    kept_idx = np.nonzero(centroid_keep)[0]
+                    strict_keep = np.zeros(len(tri_faces), dtype=bool)
+                    for fi in kept_idx:
+                        ok = True
+                        for k in range(3):
+                            x = float(tri_pts[fi, k, 0])
+                            y = float(tri_pts[fi, k, 1])
+                            p = Point(x, y)
+                            if not (prep_poly.contains(p) if stitching_mode else (prep_poly.contains(p) or prep_poly.touches(p))):
+                                ok = False
+                                break
+                        strict_keep[fi] = ok
+                    tri_faces = tri_faces[strict_keep]
+                else:
+                    tri_faces = tri_faces[:0]
 
                 if tri_faces.size > 0:
                     terrain_top = trimesh.Trimesh(vertices=pts3, faces=tri_faces, process=True)
@@ -778,16 +813,32 @@ def create_terrain_mesh(
             shapely_poly = ShapelyPolygon(poly_coords_2d)
             
             if shapely_poly.is_valid and not shapely_poly.is_empty:
-                # Обрізаємо terrain_top по полігону
-                # Використовуємо координати в локальних координатах (як є)
-                # global_center=None бо координати вже локальні
-                # Використовуємо менший tolerance для точного обрізання
-                clipped = clip_mesh_to_polygon(terrain_top, poly_coords_2d, global_center=None, tolerance=0.1)
-                if clipped is not None and len(clipped.vertices) > 0:
-                    terrain_top_clipped = clipped
-                    # print(f"[INFO] Terrain обрізано по формі зони перед створенням стінок ({len(poly_coords)} точок)")
-                else:
-                    print(f"[WARN] Не вдалося обрізати terrain по полігону, використовується необрізаний terrain")
+                # Якщо верхній рельєф вже побудовано polygon-aware (Delaunay всередині полігону),
+                # додаткове mesh-level clipping тільки погіршує край (тонкі трикутники/шипи).
+                # Тому кліпаємо ТІЛЬКИ якщо terrain_top явно більший за полігон (регулярна сітка fallback).
+                try:
+                    tb = terrain_top.bounds
+                    pb = shapely_poly.bounds
+                    terrain_covers_poly_bbox = (
+                        float(tb[0][0]) <= float(pb[0]) and float(tb[0][1]) <= float(pb[1]) and
+                        float(tb[1][0]) >= float(pb[2]) and float(tb[1][1]) >= float(pb[3])
+                    )
+                except Exception:
+                    terrain_covers_poly_bbox = True
+
+                # Heuristic: regular grid terrain has exactly res_x*res_y vertices, polygon-aware won't.
+                is_regular_grid = False
+                try:
+                    is_regular_grid = int(len(terrain_top.vertices)) == int(res_x * res_y)
+                except Exception:
+                    is_regular_grid = False
+
+                if terrain_covers_poly_bbox and is_regular_grid:
+                    clipped = clip_mesh_to_polygon(terrain_top, poly_coords_2d, global_center=None, tolerance=0.1)
+                    if clipped is not None and len(clipped.vertices) > 0:
+                        terrain_top_clipped = clipped
+                    else:
+                        print(f"[WARN] Не вдалося обрізати terrain по полігону, використовується необрізаний terrain")
         except Exception as e:
             print(f"[WARN] Помилка обрізання terrain по полігону: {e}, використовується необрізаний terrain")
             import traceback
@@ -801,29 +852,27 @@ def create_terrain_mesh(
     # that per-tile shift breaks height continuity across shared edges.
     #
     # Fix: force a CONSTANT bottom plane across tiles in global elevation mode.
-    # We pick a global floor below the lowest expected terrain surface:
-    # - base thickness (model) + water depression depth (model, if enabled) expressed in world meters.
-    # Then we adapt per-tile base thickness so that min_z becomes the same floor for all tiles.
+    #
+    # IMPORTANT:
+    # `Z` in this pipeline has historically been inconsistent between "relative" and "absolute-like" meters
+    # depending on provider / legacy code paths.
+    # If we assume the wrong space, we get "tower bases" (huge base_thickness) and zones won't stitch.
+    #
+    # Strategy:
+    # - Infer whether `Z` is "absolute-like" (around elevation_ref_m in meters above sea level) vs "relative" (near 0).
+    # - Choose a global floor in the SAME space as `Z`.
+    # - Adapt base thickness so that min_z (bottom of solid) is exactly that global floor for every tile.
+    # IMPORTANT: base_thickness is already computed from mm/scale_factor in world meters.
+    # Do NOT adapt it per-tile based on min(Z) — that causes vertical offsets between adjacent zones.
     base_thickness_for_solid = float(base_thickness)
-    try:
-        if elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)):
-            requested_base = float(base_thickness_for_solid)
-            wdepth = float(water_depth_m or 0.0)
-            wdepth = wdepth if np.isfinite(wdepth) and wdepth > 0 else 0.0
-            # global floor in world meters (after z_scale): constant across tiles if scale_factor is consistent
-            global_floor_z = -requested_base - wdepth
-            tmin = float(np.nanmin(np.asarray(Z, dtype=float)))
-            if np.isfinite(tmin):
-                base_thickness_for_solid = float(max(0.001, tmin - global_floor_z))
-    except Exception:
-        base_thickness_for_solid = float(base_thickness)
 
     terrain_solid = create_solid_terrain(
         terrain_top_clipped,  # Використовуємо обрізаний terrain
         X, Y, Z, 
         base_thickness=base_thickness_for_solid,
         zone_polygon=zone_polygon,  # Передаємо полігон зони для форми base та стінок
-        terrain_provider=terrain_provider  # Передаємо TerrainProvider для отримання висот на полігоні
+        terrain_provider=terrain_provider,  # Передаємо TerrainProvider для отримання висот на полігоні
+        stitching_mode=bool(elevation_ref_m is not None and np.isfinite(float(elevation_ref_m))),
     )
     
     return terrain_solid, terrain_provider
@@ -1112,6 +1161,17 @@ def get_elevation_data(
     
     # 1) Try absolute DEM first (so we can apply global baseline)
     Z_abs = None
+    # If caller didn't provide CRS (common in terrain_only mode), infer it from the lat/lon bbox.
+    # Without this we silently fall back to synthetic terrain, which breaks stitching.
+    if latlon_bbox is not None and source_crs is None:
+        try:
+            from services.crs_utils import bbox_latlon_to_utm
+            north, south, east, west = latlon_bbox
+            _, _, _, _, utm_crs, _, _ = bbox_latlon_to_utm(north, south, east, west)
+            source_crs = utm_crs
+        except Exception:
+            source_crs = None
+
     if latlon_bbox is not None and source_crs is not None:
         # Використовуємо реальний рельєф з API (Terrarium/OpenTopoData/GeoTIFF)
         # Отримуємо абсолютні висоти в метрах над рівнем моря
@@ -1160,6 +1220,16 @@ def get_elevation_data(
         Z_rel = Z_rel + float(baseline_offset_m or 0.0)
     except Exception:
         pass
+
+    # CRITICAL (stitching + base thickness):
+    # When using a GLOBAL elevation_ref_m, do NOT allow negative relative heights.
+    # Negative Z causes per-tile minZ shifts on export and huge/variable base thickness.
+    # Clamp to 0 so all tiles share the same Z floor.
+    if elevation_ref_m is not None and np.isfinite(elevation_ref_m):
+        try:
+            Z_rel = np.maximum(np.asarray(Z_rel, dtype=float), 0.0)
+        except Exception:
+            pass
 
     # CRITICAL: never replace missing elevation with 0.0 here.
     # If elevation_ref_m is used, 0.0 becomes a huge negative after (Z_abs - elevation_ref_m),
@@ -1210,7 +1280,8 @@ def create_solid_terrain(
     Z: np.ndarray,
     base_thickness: float = 5.0,
     zone_polygon: Optional[BaseGeometry] = None,  # Полігон зони для форми base та стінок
-    terrain_provider: Optional[object] = None  # TerrainProvider для отримання висот на полігоні
+    terrain_provider: Optional[object] = None,  # TerrainProvider для отримання висот на полігоні
+    stitching_mode: bool = False,  # якщо True: спільний Z-floor між зонами (нижня площина однакова для всіх)
 ) -> trimesh.Trimesh:
     """
     Створює твердотільний рельєф з дном та стінами (watertight mesh)
@@ -1241,14 +1312,235 @@ def create_solid_terrain(
     if not np.isfinite(effective_base_thickness) or effective_base_thickness <= 0:
         effective_base_thickness = 0.001  # safety: 1mm in world units, will be scaled later
     
-    # Обчислюємо мінімальну висоту бази
-    # КРИТИЧНО: Верх base має бути на мінімальній висоті terrain
-    # Base екструдується вниз на effective_base_thickness
-    # Тому min_z (низ base) = terrain_min_z - effective_base_thickness
-    min_z = terrain_min_z - effective_base_thickness
-    print(f"[DEBUG] Terrain height range: {z_range:.2f}м, base_thickness: {effective_base_thickness:.3f}м "
-          f"(requested: {float(base_thickness):.3f}м, min: {terrain_min_z:.2f}м, max: {terrain_max_z:.2f}м)")
+    # Global stitching mode:
+    # - bottom of all tiles must be identical (so "podlozhka" bottoms align)
+    # - top of base is a shared Z=0 plane (terrain sits above it; holes avoided by earlier Z>=0 clamp)
+    if stitching_mode:
+        terrain_min_z = 0.0
+        min_z = -effective_base_thickness
+    else:
+        # Legacy: base top follows the local min of the heightfield.
+        min_z = terrain_min_z - effective_base_thickness
+
+    print(
+        f"[DEBUG] Terrain height range: {z_range:.2f}м, base_thickness: {effective_base_thickness:.3f}м "
+        f"(requested: {float(base_thickness):.3f}м, min: {float(np.min(Z)):.2f}м, max: {float(np.max(Z)):.2f}м, "
+        f"stitching_mode={bool(stitching_mode)})"
+    )
     
+    # Helper: build a watertight solid by extruding the OPEN boundary loop of terrain_top down to min_z.
+    # This avoids "teeth" / huge triangles on side walls caused by hole-filling after loose concatenation.
+    def _solidify_from_boundary(top_mesh: trimesh.Trimesh, floor_z: float) -> Optional[trimesh.Trimesh]:
+        try:
+            m = top_mesh.copy()
+            if m.faces is None or len(m.faces) == 0:
+                return None
+            # Boundary edges (each belongs to exactly one face). Do NOT rely on trimesh.edges_boundary
+            # because API differs between versions.
+            edges = None
+            try:
+                faces = np.asarray(m.faces, dtype=np.int64)
+                e01 = faces[:, [0, 1]]
+                e12 = faces[:, [1, 2]]
+                e20 = faces[:, [2, 0]]
+                all_e = np.vstack([e01, e12, e20])
+                all_e_sorted = np.sort(all_e, axis=1)
+                # count unique edges
+                uniq, counts = np.unique(all_e_sorted, axis=0, return_counts=True)
+                edges = uniq[counts == 1]
+            except Exception:
+                edges = None
+            if edges is None or len(edges) < 3:
+                return None
+
+            # Build adjacency for boundary graph
+            adj: dict[int, list[int]] = {}
+            for a, b in edges:
+                a = int(a); b = int(b)
+                adj.setdefault(a, []).append(b)
+                adj.setdefault(b, []).append(a)
+
+            # Walk loops
+            loops: list[list[int]] = []
+            visited_edges: set[tuple[int, int]] = set()
+
+            def _mark(a: int, b: int):
+                visited_edges.add((a, b))
+                visited_edges.add((b, a))
+
+            for start in list(adj.keys()):
+                # find an unvisited outgoing edge
+                nxts = adj.get(start, [])
+                if not nxts:
+                    continue
+                if all((start, n) in visited_edges for n in nxts):
+                    continue
+
+                loop = [start]
+                prev = None
+                cur = start
+                # pick first unvisited neighbor
+                next_v = None
+                for n in nxts:
+                    if (cur, int(n)) not in visited_edges:
+                        next_v = int(n)
+                        break
+                if next_v is None:
+                    continue
+
+                _mark(cur, next_v)
+                prev = cur
+                cur = next_v
+                loop.append(cur)
+
+                # continue until closed or stuck
+                for _ in range(len(edges) + 5):
+                    nbrs = adj.get(cur, [])
+                    if not nbrs:
+                        break
+                    # choose neighbor not equal prev, prefer unvisited
+                    cand = [int(n) for n in nbrs if int(n) != int(prev)]
+                    if not cand:
+                        cand = [int(n) for n in nbrs]
+                    pick = None
+                    for n in cand:
+                        if (cur, n) not in visited_edges:
+                            pick = n
+                            break
+                    if pick is None:
+                        # allow closing back to start if edge exists
+                        if start in cand and (cur, start) not in visited_edges:
+                            pick = start
+                        else:
+                            break
+                    _mark(cur, pick)
+                    prev, cur = cur, pick
+                    if cur == start:
+                        break
+                    loop.append(cur)
+
+                # Ensure closed loop
+                if len(loop) >= 3 and loop[0] == loop[-1]:
+                    loop = loop[:-1]
+                if len(loop) >= 3:
+                    loops.append(loop)
+
+            if not loops:
+                return None
+
+            # Pick the largest loop by projected area
+            verts = np.asarray(m.vertices, dtype=float)
+            best = None
+            best_area = -1.0
+            for loop in loops:
+                try:
+                    pts = verts[np.array(loop, dtype=int), :2]
+                    from shapely.geometry import Polygon as _Poly
+                    poly = _Poly([(float(x), float(y)) for x, y in pts])
+                    a = float(abs(poly.area))
+                except Exception:
+                    a = float(len(loop))
+                if a > best_area:
+                    best_area = a
+                    best = loop
+            if best is None or len(best) < 3:
+                return None
+
+            loop_idx = [int(i) for i in best]
+            loop_xy = verts[np.array(loop_idx, dtype=int), :2]
+
+            # Smooth/simplify boundary to avoid "ribbed" side walls from tiny zig-zags along the triangulation.
+            # IMPORTANT: keep Z from the *real* top mesh boundary vertices (do NOT invent new top vertices).
+            try:
+                from shapely.geometry import LineString as _LineString
+                line = _LineString([(float(x), float(y)) for x, y in loop_xy])
+                simp = line.simplify(1.0, preserve_topology=True)  # meters
+                coords = list(simp.coords)
+                if len(coords) >= 3:
+                    # Snap simplified coords to nearest existing boundary vertices (preserves true Z)
+                    try:
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(np.asarray(loop_xy, dtype=float))
+                        _, nn = tree.query(np.asarray(coords, dtype=float), k=1)
+                        nn = [int(i) for i in np.asarray(nn).reshape(-1)]
+                        # De-dup while preserving order
+                        picked = []
+                        seen = set()
+                        for i in nn:
+                            if i in seen:
+                                continue
+                            seen.add(i)
+                            picked.append(i)
+                        if len(picked) >= 3:
+                            loop_idx = [loop_idx[i] for i in picked]
+                            loop_xy = verts[np.array(loop_idx, dtype=int), :2]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Create bottom vertices (aligned with boundary XY)
+            bottom_map: dict[int, int] = {}
+            new_vertices = verts.tolist()
+            for vi in loop_idx:
+                bottom_map[vi] = len(new_vertices)
+                new_vertices.append([float(verts[vi, 0]), float(verts[vi, 1]), float(floor_z)])
+
+            # Wall faces (reuse top boundary vertices)
+            wall_faces: list[list[int]] = []
+            n = len(loop_idx)
+            for i in range(n):
+                a = loop_idx[i]
+                b = loop_idx[(i + 1) % n]
+                a2 = bottom_map[a]
+                b2 = bottom_map[b]
+                # two triangles
+                wall_faces.append([a, b, b2])
+                wall_faces.append([a, b2, a2])
+
+            # Bottom triangulation from boundary polygon
+            bottom_faces: list[list[int]] = []
+            try:
+                from shapely.geometry import Polygon as _Poly
+                from trimesh.creation import triangulate_polygon
+                poly = _Poly([(float(x), float(y)) for x, y in loop_xy])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly is not None and not poly.is_empty:
+                    v2d, f2d = triangulate_polygon(poly)
+                    # Add bottom interior vertices at floor_z
+                    base_offset = len(new_vertices)
+                    for x, y in np.asarray(v2d, dtype=float):
+                        new_vertices.append([float(x), float(y), float(floor_z)])
+                    for tri in np.asarray(f2d, dtype=np.int64):
+                        # orient bottom faces downward (flip winding)
+                        bottom_faces.append([base_offset + int(tri[2]), base_offset + int(tri[1]), base_offset + int(tri[0])])
+            except Exception:
+                bottom_faces = []
+
+            all_faces = np.vstack([np.asarray(m.faces, dtype=np.int64), np.asarray(wall_faces, dtype=np.int64)] + ([np.asarray(bottom_faces, dtype=np.int64)] if bottom_faces else []))
+            solid = trimesh.Trimesh(vertices=np.asarray(new_vertices, dtype=float), faces=all_faces, process=True)
+            try:
+                solid.remove_duplicate_faces()
+                solid.remove_unreferenced_vertices()
+                solid.fix_normals()
+            except Exception:
+                pass
+            return solid if len(solid.vertices) > 0 and len(solid.faces) > 0 else None
+        except Exception:
+            return None
+
+    # Try boundary-based solidify first (best quality)
+    # NOTE: When we have a zone polygon (hex tile), we intentionally skip this path so side walls are flat
+    # and strictly follow the polygon edges (better stitching + no ribbed walls).
+    if zone_polygon is None:
+        try:
+            solid_boundary = _solidify_from_boundary(terrain_top, min_z)
+            if solid_boundary is not None:
+                return solid_boundary
+        except Exception:
+            pass
+
     # Отримуємо межі рельєфу
     bounds = terrain_top.bounds
     min_x, min_y = float(bounds[0][0]), float(bounds[0][1])
@@ -1258,9 +1550,11 @@ def create_solid_terrain(
     # Інакше використовуємо квадратний bbox
     if zone_polygon is not None:
         try:
-            # Створюємо base по формі полігону (екструзія вниз)
+            # Створюємо НИЖНЮ площину base по формі полігону (БЕЗ екструзії).
+            # ВАЖЛИВО: extrude_polygon вже створює бокові стінки.
+            # Якщо ми потім ще додаємо свої стінки, виходять "подвійні/криві" стінки + зайві трикутники.
             from shapely.geometry import Polygon as ShapelyPolygon
-            from trimesh.creation import extrude_polygon
+            from trimesh.creation import triangulate_polygon
             
             # Отримуємо координати полігону
             if hasattr(zone_polygon, 'exterior'):
@@ -1273,40 +1567,18 @@ def create_solid_terrain(
             shapely_poly = ShapelyPolygon(poly_coords_2d)
             
             if shapely_poly.is_valid and not shapely_poly.is_empty:
-                # Екструдуємо полігон вниз на base_thickness
-                # extrude_polygon створює mesh від z=0 до z=height
-                bottom_mesh = extrude_polygon(shapely_poly, height=effective_base_thickness)
-                if bottom_mesh is not None and len(bottom_mesh.vertices) > 0:
-                    # Переміщуємо base так, щоб верх base був на terrain_min_z, а низ на min_z
-                    bottom_vertices = bottom_mesh.vertices.copy()
-                    # Знаходимо мінімальну та максимальну Z координати base
-                    min_base_z = float(np.min(bottom_vertices[:, 2]))
-                    max_base_z = float(np.max(bottom_vertices[:, 2]))
-                    # Нормалізуємо: min_base_z -> min_z, max_base_z -> terrain_min_z
-                    if max_base_z > min_base_z:
-                        # Лінійна інтерполяція
-                        bottom_vertices[:, 2] = min_z + (bottom_vertices[:, 2] - min_base_z) * (terrain_min_z - min_z) / (max_base_z - min_base_z)
-                    else:
-                        # Якщо base плоска, просто переміщуємо
-                        bottom_vertices[:, 2] = min_z
-                    bottom_mesh = trimesh.Trimesh(vertices=bottom_vertices, faces=bottom_mesh.faces, process=True)
-                    # Перевірка на валідність base mesh
-                    if not bottom_mesh.is_watertight:
-                        try:
-                            bottom_mesh.fill_holes()
-                        except Exception:
-                            pass
-                    # print(f"[DEBUG] Base створено по формі полігону зони ({len(coords)} точок)")
+                v2d, f2d = triangulate_polygon(shapely_poly)
+                v2d = np.asarray(v2d, dtype=float)
+                f2d = np.asarray(f2d, dtype=np.int64)
+                if v2d.size > 0 and f2d.size > 0:
+                    bottom_vertices = np.column_stack([v2d[:, 0], v2d[:, 1], np.full((len(v2d),), float(min_z), dtype=float)])
+                    bottom_faces = []
+                    for tri in f2d:
+                        # orient bottom downward
+                        bottom_faces.append([int(tri[2]), int(tri[1]), int(tri[0])])
+                    bottom_mesh = trimesh.Trimesh(vertices=bottom_vertices, faces=np.asarray(bottom_faces, dtype=np.int64), process=True)
                 else:
-                    # Fallback до квадратного base
-                    bottom_vertices = np.array([
-                        [min_x, min_y, min_z],
-                        [max_x, min_y, min_z],
-                        [max_x, max_y, min_z],
-                        [min_x, max_y, min_z]
-                    ], dtype=np.float64)
-                    bottom_faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
-                    bottom_mesh = trimesh.Trimesh(vertices=bottom_vertices, faces=bottom_faces, process=True)
+                    raise ValueError("triangulate_polygon returned empty result")
             else:
                 # Fallback до квадратного base
                 bottom_vertices = np.array([
@@ -1370,6 +1642,46 @@ def create_solid_terrain(
             edge_verts = edge_verts[indices]
         
         return edge_verts
+
+    def add_wall(v1_top: np.ndarray, v2_top: np.ndarray):
+        """Створює стіну з правильним порядком вершин (CCW)"""
+        # Перевірка на валідність вершин
+        if v1_top is None or v2_top is None or len(v1_top) != 3 or len(v2_top) != 3:
+            return
+
+        # Перевірка на NaN/Inf
+        if not (np.all(np.isfinite(v1_top)) and np.all(np.isfinite(v2_top))):
+            return
+
+        # Використовуємо точні координати вершин (копіюємо для безпеки)
+        v1_top = np.array(v1_top, dtype=np.float64).copy()
+        v2_top = np.array(v2_top, dtype=np.float64).copy()
+
+        # Створюємо нижні вершини з точно такими ж X, Y координатами
+        v1_bottom = v1_top.copy()
+        v2_bottom = v2_top.copy()
+        v1_bottom[2] = min_z
+        v2_bottom[2] = min_z
+
+        # Перевірка на однакові вершини (уникаємо дегенерованих трикутників)
+        if np.allclose(v1_top, v2_top, atol=1e-6):
+            return
+
+        wall_vertices = np.array([v1_top, v2_top, v2_bottom, v1_bottom], dtype=np.float64)
+
+        # Перевірка на дегенеровані трикутники (перевірка площі)
+        tri1_area = 0.5 * np.linalg.norm(np.cross(v2_top - v1_top, v2_bottom - v1_top))
+        tri2_area = 0.5 * np.linalg.norm(np.cross(v2_bottom - v1_top, v1_bottom - v1_top))
+        if tri1_area < 1e-10 or tri2_area < 1e-10:
+            return
+
+        wall_faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        try:
+            wall_mesh = trimesh.Trimesh(vertices=wall_vertices, faces=wall_faces, process=True)
+            if wall_mesh is not None and len(wall_mesh.vertices) > 0 and len(wall_mesh.faces) > 0:
+                side_meshes.append(wall_mesh)
+        except Exception:
+            pass
     
     # Ініціалізуємо змінні для bbox стінок
     south_verts = np.array([])
@@ -1379,130 +1691,108 @@ def create_solid_terrain(
     
     # КРИТИЧНО: Якщо є полігон зони, використовуємо його для стінок
     # Створюємо стінки безпосередньо від полігону зони, а не від вершин terrain
+    use_bbox_walls = True
     if zone_polygon is not None:
+        # Build flat walls strictly along the polygon edges (no ribbed/zig-zag walls).
+        # Also compress collinear points so hex edges become exactly 6 segments.
         try:
-            from shapely.geometry import Point
-            
-            # Отримуємо координати полігону
-            if hasattr(zone_polygon, 'exterior'):
-                poly_coords = list(zone_polygon.exterior.coords)
+            # Optional KDTree for fast nearest lookup on terrain_top vertices
+            try:
+                from scipy.spatial import cKDTree
+                _edge_tree = cKDTree(np.asarray(verts[:, :2], dtype=float))
+            except Exception:
+                _edge_tree = None
+
+            # Extract polygon coords
+            if hasattr(zone_polygon, "exterior"):
+                raw = list(zone_polygon.exterior.coords)
             else:
-                poly_coords = list(zone_polygon.coords)
-            
-            # Закриваємо полігон (якщо перша і остання точка не співпадають)
-            if len(poly_coords) > 0:
-                # Видаляємо дублікати на початку/кінці
-                if len(poly_coords) > 1 and poly_coords[0] == poly_coords[-1]:
-                    poly_coords = poly_coords[:-1]
-                # Додаємо закриваючу точку якщо потрібно
-                if len(poly_coords) > 2 and poly_coords[0] != poly_coords[-1]:
-                    poly_coords.append(poly_coords[0])
-            
-            # КРИТИЧНО: Обмежуємо кількість точок для стінок, щоб уникнути "капаючих" ліній
-            # Якщо точок занадто багато, вибираємо рівномірно розподілені
-            max_wall_segments = 100  # Максимальна кількість сегментів стінок
-            if len(poly_coords) > max_wall_segments:
-                # Вибираємо рівномірно розподілені точки
-                indices = np.linspace(0, len(poly_coords) - 1, max_wall_segments, dtype=int)
-                poly_coords = [poly_coords[i] for i in indices]
-                # Переконаємося, що перша і остання точка співпадають
-                if len(poly_coords) > 0 and poly_coords[0] != poly_coords[-1]:
-                    poly_coords.append(poly_coords[0])
-            
-            # Для кожної пари сусідніх точок полігону створюємо стінку
-            # Знаходимо висоту terrain_top для кожної точки полігону
-            # КРИТИЧНО: Використовуємо точно точки полігону, а не вершини terrain
-            for i in range(len(poly_coords) - 1):
-                p1_2d = poly_coords[i]
-                p2_2d = poly_coords[i + 1]
-                
-                # Перевірка на валідність координат
-                if len(p1_2d) < 2 or len(p2_2d) < 2:
+                raw = list(getattr(zone_polygon, "coords", []))
+
+            poly2d = [(float(p[0]), float(p[1])) for p in raw if p is not None and len(p) >= 2]
+            if len(poly2d) >= 2 and poly2d[0] == poly2d[-1]:
+                poly2d = poly2d[:-1]
+
+            # Remove collinear points (keep corners only)
+            def _compress_collinear(pts: list[tuple[float, float]], eps: float = 1e-9) -> list[tuple[float, float]]:
+                if len(pts) < 4:
+                    return pts
+                out: list[tuple[float, float]] = []
+                n = len(pts)
+                for i in range(n):
+                    p0 = pts[(i - 1) % n]
+                    p1 = pts[i % n]
+                    p2 = pts[(i + 1) % n]
+                    v1x, v1y = (p1[0] - p0[0]), (p1[1] - p0[1])
+                    v2x, v2y = (p2[0] - p1[0]), (p2[1] - p1[1])
+                    cross = v1x * v2y - v1y * v2x
+                    if abs(cross) > eps:
+                        out.append(p1)
+                # de-dupe consecutive duplicates
+                dedup: list[tuple[float, float]] = []
+                for p in out:
+                    if not dedup or (abs(dedup[-1][0] - p[0]) > 1e-9 or abs(dedup[-1][1] - p[1]) > 1e-9):
+                        dedup.append(p)
+                return dedup if len(dedup) >= 3 else pts
+
+            poly2d = _compress_collinear(poly2d)
+            if len(poly2d) < 3:
+                raise ValueError("zone_polygon has too few vertices for walls")
+
+            # Close ring
+            ring = poly2d + [poly2d[0]]
+
+            nearest_tol = 2.0  # meters (local coords)
+
+            def get_terrain_height_at_xy(x: float, y: float) -> float:
+                # Prefer nearest vertex on terrain_top if close
+                if _edge_tree is not None:
+                    try:
+                        dist, idx = _edge_tree.query([float(x), float(y)], k=1)
+                        if np.isfinite(dist) and float(dist) <= float(nearest_tol):
+                            return float(verts[int(idx), 2])
+                    except Exception:
+                        pass
+                # TerrainProvider interpolation fallback
+                if terrain_provider is not None:
+                    try:
+                        if hasattr(terrain_provider, "get_height_at"):
+                            h = terrain_provider.get_height_at(float(x), float(y))
+                        elif hasattr(terrain_provider, "get_height"):
+                            h = terrain_provider.get_height(float(x), float(y))
+                        else:
+                            h = None
+                        if h is not None and np.isfinite(h):
+                            return float(h)
+                    except Exception:
+                        pass
+                # last resort: nearest by brute force
+                d = np.sqrt((verts[:, 0] - float(x)) ** 2 + (verts[:, 1] - float(y)) ** 2)
+                j = int(np.argmin(d))
+                return float(verts[j, 2])
+
+            made = 0
+            for i in range(len(ring) - 1):
+                x1, y1 = ring[i]
+                x2, y2 = ring[i + 1]
+                if float(np.hypot(x2 - x1, y2 - y1)) < 0.1:
                     continue
-                
-                # Знаходимо висоту для кожної точки на полігоні
-                # Використовуємо найближчу вершину terrain_top або інтерполяцію
-                def get_terrain_height_at_point(point_2d):
-                    """Знаходить висоту terrain_top в точці"""
-                    point_x, point_y = point_2d[0], point_2d[1]
-                    
-                    # Якщо є TerrainProvider, використовуємо його для точнішої інтерполяції
-                    if terrain_provider is not None:
-                        try:
-                            # Використовуємо get_height_at для отримання висоти
-                            if hasattr(terrain_provider, 'get_height_at'):
-                                height = terrain_provider.get_height_at(point_x, point_y)
-                            elif hasattr(terrain_provider, 'get_height'):
-                                height = terrain_provider.get_height(point_x, point_y)
-                            else:
-                                height = None
-                            
-                            if height is not None and np.isfinite(height):
-                                return float(height)
-                        except Exception:
-                            pass
-                    
-                    # Fallback: знаходимо найближчу вершину terrain_top
-                    distances = np.sqrt((verts[:, 0] - point_x)**2 + (verts[:, 1] - point_y)**2)
-                    nearest_idx = np.argmin(distances)
-                    nearest_vert = verts[nearest_idx]
-                    
-                    # Якщо точка дуже близька до вершини, використовуємо її висоту
-                    if distances[nearest_idx] < max(tol_x, tol_y) * 2:
-                        return nearest_vert[2]
-                    
-                    # Інакше інтерполюємо між найближчими вершинами
-                    # Знаходимо 3 найближчі вершини
-                    nearest_3_indices = np.argsort(distances)[:3]
-                    nearest_3_verts = verts[nearest_3_indices]
-                    nearest_3_dists = distances[nearest_3_indices]
-                    
-                    # Зважена інтерполяція (обернена відстань)
-                    weights = 1.0 / (nearest_3_dists + 1e-6)
-                    weights = weights / np.sum(weights)
-                    interpolated_z = np.sum(nearest_3_verts[:, 2] * weights)
-                    
-                    return float(interpolated_z)
-                
-                # Отримуємо висоти для обох точок
-                try:
-                    z1 = get_terrain_height_at_point(p1_2d)
-                    z2 = get_terrain_height_at_point(p2_2d)
-                    
-                    # Перевірка на валідність висот
-                    if not (np.isfinite(z1) and np.isfinite(z2)):
-                        continue
-                    
-                    # Переконаємося, що висоти не нижче terrain_min_z (верх base)
-                    # Стінки мають з'єднуватися з верхом base (terrain_min_z), а не з min_z
-                    z1 = max(z1, terrain_min_z)
-                    z2 = max(z2, terrain_min_z)
-                    
-                    # Перевірка на мінімальну відстань між точками (уникаємо дуже коротких стінок)
-                    dist_2d = np.sqrt((p1_2d[0] - p2_2d[0])**2 + (p1_2d[1] - p2_2d[1])**2)
-                    if dist_2d < 0.1:  # Пропускаємо дуже короткі сегменти (< 10см)
-                        continue
-                    
-                    # Створюємо вершини стіни (верхній край)
-                    v1_top = np.array([p1_2d[0], p1_2d[1], z1], dtype=np.float64)
-                    v2_top = np.array([p2_2d[0], p2_2d[1], z2], dtype=np.float64)
-                    
-                    # Створюємо стінку (add_wall створить нижній край на min_z - низ base)
-                    add_wall(v1_top, v2_top)
-                except Exception as e:
-                    # Пропускаємо цю стінку якщо помилка
+                z1 = get_terrain_height_at_xy(x1, y1)
+                z2 = get_terrain_height_at_xy(x2, y2)
+                if not (np.isfinite(z1) and np.isfinite(z2)):
                     continue
-            
-            # print(f"[INFO] Стінки створено по формі полігону зони ({len(poly_coords) - 1} сегментів)")
+                z1 = max(float(z1), float(terrain_min_z))
+                z2 = max(float(z2), float(terrain_min_z))
+                add_wall(np.array([x1, y1, z1], dtype=np.float64), np.array([x2, y2, z2], dtype=np.float64))
+                made += 1
+
+            if made >= 3:
+                use_bbox_walls = False
         except Exception as e:
-            print(f"[WARN] Помилка створення стінок по полігону: {e}, використовується bbox")
-            import traceback
-            traceback.print_exc()
-            # Fallback до bbox стінок
-            zone_polygon = None
+            print(f"[WARN] Zone polygon walls failed: {e}; falling back to bbox walls")
     
     # Якщо немає полігону або fallback - використовуємо bbox стінки
-    if zone_polygon is None:
+    if use_bbox_walls:
         # South edge (y ≈ min_y)
         south_verts = verts[np.abs(verts[:, 1] - min_y) < tol_y]
         if len(south_verts) > 0:
@@ -1538,62 +1828,6 @@ def create_solid_terrain(
             # Якщо не знайдено, використовуємо найближчі вершини
             east_idx = np.argmax(verts[:, 0])
             east_verts = verts[[east_idx]]
-
-    def add_wall(v1_top: np.ndarray, v2_top: np.ndarray):
-        """Створює стіну з правильним порядком вершин (CCW)"""
-        # Перевірка на валідність вершин
-        if v1_top is None or v2_top is None or len(v1_top) != 3 or len(v2_top) != 3:
-            return
-        
-        # Перевірка на NaN/Inf
-        if not (np.all(np.isfinite(v1_top)) and np.all(np.isfinite(v2_top))):
-            return
-        
-        # Використовуємо точні координати вершин (копіюємо для безпеки)
-        v1_top = np.array(v1_top, dtype=np.float64).copy()
-        v2_top = np.array(v2_top, dtype=np.float64).copy()
-        
-        # Створюємо нижні вершини з точно такими ж X, Y координатами
-        v1_bottom = v1_top.copy()
-        v2_bottom = v2_top.copy()
-        v1_bottom[2] = min_z
-        v2_bottom[2] = min_z
-        
-        # Перевірка на однакові вершини (уникаємо дегенерованих трикутників)
-        if np.allclose(v1_top, v2_top, atol=1e-6):
-            return
-        
-        # Вершини стіни: верхній край -> нижній край (CCW)
-        wall_vertices = np.array([
-            v1_top,      # 0: верхній лівий
-            v2_top,      # 1: верхній правий
-            v2_bottom,   # 2: нижній правий
-            v1_bottom    # 3: нижній лівий
-        ], dtype=np.float64)
-        
-        # Перевірка на дегенеровані трикутники (перевірка площі)
-        # Трикутник 1: v1_top, v2_top, v2_bottom
-        tri1_area = 0.5 * np.linalg.norm(np.cross(v2_top - v1_top, v2_bottom - v1_top))
-        # Трикутник 2: v1_top, v2_bottom, v1_bottom
-        tri2_area = 0.5 * np.linalg.norm(np.cross(v2_bottom - v1_top, v1_bottom - v1_top))
-        
-        if tri1_area < 1e-10 or tri2_area < 1e-10:
-            # Дегенерований трикутник - пропускаємо
-            return
-        
-        # Два трикутники з правильним порядком (CCW)
-        wall_faces = np.array([
-            [0, 1, 2],  # Трикутник 1
-            [0, 2, 3]   # Трикутник 2
-        ], dtype=np.int32)
-        
-        try:
-            wall_mesh = trimesh.Trimesh(vertices=wall_vertices, faces=wall_faces, process=True)
-            if wall_mesh is not None and len(wall_mesh.vertices) > 0 and len(wall_mesh.faces) > 0:
-                side_meshes.append(wall_mesh)
-        except Exception:
-            # Пропускаємо невалідні стіни
-            pass
 
     # South edge (y ≈ min_y, нижній край) - від min_x до max_x
     try:

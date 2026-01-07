@@ -17,6 +17,7 @@ def export_preview_parts_stl(
     rotate_to_ground: bool = False,
     reference_xy_m: Optional[Tuple[float, float]] = None,  # (width_m, height_m) to ensure consistent scale across tiles
     preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
+    preserve_xy: bool = False,  # keep global XY (do NOT center each tile); used for stitching across zones
 ) -> dict[str, str]:
     """
     Експортує окремі STL частини для стабільного прев'ю у браузері (з кольорами на фронтенді).
@@ -67,7 +68,12 @@ def export_preview_parts_stl(
 
     # 1) Центр по centroid
     center = combined_work.centroid
-    if preserve_z:
+    if preserve_xy and preserve_z:
+        t0 = np.eye(4)
+    elif preserve_xy and not preserve_z:
+        t0 = trimesh.transformations.translation_matrix([0.0, 0.0, -center[2]])
+        combined_work.apply_translation([0.0, 0.0, -center[2]])
+    elif preserve_z:
         t0 = trimesh.transformations.translation_matrix([-center[0], -center[1], 0.0])
         combined_work.apply_translation([-center[0], -center[1], 0.0])
     else:
@@ -104,7 +110,12 @@ def export_preview_parts_stl(
     # 5) Center by bounds, minZ->0, center XY only (Z=0 лишається платформою)
     final_bounds = combined_work.bounds
     final_center_from_bounds = (final_bounds[0] + final_bounds[1]) / 2.0
-    if preserve_z:
+    if preserve_xy and preserve_z:
+        t_center = np.eye(4)
+    elif preserve_xy and not preserve_z:
+        t_center = trimesh.transformations.translation_matrix([0.0, 0.0, -final_center_from_bounds[2]])
+        combined_work.apply_translation([0.0, 0.0, -final_center_from_bounds[2]])
+    elif preserve_z:
         t_center = trimesh.transformations.translation_matrix([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
         combined_work.apply_translation([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
     else:
@@ -112,16 +123,22 @@ def export_preview_parts_stl(
         combined_work.apply_translation(-final_center_from_bounds)
     transforms.append(t_center)
 
-    final_bounds_after = combined_work.bounds
-    min_z2 = final_bounds_after[0][2]
-    t_minz = trimesh.transformations.translation_matrix([0, 0, -min_z2])
-    combined_work.apply_translation([0, 0, -min_z2])
-    transforms.append(t_minz)
+    # CRITICAL (stitching): when preserve_z=True we must NOT rebase each tile by its own minZ.
+    # That per-tile shift breaks height continuity across neighboring zones.
+    if not preserve_z:
+        final_bounds_after = combined_work.bounds
+        min_z2 = final_bounds_after[0][2]
+        t_minz = trimesh.transformations.translation_matrix([0, 0, -min_z2])
+        combined_work.apply_translation([0, 0, -min_z2])
+        transforms.append(t_minz)
+    else:
+        transforms.append(np.eye(4))
 
-    final_centroid_before = combined_work.centroid
-    t_xy = trimesh.transformations.translation_matrix([-final_centroid_before[0], -final_centroid_before[1], 0.0])
-    combined_work.apply_translation([-final_centroid_before[0], -final_centroid_before[1], 0.0])
-    transforms.append(t_xy)
+    if not preserve_xy:
+        final_centroid_before = combined_work.centroid
+        t_xy = trimesh.transformations.translation_matrix([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+        combined_work.apply_translation([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+        transforms.append(t_xy)
 
     # Експортуємо частини
     outputs: dict[str, str] = {}
@@ -163,6 +180,7 @@ def export_scene(
     poi_mesh: Optional[trimesh.Trimesh] = None,
     reference_xy_m: Optional[Tuple[float, float]] = None,  # (width_m, height_m) for consistent tiling scale
     preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
+    preserve_xy: bool = False,  # keep global XY (do NOT center each tile); used for stitching across zones
 ) -> Optional[dict]:
     """
     Експортує 3D сцену у файл
@@ -296,6 +314,7 @@ def export_scene(
             base_thickness_mm=base_thickness_mm,
             reference_xy_m=reference_xy_m,
             preserve_z=preserve_z,
+            preserve_xy=preserve_xy,
         )
         return None
     elif format.lower() == "stl":
@@ -306,6 +325,8 @@ def export_scene(
             add_flat_base=add_flat_base,
             base_thickness_mm=base_thickness_mm,
             reference_xy_m=reference_xy_m,
+            preserve_z=preserve_z,
+            preserve_xy=preserve_xy,
         )
         return outputs
     else:
@@ -321,6 +342,7 @@ def export_3mf(
     rotate_to_ground: bool = False,  # Не крутимо, щоб не ламати орієнтацію
     reference_xy_m: Optional[Tuple[float, float]] = None,
     preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
+    preserve_xy: bool = False,  # keep global XY (do NOT center each tile); used for stitching across zones
 ) -> None:
     """
     Експортує сцену у формат 3MF з підтримкою окремих об'єктів
@@ -427,7 +449,12 @@ def export_3mf(
 
         # 1) Центрування за centroid
         center = combined.centroid
-        if preserve_z:
+        if preserve_xy and preserve_z:
+            t0 = np.eye(4)
+        elif preserve_xy and not preserve_z:
+            t0 = trimesh.transformations.translation_matrix([0.0, 0.0, -center[2]])
+            combined.apply_translation([0.0, 0.0, -center[2]])
+        elif preserve_z:
             t0 = trimesh.transformations.translation_matrix([-center[0], -center[1], 0.0])
             combined.apply_translation([-center[0], -center[1], 0.0])
         else:
@@ -464,30 +491,43 @@ def export_3mf(
             except Exception as e:
                 print(f"Попередження: не вдалося покласти модель на XY (3MF): {e}")
 
-        # 5) Центрування за bounds + підняття minZ до 0 + центрування XY (Z не рухаємо після minZ)
+        # 5) Центрування за bounds + підняття minZ до 0 + (опц.) центрування XY
         try:
             final_bounds = combined.bounds
             final_center_from_bounds = (final_bounds[0] + final_bounds[1]) / 2.0
-            if preserve_z:
+            if preserve_xy and preserve_z:
+                t_center = np.eye(4)
+            elif preserve_xy and not preserve_z:
+                t_center = trimesh.transformations.translation_matrix([0.0, 0.0, -final_center_from_bounds[2]])
+                combined.apply_translation([0.0, 0.0, -final_center_from_bounds[2]])
+            elif preserve_z:
                 t_center = trimesh.transformations.translation_matrix([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
                 combined.apply_translation([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
             else:
                 t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
                 combined.apply_translation(-final_center_from_bounds)
 
-            final_bounds_after = combined.bounds
-            min_z = final_bounds_after[0][2]
-            t_minz = trimesh.transformations.translation_matrix([0, 0, -min_z])
-            combined.apply_translation([0, 0, -min_z])
+            if not preserve_z:
+                final_bounds_after = combined.bounds
+                min_z = final_bounds_after[0][2]
+                t_minz = trimesh.transformations.translation_matrix([0, 0, -min_z])
+                combined.apply_translation([0, 0, -min_z])
+            else:
+                t_minz = np.eye(4)
 
             # Додаткове центрування ЛИШЕ по X/Y, щоб Z=0 залишився "платформою" для друку
-            final_centroid_before = combined.centroid
-            t_xy = trimesh.transformations.translation_matrix([-final_centroid_before[0], -final_centroid_before[1], 0.0])
-            combined.apply_translation([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+            if not preserve_xy:
+                final_centroid_before = combined.centroid
+                t_xy = trimesh.transformations.translation_matrix([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+                combined.apply_translation([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+            else:
+                t_xy = np.eye(4)
 
             transforms.append(("translate", t_center))
-            transforms.append(("translate", t_minz))
-            transforms.append(("translate", t_xy))
+            if not preserve_z:
+                transforms.append(("translate", t_minz))
+            if not preserve_xy:
+                transforms.append(("translate", t_xy))
 
             final_bounds_check = combined.bounds
             final_centroid = combined.centroid
@@ -587,6 +627,8 @@ def export_stl(
     base_thickness_mm: float = 2.0,  # тонша база
     rotate_to_ground: bool = False,  # Не крутимо, щоб не ламати орієнтацію
     reference_xy_m: Optional[Tuple[float, float]] = None,
+    preserve_z: bool = False,  # keep global Z (avoid per-tile Z centering); still lifts minZ to 0
+    preserve_xy: bool = False,  # keep global XY (do NOT center each tile); used for stitching across zones
 ) -> dict:
     """
     Експортує сцену у формат STL
@@ -709,9 +751,10 @@ def export_stl(
             
             bounds_after_xy = combined.bounds
             min_z = bounds_after_xy[0][2]
-            vertices = combined.vertices.copy()
-            vertices[:, 2] -= min_z
-            combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+            if not preserve_z:
+                vertices = combined.vertices.copy()
+                vertices[:, 2] -= min_z
+                combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
             
             bounds_after = combined.bounds
             size_after = bounds_after[1] - bounds_after[0]
@@ -730,14 +773,24 @@ def export_stl(
                 
                 bounds_after_xy = combined.bounds
                 min_z = bounds_after_xy[0][2]
-                vertices = combined.vertices.copy()
-                vertices[:, 2] -= min_z
-                combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+                if not preserve_z:
+                    vertices = combined.vertices.copy()
+                    vertices[:, 2] -= min_z
+                    combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
                 
                 bounds_after = combined.bounds
                 size_after = bounds_after[1] - bounds_after[0]
         else:
-            combined.apply_translation(-center)
+            # Standard: center by centroid for a nice single-tile export.
+            # For stitching mode we preserve global XY/Z and only do minZ->0 later.
+            if preserve_xy and preserve_z:
+                pass
+            elif preserve_xy and not preserve_z:
+                combined.apply_translation([0.0, 0.0, -center[2]])
+            elif preserve_z:
+                combined.apply_translation([-center[0], -center[1], 0.0])
+            else:
+                combined.apply_translation(-center)
             bounds_after = combined.bounds
             size_after = bounds_after[1] - bounds_after[0]
         
@@ -796,21 +849,33 @@ def export_stl(
         try:
             final_bounds = combined.bounds
             final_center_from_bounds = (final_bounds[0] + final_bounds[1]) / 2.0
-            t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
-            combined.apply_translation(-final_center_from_bounds)
-            transforms.append(t_center)
+            if preserve_xy and preserve_z:
+                t_center = np.eye(4)
+            elif preserve_xy and not preserve_z:
+                t_center = trimesh.transformations.translation_matrix([0.0, 0.0, -final_center_from_bounds[2]])
+                combined.apply_translation([0.0, 0.0, -final_center_from_bounds[2]])
+            elif preserve_z:
+                t_center = trimesh.transformations.translation_matrix([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
+                combined.apply_translation([-final_center_from_bounds[0], -final_center_from_bounds[1], 0.0])
+            else:
+                t_center = trimesh.transformations.translation_matrix(-final_center_from_bounds)
+                combined.apply_translation(-final_center_from_bounds)
+            if not (preserve_xy and preserve_z):
+                transforms.append(t_center)
 
-            final_bounds_after = combined.bounds
-            min_z = final_bounds_after[0][2]
-            t_minz = trimesh.transformations.translation_matrix([0, 0, -min_z])
-            combined.apply_translation([0, 0, -min_z])
-            transforms.append(t_minz)
+            if not preserve_z:
+                final_bounds_after = combined.bounds
+                min_z = final_bounds_after[0][2]
+                t_minz = trimesh.transformations.translation_matrix([0, 0, -min_z])
+                combined.apply_translation([0, 0, -min_z])
+                transforms.append(t_minz)
 
             # Центруємо лише X/Y, щоб Z=0 залишився площиною друку
-            final_centroid_before = combined.centroid
-            t_xy = trimesh.transformations.translation_matrix([-final_centroid_before[0], -final_centroid_before[1], 0.0])
-            combined.apply_translation([-final_centroid_before[0], -final_centroid_before[1], 0.0])
-            transforms.append(t_xy)
+            if not preserve_xy:
+                final_centroid_before = combined.centroid
+                t_xy = trimesh.transformations.translation_matrix([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+                combined.apply_translation([-final_centroid_before[0], -final_centroid_before[1], 0.0])
+                transforms.append(t_xy)
 
             final_bounds_check = combined.bounds
             final_centroid = combined.centroid

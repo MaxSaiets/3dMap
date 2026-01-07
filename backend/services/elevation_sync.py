@@ -243,27 +243,45 @@ def calculate_global_elevation_reference(
             print("[WARN] Не вдалося отримати дані висот, використовується локальна нормалізація")
             return None, 0.0
         
-        # Мінімальна абсолютна висота (метри над рівнем моря)
-        sample_min = float(np.nanmin(Z_abs))
-        elevation_ref_m = float(min(sample_min, tile_min)) if tile_min is not None else float(sample_min)
+        # Robust reference for stitching:
+        # Terrarium can contain outlier low pixels (even after per-tile quantile), and using absolute MIN
+        # makes elevation_ref_m too low -> all Z become huge positive -> base thickness explodes.
+        vals = np.asarray(Z_abs, dtype=float).reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        vals = vals[(vals > -5000.0) & (vals < 9000.0)]
+        if vals.size == 0:
+            return None, 0.0
+
+        sample_min = float(np.min(vals))
+        # Use low quantile as a stable "sea-level-like" reference for the city bbox
+        # (prevents tower bases while keeping relative relief consistent across tiles).
+        sample_q = float(np.quantile(vals, 0.01))  # 1% quantile
+
+        tile_q = None
+        if tile_min is not None and np.isfinite(tile_min):
+            # Reject tile minima that are far below sampled distribution (likely outliers / corrupt pixels)
+            # Allow some margin for real valleys (30m is plenty for city tiles)
+            if float(tile_min) >= (sample_q - 30.0):
+                tile_q = float(tile_min)
+
+        elevation_ref_m = float(min(sample_q, tile_q)) if tile_q is not None else float(sample_q)
         elevation_max = float(np.nanmax(Z_abs))
         elevation_mean = float(np.nanmean(Z_abs))
         
         print(f"[INFO] Глобальний elevation_ref: min={elevation_ref_m:.2f}м, max={elevation_max:.2f}м, mean={elevation_mean:.2f}м")
         
         # baseline_offset_m: глобальний зсув (в метрах у світі) який гарантує,
-        # що всі Z_rel >= 0 для всіх зон у батчі (по нашому семплу).
+        # що всі Z_rel >= 0 для всіх зон у батчі.
         # Це критично, бо експорт зсуває кожну плитку по minZ -> якщо minZ різний,
         # зони не стикуються по висоті.
+        # baseline_offset_m:
+        # Historically we used this to "lift" all terrain so Z>=0 everywhere.
+        # In practice Terrarium can contain rare bogus low pixels that force a huge baseline (hundreds of meters),
+        # creating "tower bases" and making zones look wrong.
+        #
+        # We now clamp Z>=0 in `get_elevation_data()` for global mode, so we KEEP baseline at 0
+        # and rely on clamping instead of shifting the whole city upward.
         baseline_offset_m = 0.0
-        try:
-            z_scale_f = float(z_scale) if z_scale is not None else 1.0
-            Z_rel_sample = (np.asarray(Z_abs, dtype=float) - float(elevation_ref_m)) * z_scale_f
-            rel_min = float(np.nanmin(Z_rel_sample)) if np.any(np.isfinite(Z_rel_sample)) else 0.0
-            if np.isfinite(rel_min) and rel_min < 0:
-                baseline_offset_m = float(-rel_min)
-        except Exception:
-            baseline_offset_m = 0.0
         
         return elevation_ref_m, baseline_offset_m
         

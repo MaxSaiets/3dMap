@@ -205,8 +205,9 @@ def clip_mesh_to_polygon(
         #     except Exception:
         #         pass
 
-        # ВАЖЛИВО: vertex-only фільтр лишає "висячі" трикутники поза зоною.
-        # Краще: залишаємо faces, у яких centroid (XY) всередині полігону.
+        # ВАЖЛИВО: centroid-only фільтр лишає трикутники, які ПЕРЕТИНАЮТЬ край
+        # (centroid всередині, але частина face зовні), що створює "зайві" тонкі трикутники/шипи.
+        # Тому: залишаємо face ТІЛЬКИ якщо ВСІ його вершини (XY) всередині/на межі полігону.
         vertices = np.asarray(mesh.vertices)
         faces = np.asarray(mesh.faces)
         if faces.size == 0:
@@ -219,9 +220,29 @@ def clip_mesh_to_polygon(
             geom = polygon
 
         tri = vertices[faces]  # (F,3,3)
-        centroids = tri[:, :, :2].mean(axis=1)  # (F,2)
-        # shapely contains is strict; include touches to keep boundary
-        keep = np.array([geom.contains(Point(xy[0], xy[1])) or geom.touches(Point(xy[0], xy[1])) for xy in centroids], dtype=bool)
+        tri_xy = tri[:, :, :2]  # (F,3,2)
+
+        # Fast pre-filter by centroid, then strict vertex-in-polygon to avoid edge-crossing faces.
+        centroids = tri_xy.mean(axis=1)  # (F,2)
+        centroid_keep = np.array(
+            [geom.contains(Point(float(xy[0]), float(xy[1]))) or geom.touches(Point(float(xy[0]), float(xy[1]))) for xy in centroids],
+            dtype=bool,
+        )
+        if not np.any(centroid_keep):
+            return None
+
+        keep = np.zeros(len(faces), dtype=bool)
+        kept_idx = np.nonzero(centroid_keep)[0]
+        for fi in kept_idx:
+            ok = True
+            for k in range(3):
+                x = float(tri_xy[fi, k, 0])
+                y = float(tri_xy[fi, k, 1])
+                p = Point(x, y)
+                if not (geom.contains(p) or geom.touches(p)):
+                    ok = False
+                    break
+            keep[fi] = ok
 
         if not np.any(keep):
             return None

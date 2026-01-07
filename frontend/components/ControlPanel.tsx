@@ -262,6 +262,19 @@ export function ControlPanel({
     setShowHexGrid(false);
 
     try {
+      // IMPORTANT: keep a stable order (row/col) so backend taskIds align with zone meta for preview layout.
+      const zonesSorted = [...selectedZones].sort((a, b) => {
+        const ar = Number(a?.properties?.row ?? 0);
+        const br = Number(b?.properties?.row ?? 0);
+        if (ar !== br) return ar - br;
+        const ac = Number(a?.properties?.col ?? 0);
+        const bc = Number(b?.properties?.col ?? 0);
+        if (ac !== bc) return ac - bc;
+        const aid = String(a?.id || a?.properties?.id || "");
+        const bid = String(b?.id || b?.properties?.id || "");
+        return aid.localeCompare(bid);
+      });
+
       // Використовуємо координати з вибраних зон
       const request = {
         north: kyivBounds.north,
@@ -290,7 +303,7 @@ export function ControlPanel({
         model_size_mm: modelSizeMm,
       };
 
-      const response = await api.generateZones(selectedZones, request);
+      const response = await api.generateZones(zonesSorted, request);
       const ids = (response as any).all_task_ids && (response as any).all_task_ids.length
         ? (response as any).all_task_ids
         : [response.task_id];
@@ -301,7 +314,7 @@ export function ControlPanel({
       try {
         const meta: Record<string, any> = {};
         for (let i = 0; i < ids.length; i++) {
-          const z = selectedZones[i];
+          const z = zonesSorted[i];
           const zoneId = String(z?.id || z?.properties?.id || `zone_${i}`);
           const row = z?.properties?.row;
           const col = z?.properties?.col;

@@ -251,8 +251,23 @@ def detect_bridges(
             is_bridge = False
             bridge_height = 2.0  # Базова висота моста (метри)
             
+            def _is_bridge_value(v) -> bool:
+                # OSMnx/GeoDataFrame can store tag values as str/bool/list.
+                if v is None:
+                    return False
+                if isinstance(v, (list, tuple, set)):
+                    return any(_is_bridge_value(x) for x in v)
+                if isinstance(v, bool):
+                    return bool(v)
+                try:
+                    s = str(v).strip().lower()
+                except Exception:
+                    return False
+                # OSM sometimes uses "viaduct" etc as bridge values
+                return s in {"yes", "true", "1", "viaduct", "aqueduct"} or s.startswith("viaduct")
+
             # 1. Перевірка тегу bridge в OSM
-            if bridge_tag in row and row[bridge_tag] in ['yes', 'true', '1', True]:
+            if bridge_tag in row and _is_bridge_value(row.get(bridge_tag)):
                 is_bridge = True
                 # Визначаємо висоту моста за типом
                 bridge_type = row.get('bridge:type', '')
@@ -264,6 +279,15 @@ def detect_bridges(
                     bridge_height = 3.0
                 else:
                     bridge_height = 2.5
+
+            # 1.1 Додаткові теги (інколи bridge:structure або man_made=bridge)
+            if not is_bridge:
+                try:
+                    if _is_bridge_value(row.get("bridge:structure")) or _is_bridge_value(row.get("man_made")):
+                        is_bridge = True
+                        bridge_height = max(bridge_height, 2.5)
+                except Exception:
+                    pass
             
             # 2. Перевірка перетину з водою
             if not is_bridge and water_union is not None:
@@ -694,10 +718,19 @@ def process_roads(
                             adaptive_embed = float(re)
                             if slope > float(re) * 2.0:
                                 adaptive_embed = float(re) * (1.0 - min(0.5, (slope - float(re) * 2.0) / (slope + 1.0)))
-                            min_height_above_ground = float(rh) * 0.05
+                            # CRITICAL: do not lift the BOTTOM of the extruded road above the terrain.
+                            # The previous clamp forced z >= ground + 5%*height even for bottom vertices (old_z=0),
+                            # which makes roads "float in the air".
                             road_z = ground_z_values + old_z - adaptive_embed
-                            min_road_z = ground_z_values + min_height_above_ground
-                            vertices[:, 2] = np.maximum(road_z, min_road_z)
+
+                            # Only enforce a tiny clearance for TOP vertices (avoid z-fighting in preview),
+                            # while keeping bottom embedded into terrain by adaptive_embed.
+                            min_top_clearance = float(rh) * 0.02  # 2% of height, small
+                            top_mask = old_z > (float(rh) * 0.5)
+                            if np.any(top_mask):
+                                road_z[top_mask] = np.maximum(road_z[top_mask], ground_z_values[top_mask] + min_top_clearance)
+
+                            vertices[:, 2] = road_z
                         mesh.vertices = vertices
                     else:
                         if float(re) > 0:

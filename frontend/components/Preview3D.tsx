@@ -2,13 +2,14 @@
 
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, PerspectiveCamera } from "@react-three/drei";
-import { Suspense, useEffect, useState, useRef } from "react";
+import { Suspense, useEffect, useMemo, useState, useRef } from "react";
 import { useGenerationStore } from "@/store/generation-store";
 import { api } from "@/lib/api";
 import * as THREE from "three";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import JSZip from "jszip";
+import { useFrame } from "@react-three/fiber";
 
 function bakeStlZUpToThreeYUp(object: THREE.Object3D) {
   // STL/3MF зазвичай Z-up, а Three.js сцена Y-up.
@@ -294,6 +295,158 @@ function CameraController() {
 }
 
 type RotateMode = "camera" | "model";
+type CameraMode = "orbit" | "fly";
+
+function FreeFlyControls({
+  enabled,
+  speed,
+  onSpeedChange,
+}: {
+  enabled: boolean;
+  speed: number;
+  onSpeedChange: (v: number) => void;
+}) {
+  const { camera, gl } = useThree();
+  const stateRef = useRef({
+    keys: new Set<string>(),
+    mouseDown: false,
+    yaw: 0,
+    pitch: 0,
+    speed: 120, // units/sec (preview space)
+    boost: 3.0,
+    sensitivity: 0.0025,
+  });
+
+  const tmpForward = useMemo(() => new THREE.Vector3(), []);
+  const tmpRight = useMemo(() => new THREE.Vector3(), []);
+  const tmpUp = useMemo(() => new THREE.Vector3(0, 1, 0), []);
+  const tmpMove = useMemo(() => new THREE.Vector3(), []);
+  const euler = useMemo(() => new THREE.Euler(0, 0, 0, "YXZ"), []);
+
+  // Initialize yaw/pitch from camera when enabling
+  useEffect(() => {
+    if (!enabled) return;
+    // Sync external speed setting into control state
+    stateRef.current.speed = Math.max(10, Math.min(800, Number(speed) || 120));
+    const q = camera.quaternion.clone();
+    euler.setFromQuaternion(q, "YXZ");
+    stateRef.current.yaw = euler.y;
+    stateRef.current.pitch = euler.x;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, speed]);
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    const el = gl.domElement;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      stateRef.current.keys.add(e.code);
+      // Prevent page scroll when using arrows/space
+      if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) {
+        e.preventDefault();
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      stateRef.current.keys.delete(e.code);
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      // Right click or middle click enables look-around while held
+      if (e.button === 2 || e.button === 1) {
+        stateRef.current.mouseDown = true;
+        e.preventDefault();
+      }
+    };
+    const onMouseUp = (e: MouseEvent) => {
+      if (e.button === 2 || e.button === 1) {
+        stateRef.current.mouseDown = false;
+        e.preventDefault();
+      }
+    };
+    const onMouseMove = (e: MouseEvent) => {
+      if (!stateRef.current.mouseDown) return;
+      const s = stateRef.current;
+      s.yaw -= e.movementX * s.sensitivity;
+      s.pitch -= e.movementY * s.sensitivity;
+      // Clamp pitch to avoid flipping
+      const lim = Math.PI / 2 - 0.01;
+      s.pitch = Math.max(-lim, Math.min(lim, s.pitch));
+    };
+    const onWheel = (e: WheelEvent) => {
+      // Adjust speed with wheel (no page scroll when hovering canvas)
+      const s = stateRef.current;
+      const delta = Math.sign(e.deltaY);
+      s.speed = Math.max(10, Math.min(800, s.speed * (delta > 0 ? 0.9 : 1.1)));
+      onSpeedChange(s.speed);
+      e.preventDefault();
+    };
+    const onContextMenu = (e: MouseEvent) => {
+      // Disable context menu on canvas so RMB is usable
+      e.preventDefault();
+    };
+
+    window.addEventListener("keydown", onKeyDown, { passive: false });
+    window.addEventListener("keyup", onKeyUp);
+    el.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mousemove", onMouseMove);
+    el.addEventListener("wheel", onWheel, { passive: false });
+    el.addEventListener("contextmenu", onContextMenu);
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown as any);
+      window.removeEventListener("keyup", onKeyUp as any);
+      el.removeEventListener("mousedown", onMouseDown as any);
+      window.removeEventListener("mouseup", onMouseUp as any);
+      window.removeEventListener("mousemove", onMouseMove as any);
+      el.removeEventListener("wheel", onWheel as any);
+      el.removeEventListener("contextmenu", onContextMenu as any);
+      stateRef.current.keys.clear();
+      stateRef.current.mouseDown = false;
+    };
+  }, [enabled, gl.domElement]);
+
+  useFrame((_, delta) => {
+    if (!enabled) return;
+
+    const s = stateRef.current;
+
+    // Update camera rotation
+    euler.set(s.pitch, s.yaw, 0);
+    camera.quaternion.setFromEuler(euler);
+
+    // Movement
+    const keys = s.keys;
+    const boost = keys.has("ShiftLeft") || keys.has("ShiftRight") ? s.boost : 1.0;
+    const v = s.speed * boost * Math.min(delta, 0.05);
+
+    tmpMove.set(0, 0, 0);
+
+    // Forward is -Z in camera space
+    tmpForward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    tmpRight.set(1, 0, 0).applyQuaternion(camera.quaternion);
+
+    // Optional: keep forward movement mostly horizontal for easier navigation
+    tmpForward.y = 0;
+    tmpRight.y = 0;
+    tmpForward.normalize();
+    tmpRight.normalize();
+
+    if (keys.has("KeyW")) tmpMove.addScaledVector(tmpForward, v);
+    if (keys.has("KeyS")) tmpMove.addScaledVector(tmpForward, -v);
+    if (keys.has("KeyA")) tmpMove.addScaledVector(tmpRight, -v);
+    if (keys.has("KeyD")) tmpMove.addScaledVector(tmpRight, v);
+    if (keys.has("KeyE")) tmpMove.addScaledVector(tmpUp, v);
+    if (keys.has("KeyQ")) tmpMove.addScaledVector(tmpUp, -v);
+
+    if (tmpMove.lengthSq() > 0) {
+      camera.position.add(tmpMove);
+      camera.updateMatrixWorld();
+    }
+  });
+
+  return null;
+}
 
 function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
   const { downloadUrl, activeTaskId, exportFormat, showAllZones, taskIds, taskStatuses, batchZoneMetaByTaskId } = useGenerationStore();
@@ -462,7 +615,10 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
     return { id, obj: loadedModel, ...info };
   };
 
-  // Batch preview: показуємо всі готові зони одночасно (розкладаємо на сітці)
+  // Batch preview:
+  // - If tiles are exported in global XY (stitching mode), we should NOT normalize each tile individually,
+  //   and we should NOT do artificial grid layout. Just load as-is and normalize the whole group once.
+  // - If tiles are still centered (legacy), we fallback to the old grid layout so user can still see all zones.
   useEffect(() => {
     if (!showAllZones) return;
     if (!taskIds || taskIds.length < 2) return;
@@ -479,90 +635,99 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
       setLoading(true);
       setError(null);
       try {
-        const models = (await Promise.all(idsToLoad.map((id) => loadZoneModel(id)))).filter(Boolean) as any[];
+        // Load without per-tile normalize so we can preserve real relative alignment (when available)
+        const loadZoneModelRaw = async (id: string) => {
+          let loadedModel: THREE.Group | THREE.Mesh;
+          const blobs: any = {};
+          const tryPart = async (p: "base" | "roads" | "buildings" | "water" | "parks" | "poi") => {
+            try {
+              const b = await api.downloadModel(id, "stl", p);
+              if (b && b.size > 100) blobs[p] = b;
+            } catch {
+              // ignore
+            }
+          };
+          await Promise.all([
+            tryPart("base"),
+            tryPart("roads"),
+            tryPart("buildings"),
+            tryPart("water"),
+            tryPart("parks"),
+            tryPart("poi"),
+          ]);
+
+          if (Object.keys(blobs).length > 0) {
+            loadedModel = await loadColoredPartsFromBlobs(blobs);
+          } else {
+            const blob = await api.downloadModel(id, "stl");
+            loadedModel = await loadStlAsMesh(blob, 0x888888);
+          }
+
+          loadedModel.updateMatrixWorld(true);
+          return { id, obj: loadedModel };
+        };
+
+        const models = (await Promise.all(idsToLoad.map((id) => loadZoneModelRaw(id)))).filter(Boolean) as any[];
         if (!models.length) {
           setModel(null);
           setLoading(false);
           return;
         }
 
-        // Уніфікований масштаб для всіх (щоб не було різних "розмірів")
-        const maxDimGlobal = Math.max(...models.map((m) => m.maxDim || 1));
-        const globalScale = maxDimGlobal > 0 ? 200 / maxDimGlobal : 1;
-
         const group = new THREE.Group();
         for (const m of models) {
-          m.obj.scale.setScalar(globalScale);
           m.obj.updateMatrixWorld(true);
           group.add(m.obj);
         }
 
-        // Покращена логіка компактного розміщення зон
-        // 1. Обчислюємо розміри кожної зони після масштабування
-        const zoneInfo = models.map((m) => {
-          const box = new THREE.Box3().setFromObject(m.obj);
-          return {
-            size: box.getSize(new THREE.Vector3()),
-            center: box.getCenter(new THREE.Vector3()),
-            min: box.min.clone(),
-            model: m
-          };
-        });
+        // Decide whether tiles already have meaningful relative positions.
+        // If all centers are ~the same => legacy centered exports => use grid layout.
+        const centers = models.map((m) => new THREE.Box3().setFromObject(m.obj).getCenter(new THREE.Vector3()));
+        const mean = centers.reduce((acc, c) => acc.add(c), new THREE.Vector3()).multiplyScalar(1 / Math.max(1, centers.length));
+        const spread = centers.reduce((acc, c) => acc + c.clone().sub(mean).length(), 0) / Math.max(1, centers.length);
+        const looksGlobal = spread > 1.0; // >1 unit spread => not all centered at origin
 
-        // 2) Layout like on the map (row/col) when available. Otherwise fallback to compact rows.
-        const metaByTaskId = batchZoneMetaByTaskId || {};
-        const canUseMapLayout = models.every((m) => {
-          const meta = (metaByTaskId as any)[m.id];
-          return meta && (meta.row != null || meta.col != null);
-        });
-
-        if (canUseMapLayout) {
-          const rows = models.map((m) => Number((metaByTaskId as any)[m.id].row ?? 0));
-          const cols = models.map((m) => Number((metaByTaskId as any)[m.id].col ?? 0));
-          const minRow = Math.min(...rows);
-          const minCol = Math.min(...cols);
-
-          const maxW = Math.max(...zoneInfo.map((z) => z.size.x));
-          const maxD = Math.max(...zoneInfo.map((z) => z.size.z));
-          // No gaps: slight overlap hides micro seams in preview
-          const stepX = maxW * 0.98;
-          const stepZ = maxD * 0.98;
-
-          zoneInfo.forEach((item) => {
-            const meta = (metaByTaskId as any)[item.model.id] || {};
-            const r = Number(meta.row ?? 0) - minRow;
-            const c = Number(meta.col ?? 0) - minCol;
-            const xShift = (r % 2) ? stepX * 0.5 : 0.0;
-
-            item.model.obj.position.x = c * stepX + xShift - item.center.x;
-            item.model.obj.position.z = r * stepZ - item.center.z;
-            item.model.obj.position.y = -item.min.y;
-            item.model.obj.updateMatrixWorld(true);
+        if (!looksGlobal) {
+          // Legacy layout fallback (keep previous behavior)
+          const zoneInfo = models.map((m) => {
+            const box = new THREE.Box3().setFromObject(m.obj);
+            return {
+              size: box.getSize(new THREE.Vector3()),
+              center: box.getCenter(new THREE.Vector3()),
+              min: box.min.clone(),
+              model: m
+            };
           });
-        } else {
-          const minSpacing = 0.0;
-          const totalZones = models.length;
-          const cols = totalZones <= 6 ? totalZones : Math.ceil(Math.sqrt(totalZones));
 
-          let currentX = 0;
-          let currentZ = 0;
-          let maxDepthInRow = 0;
-
-          zoneInfo.forEach((item, i) => {
-            const col = i % cols;
-            if (col === 0 && i > 0) {
-              currentX = 0;
-              currentZ += maxDepthInRow + minSpacing;
-              maxDepthInRow = 0;
-            }
-            item.model.obj.position.x = currentX - item.center.x;
-            item.model.obj.position.z = currentZ - item.center.z;
-            item.model.obj.position.y = -item.min.y;
-            item.model.obj.updateMatrixWorld(true);
-
-            currentX += item.size.x + minSpacing;
-            maxDepthInRow = Math.max(maxDepthInRow, item.size.z);
+          const metaByTaskId = batchZoneMetaByTaskId || {};
+          const canUseMapLayout = models.every((m) => {
+            const meta = (metaByTaskId as any)[m.id];
+            return meta && (meta.row != null || meta.col != null);
           });
+
+          if (canUseMapLayout) {
+            const rows = models.map((m) => Number((metaByTaskId as any)[m.id].row ?? 0));
+            const cols = models.map((m) => Number((metaByTaskId as any)[m.id].col ?? 0));
+            const minRow = Math.min(...rows);
+            const minCol = Math.min(...cols);
+
+            const maxW = Math.max(...zoneInfo.map((z) => z.size.x));
+            const maxD = Math.max(...zoneInfo.map((z) => z.size.z));
+            const stepX = maxW * 1.0;
+            const stepZ = maxD * 1.0;
+
+            zoneInfo.forEach((item) => {
+              const meta = (metaByTaskId as any)[item.model.id] || {};
+              const r = Number(meta.row ?? 0) - minRow;
+              const c = Number(meta.col ?? 0) - minCol;
+              const xShift = (r % 2) ? stepX * 0.5 : 0.0;
+
+              item.model.obj.position.x = c * stepX + xShift - item.center.x;
+              item.model.obj.position.z = r * stepZ - item.center.z;
+              item.model.obj.position.y = -item.min.y;
+              item.model.obj.updateMatrixWorld(true);
+            });
+          }
         }
 
         // 5. Центруємо всю групу
@@ -869,6 +1034,8 @@ export function Preview3D() {
   const [gridVisible, setGridVisible] = useState(true);
   const [axesVisible, setAxesVisible] = useState(true);
   const [rotateMode, setRotateMode] = useState<RotateMode>("camera");
+  const [cameraMode, setCameraMode] = useState<CameraMode>("orbit");
+  const [flySpeed, setFlySpeed] = useState<number>(120);
   
   return (
     <div className="w-full h-full bg-gray-900 relative" style={{ minHeight: '100%' }}>
@@ -903,9 +1070,38 @@ export function Preview3D() {
               {rotateMode === "camera" ? "Camera" : "Model"}
             </button>
           </div>
-          <div className="text-[10px] text-white/70">
-            {rotateMode === "model" ? "Drag по моделі = rotate. Double-click = reset." : "Drag = rotate camera."}
+          <div className="flex items-center justify-between gap-3">
+            <span>Camera</span>
+            <button
+              className="px-2 py-1 rounded bg-white/10 hover:bg-white/20"
+              onClick={() => setCameraMode((m) => (m === "orbit" ? "fly" : "orbit"))}
+              title="Orbit: стандартний огляд. Fly: вільний політ (WASD, Q/E, Shift, RMB+mouse)."
+            >
+              {cameraMode === "orbit" ? "Orbit" : "Fly"}
+            </button>
           </div>
+          <div className="text-[10px] text-white/70">
+            {cameraMode === "fly"
+              ? "Fly: WASD рух, Q/E вгору/вниз, Shift швидше, RMB+mouse дивитись, wheel = speed."
+              : (rotateMode === "model" ? "Drag по моделі = rotate. Double-click = reset." : "Drag = rotate camera.")}
+          </div>
+          {cameraMode === "fly" && (
+            <div className="pt-1">
+              <div className="flex items-center justify-between gap-3">
+                <span>Fly speed</span>
+                <span className="text-[10px] text-white/70 tabular-nums">{Math.round(flySpeed)}</span>
+              </div>
+              <input
+                className="w-full"
+                type="range"
+                min={10}
+                max={800}
+                step={5}
+                value={flySpeed}
+                onChange={(e) => setFlySpeed(Number(e.target.value))}
+              />
+            </div>
+          )}
         </div>
       </div>
       {isGenerating && (
@@ -919,8 +1115,10 @@ export function Preview3D() {
       <Canvas style={{ width: '100%', height: '100%', display: 'block' }}>
         <Suspense fallback={null}>
           <CameraController />
-          <OrbitControls 
-            enableDamping 
+          <FreeFlyControls enabled={cameraMode === "fly"} speed={flySpeed} onSpeedChange={setFlySpeed} />
+          <OrbitControls
+            enabled={cameraMode === "orbit"}
+            enableDamping
             dampingFactor={0.05}
             minDistance={10}
             maxDistance={2000}

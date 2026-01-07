@@ -117,8 +117,10 @@ class GenerationRequest(BaseModel):
     water_depth: float = 2.0  # мм
     terrain_enabled: bool = True
     terrain_z_scale: float = 3.0  # Збільшено для кращої видимості рельєфу
-    # Тонка основа для друку: за замовчуванням 2мм (користувач може збільшити).
-    terrain_base_thickness_mm: float = Field(default=2.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
+    # Тонка основа для друку: за замовчуванням 1мм (користувач може змінити).
+    terrain_base_thickness_mm: float = Field(default=1.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
+    # Тонка основа для друку: за замовчуванням 1мм (користувач може змінити).
+    terrain_base_thickness_mm: float = Field(default=1.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
     # Деталізація рельєфу
     # - terrain_resolution: кількість точок по осі (mesh деталь). Вища = детальніше, повільніше.
     terrain_resolution: int = Field(default=350, ge=80, le=600)  # Висока деталізація для максимально плавного рельєфу
@@ -145,6 +147,8 @@ class GenerationRequest(BaseModel):
     # Синхронізація висот між зонами (для гексагональної сітки)
     elevation_ref_m: Optional[float] = None  # Глобальна базова висота (метри над рівнем моря)
     baseline_offset_m: float = 0.0  # Зміщення baseline (метри)
+    # Preserve global XY coordinates (do NOT center per tile) for perfect stitching across zones/sessions.
+    preserve_global_xy: bool = False
 
 
 class GenerationResponse(BaseModel):
@@ -548,6 +552,8 @@ class ZoneGenerationRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     
     zones: List[dict]  # Список зон (GeoJSON features)
+    # Hex grid parameters (used to reconstruct exact zone polygons in metric space for perfect stitching)
+    hex_size_m: float = Field(default=500.0, ge=100.0, le=10000.0)
     # IMPORTANT: city/area bbox (WGS84) for a stable global reference across sessions.
     # If provided, global_center + DEM bbox + elevation_ref are computed/cached from this bbox,
     # so later "add more zones" runs stitch perfectly with earlier prints.
@@ -578,6 +584,10 @@ class ZoneGenerationRequest(BaseModel):
     flatten_roads_on_terrain: bool = False
     export_format: str = Field(default="3mf", pattern="^(stl|3mf)$")
     context_padding_m: float = Field(default=400.0, ge=0.0, le=5000.0)
+    # Fast mode for stitching diagnostics: generate only terrain (optionally with water depression)
+    terrain_only: bool = False
+    include_parks: bool = True
+    include_pois: bool = True
 
 
 @app.post("/api/generate-zones", response_model=GenerationResponse)
@@ -647,7 +657,8 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
     import hashlib, json
     cache_dir = Path("cache/cities")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    city_key = f"{grid_bbox_latlon[0]:.6f}_{grid_bbox_latlon[1]:.6f}_{grid_bbox_latlon[2]:.6f}_{grid_bbox_latlon[3]:.6f}_z{int(request.terrarium_zoom)}_zs{float(request.terrain_z_scale):.3f}_ms{float(request.model_size_mm):.1f}"
+    # cache version bump: elevation baseline logic changed (needs refresh)
+    city_key = f"v4_{grid_bbox_latlon[0]:.6f}_{grid_bbox_latlon[1]:.6f}_{grid_bbox_latlon[2]:.6f}_{grid_bbox_latlon[3]:.6f}_z{int(request.terrarium_zoom)}_zs{float(request.terrain_z_scale):.3f}_ms{float(request.model_size_mm):.1f}"
     city_hash = hashlib.md5(city_key.encode()).hexdigest()
     city_cache_file = cache_dir / f"city_{city_hash}.json"
 
@@ -698,7 +709,8 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
             ce = cached.get("elevation_ref_m")
             if ce is not None:
                 ce = float(ce)
-                if -500.0 <= ce <= 9000.0:
+                # Reject clearly bogus negative refs (Terrarium outliers) that create "tower bases".
+                if -120.0 <= ce <= 9000.0:
                     cached_elev = ce
         except Exception:
             cached_elev = None
@@ -802,15 +814,21 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
             flatten_roads_on_terrain=request.flatten_roads_on_terrain if request.flatten_roads_on_terrain is not None else False,
             export_format=request.export_format,
             context_padding_m=request.context_padding_m,
-            terrain_only=False,
+            terrain_only=bool(getattr(request, "terrain_only", False)),
+            include_parks=bool(getattr(request, "include_parks", True)),
+            include_pois=bool(getattr(request, "include_pois", True)),
             # КРИТИЧНО: Передаємо глобальні параметри для синхронізації висот
             elevation_ref_m=global_elevation_ref_m,  # Глобальна базова висота для всіх зон
             baseline_offset_m=global_baseline_offset_m,  # Глобальне зміщення baseline
+            preserve_global_xy=True,  # IMPORTANT: export in a shared coordinate frame for stitching
         )
         
         # Генеруємо модель для зони
         task_id = str(uuid.uuid4())
         zone_id_str = zone.get('id', f'zone_{zone_idx}')
+        props = zone.get("properties") or {}
+        zone_row = props.get("row")
+        zone_col = props.get("col")
         task = GenerationTask(task_id=task_id, request=zone_request)
         tasks[task_id] = task
         
@@ -825,7 +843,11 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
             task_id=task_id,
             request=zone_request,
             zone_id=zone_id_str,
-            zone_polygon_coords=zone_polygon_coords  # Передаємо координати полігону для обрізання
+            zone_polygon_coords=zone_polygon_coords,  # Передаємо координати полігону для обрізання (fallback)
+            zone_row=zone_row,
+            zone_col=zone_col,
+            grid_bbox_latlon=grid_bbox_latlon,
+            hex_size_m=float(getattr(request, "hex_size_m", 500.0)),
         )
         
         task_ids.append(task_id)
@@ -854,7 +876,16 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
     )
 
 
-async def generate_model_task(task_id: str, request: GenerationRequest, zone_id: Optional[str] = None, zone_polygon_coords: Optional[list] = None):
+async def generate_model_task(
+    task_id: str,
+    request: GenerationRequest,
+    zone_id: Optional[str] = None,
+    zone_polygon_coords: Optional[list] = None,
+    zone_row: Optional[int] = None,
+    zone_col: Optional[int] = None,
+    grid_bbox_latlon: Optional[Tuple[float, float, float, float]] = None,
+    hex_size_m: Optional[float] = None,
+):
     """
     Фонова задача генерації 3D моделі
     """
@@ -888,7 +919,57 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
         # (zone polygon bounds), not from per-zone bbox (which varies and breaks mm->meters conversions).
         zone_polygon_local = None
         reference_xy_m = None
-        if zone_polygon_coords is not None and global_center is not None:
+
+        # BEST (stitching-critical): reconstruct exact hex polygon in metric space (no lat/lon round-trip).
+        if (
+            global_center is not None
+            and grid_bbox_latlon is not None
+            and zone_row is not None
+            and zone_col is not None
+            and hex_size_m is not None
+        ):
+            try:
+                import math
+                from shapely.geometry import Polygon as ShapelyPolygon
+                from services.crs_utils import bbox_latlon_to_utm
+                from services.hexagonal_grid import hexagon_center_to_corner
+
+                north, south, east, west = grid_bbox_latlon
+                minx_utm_grid, miny_utm_grid, _, _, _, _, _ = bbox_latlon_to_utm(float(north), float(south), float(east), float(west))
+
+                hs = float(hex_size_m)
+                hex_width = math.sqrt(3.0) * hs
+                hex_height = 1.5 * hs
+
+                r = int(zone_row)
+                c = int(zone_col)
+
+                center_x = float(minx_utm_grid + c * hex_width + (hex_width / 2.0 if (r % 2) == 1 else 0.0))
+                center_y = float(miny_utm_grid + r * hex_height)
+
+                corners_utm = hexagon_center_to_corner(center_x, center_y, hs)  # list[(x,y)]
+                local_coords = []
+                for x_utm, y_utm in corners_utm:
+                    x_local, y_local = global_center.to_local(float(x_utm), float(y_utm))
+                    local_coords.append((float(x_local), float(y_local)))
+
+                zone_polygon_local = ShapelyPolygon(local_coords)
+                if not zone_polygon_local.is_valid:
+                    zone_polygon_local = zone_polygon_local.buffer(0)
+
+                if zone_polygon_local is not None and not zone_polygon_local.is_empty:
+                    # IMPORTANT: hexagon_center_to_corner orientation produces:
+                    # width ~= sqrt(3)*size, height ~= 2*size
+                    reference_xy_m = (float(hex_width), float(2.0 * hs))
+                    print(
+                        f"[DEBUG] Reconstructed hex zone polygon from row/col ({r},{c}) in local coords; "
+                        f"reference_xy_m={reference_xy_m[0]:.2f}x{reference_xy_m[1]:.2f}м"
+                    )
+            except Exception as e:
+                print(f"[WARN] Failed to reconstruct hex polygon from row/col: {e}")
+
+        # Fallback: use provided polygon coordinates (lat/lon -> local), may have small drift.
+        if zone_polygon_local is None and zone_polygon_coords is not None and global_center is not None:
             try:
                 from shapely.geometry import Polygon as ShapelyPolygon
                 local_coords = []
@@ -909,16 +990,22 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 print(f"[WARN] Помилка створення полігону зони: {e}")
 
         # bbox_meters (локальні координати)
-        from services.crs_utils import bbox_latlon_to_utm
-        bbox_utm_result = bbox_latlon_to_utm(request.north, request.south, request.east, request.west)
-        bbox_utm_coords = bbox_utm_result[:4]  # (minx, miny, maxx, maxy) в UTM
+        # Prefer exact zone_polygon bounds (stitching-safe); fallback to request bbox.
+        if zone_polygon_local is not None and not zone_polygon_local.is_empty:
+            b = zone_polygon_local.bounds
+            bbox_meters = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            print(f"[DEBUG] Bbox для зони (з полігону, локальні координати): {bbox_meters}")
+        else:
+            from services.crs_utils import bbox_latlon_to_utm
+            bbox_utm_result = bbox_latlon_to_utm(request.north, request.south, request.east, request.west)
+            bbox_utm_coords = bbox_utm_result[:4]  # (minx, miny, maxx, maxy) в UTM
 
-        minx_utm, miny_utm, maxx_utm, maxy_utm = bbox_utm_coords
-        minx_local, miny_local = global_center.to_local(minx_utm, miny_utm)
-        maxx_local, maxy_local = global_center.to_local(maxx_utm, maxy_utm)
+            minx_utm, miny_utm, maxx_utm, maxy_utm = bbox_utm_coords
+            minx_local, miny_local = global_center.to_local(minx_utm, miny_utm)
+            maxx_local, maxy_local = global_center.to_local(maxx_utm, maxy_utm)
 
-        bbox_meters = (float(minx_local), float(miny_local), float(maxx_local), float(maxy_local))
-        print(f"[DEBUG] Bbox для зони (локальні координати): {bbox_meters}")
+            bbox_meters = (float(minx_local), float(miny_local), float(maxx_local), float(maxy_local))
+            print(f"[DEBUG] Bbox для зони (локальні координати): {bbox_meters}")
 
         scale_factor = None
         try:
@@ -1077,8 +1164,12 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 filename=str(output_file_abs),
                 format=request.export_format,
                 model_size_mm=request.model_size_mm,
-                add_flat_base=True,
+                # In terrain_only mode we still want perfect stitching behavior.
+                add_flat_base=(terrain_mesh is None),
                 base_thickness_mm=float(request.terrain_base_thickness_mm),
+                reference_xy_m=reference_xy_m,
+                preserve_z=bool(getattr(request, "elevation_ref_m", None) is not None),
+                preserve_xy=bool(getattr(request, "preserve_global_xy", False)),
             )
             
             # STL для preview якщо обрано 3MF
@@ -1094,8 +1185,11 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                     filename=str(stl_preview_abs),
                     format="stl",
                     model_size_mm=request.model_size_mm,
-                    add_flat_base=not request.terrain_enabled,
-                    base_thickness_mm=2.0,
+                    add_flat_base=(terrain_mesh is None),
+                    base_thickness_mm=float(request.terrain_base_thickness_mm),
+                    reference_xy_m=reference_xy_m,
+                    preserve_z=bool(getattr(request, "elevation_ref_m", None) is not None),
+                    preserve_xy=bool(getattr(request, "preserve_global_xy", False)),
                 )
                 task.set_output("stl", str(stl_preview_abs))
             
@@ -1650,6 +1744,7 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
         
         # Експортуємо основну модель
         preserve_z = bool(getattr(request, "elevation_ref_m", None) is not None)
+        preserve_xy = bool(getattr(request, "preserve_global_xy", False))
         parts_from_main = export_scene(
             terrain_mesh=terrain_mesh,
             road_mesh=road_mesh,
@@ -1667,6 +1762,7 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
             base_thickness_mm=float(request.terrain_base_thickness_mm),
             reference_xy_m=reference_xy_m,
             preserve_z=preserve_z,
+            preserve_xy=preserve_xy,
         )
         
         # Якщо це STL і є окремі частини, зберігаємо їх
@@ -1693,6 +1789,7 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                 base_thickness_mm=float(request.terrain_base_thickness_mm),
                 reference_xy_m=reference_xy_m,
                 preserve_z=preserve_z,
+                preserve_xy=preserve_xy,
             )
 
         # Кольорове прев'ю: експортуємо STL частини (base/roads/buildings/water) з однаковими трансформаціями
@@ -1723,11 +1820,14 @@ async def generate_model_task(task_id: str, request: GenerationRequest, zone_id:
                     output_prefix=prefix,
                     mesh_items=preview_items,
                     model_size_mm=request.model_size_mm,
-                    add_flat_base=not request.terrain_enabled,
-                    base_thickness_mm=2.0,
+                    # Flat BaseFlat is needed ONLY when terrain mesh is missing.
+                    # If terrain exists it already includes the correct base thickness and zone shape.
+                    add_flat_base=(terrain_mesh is None),
+                    base_thickness_mm=float(request.terrain_base_thickness_mm),
                     rotate_to_ground=False,
                     reference_xy_m=reference_xy_m,
                     preserve_z=preserve_z,
+                    preserve_xy=preserve_xy,
                 )
                 # Зберігаємо в output_files
                 for part_name, path in parts.items():
