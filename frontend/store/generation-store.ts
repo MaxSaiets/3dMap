@@ -35,6 +35,9 @@ interface GenerationState {
   terrariumZoom: number;
   exportFormat: "stl" | "3mf";
   modelSizeMm: number; // Розмір моделі в міліметрах
+
+  // Preview only
+  terrainSmoothShading: boolean;
   
   // Actions
   setSelectedArea: (area: LatLngBounds | null) => void;
@@ -63,6 +66,8 @@ interface GenerationState {
   setTerrariumZoom: (value: number) => void;
   setExportFormat: (format: "stl" | "3mf") => void;
   setModelSizeMm: (value: number) => void;
+
+  setTerrainSmoothShading: (value: boolean) => void;
   
   reset: () => void;
 }
@@ -100,6 +105,9 @@ const initialState = {
   terrariumZoom: 15,
   exportFormat: "3mf" as const,
   modelSizeMm: 100.0, // 100мм = 10см за замовчуванням
+
+  // Preview: smooth shading can show a visible seam between separate tiles on slopes
+  terrainSmoothShading: false,
 };
 
 export const useGenerationStore = create<GenerationState>((set) => ({
@@ -143,6 +151,8 @@ export const useGenerationStore = create<GenerationState>((set) => ({
   setTerrariumZoom: (value) => set({ terrariumZoom: value }),
   setExportFormat: (format) => set({ exportFormat: format }),
   setModelSizeMm: (value) => set({ modelSizeMm: value }),
+
+  setTerrainSmoothShading: (value) => set({ terrainSmoothShading: value }),
   
   reset: () => set(initialState),
 }));

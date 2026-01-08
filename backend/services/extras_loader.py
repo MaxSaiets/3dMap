@@ -18,19 +18,56 @@ import geopandas as gpd
 import osmnx as ox
 
 
+# Кеш ВИМКНЕНО: завжди завантажуємо свіжі дані для кожної зони
+# _EXTRAS_CACHE: dict[tuple, tuple[float, gpd.GeoDataFrame, gpd.GeoDataFrame]] = {}  # DISABLED
+
+
+def _bbox_key(north: float, south: float, east: float, west: float) -> tuple[float, float, float, float]:
+    return (round(float(north), 6), round(float(south), 6), round(float(east), 6), round(float(west), 6))
+
+
 def fetch_extras(
     north: float,
     south: float,
     east: float,
     west: float,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    # Перевіряємо чи є preloaded дані (пріоритет)
+    try:
+        from services.preloaded_data import is_loaded, get_extras_for_bbox
+        if is_loaded():
+            print("[extras_loader] Використовую preloaded дані")
+            green, pois = get_extras_for_bbox(north, south, east, west)
+            return green, pois
+    except Exception as e:
+        print(f"[WARN] Помилка використання preloaded даних для extras: {e}, використовуємо звичайний режим")
+    
+    # Використовуємо Overpass API за замовчуванням (завантажує тільки для конкретної зони, без кешу)
+    # Для використання PBF встановіть OSM_SOURCE=pbf в .env
     source = (os.getenv("OSM_SOURCE") or "overpass").lower()
+
+    # Кеш ВИМКНЕНО: завжди завантажуємо свіжі дані
+    ttl_s = 0.0
+    # k = (source, _bbox_key(north, south, east, west))  # DISABLED
+    # import time as _time
+    # now = _time.time()
+    # if ttl_s > 0 and k in _EXTRAS_CACHE:  # DISABLED
+    #     ...
+
     if source in ("pbf", "geofabrik", "local"):
         from services.pbf_loader import fetch_extras_from_pbf
 
-        return fetch_extras_from_pbf(north, south, east, west)
+        green, pois = fetch_extras_from_pbf(north, south, east, west)
+        # Кеш вимкнено: не зберігаємо результати
+        # if ttl_s > 0:
+        #     _EXTRAS_CACHE[k] = (now, green, pois)  # DISABLED
+        return green, pois
 
     bbox = (north, south, east, west)
+
+    # Вимкнення кешу OSMnx для меншого використання пам'яті
+    ox.settings.use_cache = False
+    ox.settings.log_console = False
 
     # Parks/green polygons
     tags_green = {
@@ -74,6 +111,9 @@ def fetch_extras(
     except Exception:
         gdf_pois = gpd.GeoDataFrame()
 
+    # Кеш вимкнено: не зберігаємо результати
+    # if ttl_s > 0:
+    #     _EXTRAS_CACHE[k] = (now, gdf_green, gdf_pois)  # DISABLED
     return gdf_green, gdf_pois
 
 

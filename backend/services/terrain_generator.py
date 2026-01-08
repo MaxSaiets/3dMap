@@ -170,6 +170,15 @@ def create_terrain_mesh(
     X = X_local
     Y = Y_local
 
+    # Stitching mode: protect seam values from any later per-tile operations (flatten/water/etc).
+    stitching_mode = bool(elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)))
+    Z_seam_ref = None
+    if stitching_mode:
+        try:
+            Z_seam_ref = np.asarray(Z, dtype=float).copy()
+        except Exception:
+            Z_seam_ref = None
+
     # ВИПРАВЛЕННЯ 1: Строга перевірка розмірів замість небезпечного reshape
     # Це запобігає "діагональному зсуву" рельєфу (shearing)
     try:
@@ -292,6 +301,20 @@ def create_terrain_mesh(
         except Exception as e:
             print(f"[WARN] flatten_roads failed: {e}")
 
+    # Restore a thin border ring so seams stay identical between adjacent tiles,
+    # regardless of what features got clipped differently on each side (roads/buildings/water).
+    if stitching_mode and Z_seam_ref is not None:
+        try:
+            k = 2  # cells
+            Z = np.asarray(Z, dtype=float)
+            Z_seam_ref = np.asarray(Z_seam_ref, dtype=float)
+            Z[:, :k] = Z_seam_ref[:, :k]
+            Z[:, -k:] = Z_seam_ref[:, -k:]
+            Z[:k, :] = Z_seam_ref[:k, :]
+            Z[-k:, :] = Z_seam_ref[-k:, :]
+        except Exception:
+            pass
+
     # CRITICAL (stitching): in global elevation sync mode, all tiles must share the same Z floor.
     # Clamp the heightfield to >= 0 BEFORE carving water, so min_floor is identical across zones.
     try:
@@ -372,6 +395,19 @@ def create_terrain_mesh(
     except Exception as e:
         print(f"[WARN] water depression failed: {e}")
         Z_original_before_water = None
+
+    # Restore border ring again after water carve (same reasoning as above).
+    if stitching_mode and Z_seam_ref is not None:
+        try:
+            k = 2
+            Z = np.asarray(Z, dtype=float)
+            Z_seam_ref = np.asarray(Z_seam_ref, dtype=float)
+            Z[:, :k] = Z_seam_ref[:, :k]
+            Z[:, -k:] = Z_seam_ref[:, -k:]
+            Z[:k, :] = Z_seam_ref[:k, :]
+            Z[-k:, :] = Z_seam_ref[-k:, :]
+        except Exception:
+            pass
     
     # Safety (again): ensure any post-processing didn't break the grid shape.
     try:
@@ -539,128 +575,278 @@ def create_terrain_mesh(
     try:
         terrain_top = None
         if zone_polygon is not None and terrain_provider is not None:
+            from shapely.geometry import Point
+            from shapely.prepared import prep
+            from scipy.spatial import Delaunay
+
+            poly = zone_polygon
+            if hasattr(poly, "buffer") and (not getattr(poly, "is_valid", True)):
+                poly = poly.buffer(0)
+
+            stitching_mode = bool(elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)))
+
+            # Stitching mode must be deterministic and polygon-driven.
+            # If buffer(0) ever produces MultiPolygon (rare, but can happen with invalid rings),
+            # boundary extraction would fail and the border snaps inward by ~one grid step.
             try:
-                from shapely.geometry import Point
-                from shapely.prepared import prep
-                from scipy.spatial import Delaunay
+                from shapely.geometry import Polygon as _Polygon, MultiPolygon as _MultiPolygon
+                if isinstance(poly, _MultiPolygon):
+                    parts = [p for p in getattr(poly, "geoms", []) if isinstance(p, _Polygon) and (not p.is_empty)]
+                    if parts:
+                        poly = max(parts, key=lambda p: float(abs(p.area)))
+                if stitching_mode and not isinstance(poly, _Polygon):
+                    raise ValueError(f"stitching_mode: zone_polygon must be Polygon, got {type(poly).__name__}")
+            except Exception:
+                # if shapely types aren't available, continue best-effort
+                pass
+            prep_poly = prep(poly)
 
-                poly = zone_polygon
-                if hasattr(poly, "buffer") and (not getattr(poly, "is_valid", True)):
-                    poly = poly.buffer(0)
-                prep_poly = prep(poly)
+            # NOTE: In stitching mode we must keep polygon boundary vertices.
+            # Shapely `contains()` is STRICT (returns False on boundary), which would
+            # silently drop boundary triangles and produce a jagged/inset outline (crooked hex sides).
+            def _in_poly_for_tris(pt: "Point") -> bool:
+                if stitching_mode:
+                    # Prefer covers() (includes boundary); fallback to contains||touches if not available.
+                    try:
+                        return bool(getattr(prep_poly, "covers", None)(pt))  # type: ignore[misc]
+                    except Exception:
+                        try:
+                            return bool(poly.covers(pt))  # type: ignore[attr-defined]
+                        except Exception:
+                            return bool(prep_poly.contains(pt) or prep_poly.touches(pt))
+                # legacy: allow boundary too
+                return bool(prep_poly.contains(pt) or prep_poly.touches(pt))
 
-                stitching_mode = bool(elevation_ref_m is not None and np.isfinite(float(elevation_ref_m)))
+            # 1) interior points: take grid points that are inside the polygon.
+            # NOTE: in stitching_mode we do NOT include points that merely "touch" the boundary,
+            # because those grid-touch points differ per-tile and create jagged borders / spikes.
+            xy_grid = np.column_stack([X.flatten(), Y.flatten()])
+            inside_mask = np.array(
+                [
+                    (prep_poly.contains(Point(float(x), float(y))) if stitching_mode else (prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y)))))
+                    for x, y in xy_grid
+                ],
+                dtype=bool,
+            )
+            pts_xy = [tuple(map(float, p)) for p in xy_grid[inside_mask]]
 
-                # 1) interior points: take grid points that are inside the polygon.
-                # NOTE: in stitching_mode we do NOT include points that merely "touch" the boundary,
-                # because those grid-touch points differ per-tile and create jagged borders / spikes.
-                xy_grid = np.column_stack([X.flatten(), Y.flatten()])
-                inside_mask = np.array(
-                    [
-                        (prep_poly.contains(Point(float(x), float(y))) if stitching_mode else (prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y)))))
-                        for x, y in xy_grid
-                    ],
-                    dtype=bool,
-                )
-                pts_xy = [tuple(map(float, p)) for p in xy_grid[inside_mask]]
+            # 2) boundary points:
+            # - stitching_mode: deterministic samples along edges (neighbors generate identical points)
+            # - non-stitching: densify along edges for nicer looking borders in single-tile preview
+            try:
+                coords = list(poly.exterior.coords)
+            except Exception:
+                coords = []
 
-                # 2) boundary points:
-                # - stitching_mode: ONLY polygon vertices (so shared borders have identical vertex sets)
-                # - non-stitching: densify along edges for nicer looking borders in single-tile preview
-                try:
-                    coords = list(poly.exterior.coords)
-                except Exception:
-                    coords = []
+            boundary_pts = []
+            if coords:
+                if stitching_mode:
+                    if len(coords) >= 2 and coords[0] == coords[-1]:
+                        coords = coords[:-1]
+                    # Use a spacing tied to the terrain grid step.
+                    # If spacing is too large, unconstrained Delaunay can "skip" extreme boundary vertices,
+                    # and after face filtering the mesh border snaps inward by ~one grid step (seam gap).
+                    try:
+                        dx = float(width_m) / max(1.0, float(res_x - 1))
+                        dy = float(height_m) / max(1.0, float(res_y - 1))
+                        grid_step = max(1e-6, float(min(dx, dy)))
+                        edge_spacing = max(1.0, grid_step * 0.9)
+                    except Exception:
+                        edge_spacing = 5.0
 
-                boundary_pts = []
-                if coords:
-                    if stitching_mode:
-                        # Use only polygon vertices (drop closure point)
-                        if len(coords) >= 2 and coords[0] == coords[-1]:
-                            coords = coords[:-1]
-                        for x, y, *_ in coords:
-                            p = (float(x), float(y))
+                    ring_xy = [(float(x), float(y)) for x, y, *_ in coords]
+                    ring_xy = ring_xy + [ring_xy[0]]
+                    for i in range(len(ring_xy) - 1):
+                        x1, y1 = ring_xy[i]
+                        x2, y2 = ring_xy[i + 1]
+                        seg_len = float(np.hypot(x2 - x1, y2 - y1))
+                        if seg_len < 1e-6:
+                            continue
+                        n = max(2, int(seg_len / edge_spacing) + 1)
+                        for t in np.linspace(0.0, 1.0, n, dtype=float):
+                            p = (float(x1 + (x2 - x1) * t), float(y1 + (y2 - y1) * t))
                             pts_xy.append(p)
                             boundary_pts.append(p)
-                    else:
-                        # choose spacing based on zone size (meters)
-                        try:
-                            b = poly.bounds
-                            zone_size = max(float(b[2] - b[0]), float(b[3] - b[1]))
-                            spacing = max(2.0, min(10.0, zone_size / 200.0))  # 2..10m
-                        except Exception:
-                            spacing = 5.0
-                        for i in range(max(0, len(coords) - 1)):
-                            x1, y1 = coords[i][0], coords[i][1]
-                            x2, y2 = coords[i + 1][0], coords[i + 1][1]
-                            seg_len = float(np.hypot(x2 - x1, y2 - y1))
-                            n = max(2, int(seg_len / spacing) + 1)
-                            for t in np.linspace(0.0, 1.0, n, dtype=float):
-                                p = (float(x1 + (x2 - x1) * t), float(y1 + (y2 - y1) * t))
-                                pts_xy.append(p)
-                                boundary_pts.append(p)
+                else:
+                    try:
+                        b = poly.bounds
+                        zone_size = max(float(b[2] - b[0]), float(b[3] - b[1]))
+                        spacing = max(2.0, min(10.0, zone_size / 200.0))  # 2..10m
+                    except Exception:
+                        spacing = 5.0
+                    for i in range(max(0, len(coords) - 1)):
+                        x1, y1 = coords[i][0], coords[i][1]
+                        x2, y2 = coords[i + 1][0], coords[i + 1][1]
+                        seg_len = float(np.hypot(x2 - x1, y2 - y1))
+                        n = max(2, int(seg_len / spacing) + 1)
+                        for t in np.linspace(0.0, 1.0, n, dtype=float):
+                            p = (float(x1 + (x2 - x1) * t), float(y1 + (y2 - y1) * t))
+                            pts_xy.append(p)
+                            boundary_pts.append(p)
 
-                # de-dupe
-                pts_xy_arr = np.unique(np.round(np.asarray(pts_xy, dtype=float), 3), axis=0)
+            # De-dupe points.
+            # IMPORTANT (stitching): do NOT coarse-round polygon boundary points.
+            # Rounding to 0.001m can move a boundary point slightly OUTSIDE the polygon,
+            # which then causes all boundary triangles to be filtered out and the tile border
+            # snaps inward by ~one grid step (visible seam/gap + "triangular walls").
+            round_decimals = 6 if stitching_mode else 3
+            pts_xy_arr = np.unique(np.round(np.asarray(pts_xy, dtype=float), round_decimals), axis=0)
 
-                # Z from terrain_provider (already accounts for water depression etc.)
-                zs = terrain_provider.get_heights_for_points(pts_xy_arr)
+            # Z from terrain_provider (already accounts for water depression etc.)
+            zs = terrain_provider.get_heights_for_points(pts_xy_arr)
 
-                # CRITICAL: Force boundary heights to come from the absolute DEM sampling,
-                # so adjacent zones share identical border vertex heights (perfect stitching).
-                # We only re-sample the boundary points (cheap), not the full interior grid (expensive).
+            # Force boundary heights to come from absolute DEM sampling (perfect stitching).
+            try:
+                if boundary_pts and latlon_bbox is not None:
+                    boundary_set = {tuple(np.round(np.asarray(p, dtype=float), round_decimals)) for p in boundary_pts}
+                    rounded_all = np.round(pts_xy_arr, round_decimals)
+                    boundary_mask = np.array([tuple(p) in boundary_set for p in rounded_all], dtype=bool)
+                    if np.any(boundary_mask):
+                        bxy = pts_xy_arr[boundary_mask]
+                        if global_center is not None:
+                            xb = np.zeros((len(bxy), 1), dtype=float)
+                            yb = np.zeros((len(bxy), 1), dtype=float)
+                            for i in range(len(bxy)):
+                                x_utm_val, y_utm_val = global_center.from_local(float(bxy[i, 0]), float(bxy[i, 1]))
+                                xb[i, 0] = x_utm_val
+                                yb[i, 0] = y_utm_val
+                        else:
+                            xb = (bxy[:, 0].reshape(-1, 1) + float(center_x))
+                            yb = (bxy[:, 1].reshape(-1, 1) + float(center_y))
+
+                        zb = get_elevation_data(
+                            xb,
+                            yb,
+                            latlon_bbox=latlon_bbox,
+                            z_scale=z_scale,
+                            source_crs=source_crs,
+                            terrarium_zoom=terrarium_zoom,
+                            elevation_ref_m=elevation_ref_m,
+                            baseline_offset_m=baseline_offset_m,
+                        )
+                        zb = np.asarray(zb, dtype=float).reshape(-1)
+                        zs = np.asarray(zs, dtype=float)
+                        zs[boundary_mask] = zb
+            except Exception:
+                pass
+
+            pts3 = np.column_stack([pts_xy_arr[:, 0], pts_xy_arr[:, 1], zs.astype(float)])
+
+            # Triangulate and keep triangles inside/touching polygon.
+            tri_faces = None
+            tri_vertices = None
+            if stitching_mode:
+                # Use constrained triangulation so the boundary is EXACTLY the polygon (no inward "grid-step" snap).
+                # This eliminates seam gaps and "triangular walls" when other parts (roads/water) reach the true border.
+                import triangle as _tri
+
+                # Build a deterministic boundary ring (ordered) from the polygon exterior.
+                ring_xy = [(float(x), float(y)) for x, y, *_ in coords]
+                if len(ring_xy) >= 2 and ring_xy[0] == ring_xy[-1]:
+                    ring_xy = ring_xy[:-1]
+                if len(ring_xy) < 3:
+                    raise ValueError("stitching_mode: polygon exterior has too few vertices")
+
+                # De-dupe ring consecutive duplicates
+                ring_clean = []
+                for p in ring_xy:
+                    if not ring_clean or (abs(ring_clean[-1][0] - p[0]) > 1e-9 or abs(ring_clean[-1][1] - p[1]) > 1e-9):
+                        ring_clean.append(p)
+                ring_xy = ring_clean
+
+                # Build vertex list: all points (boundary + interior), de-duped at round_decimals.
+                pts_all = np.asarray(pts_xy_arr, dtype=float)
+                key = np.round(pts_all, round_decimals)
+                # mapping from rounded->index
+                mapping = {}
+                vertices = []
+                for i in range(len(pts_all)):
+                    k = (float(key[i, 0]), float(key[i, 1]))
+                    if k in mapping:
+                        continue
+                    mapping[k] = len(vertices)
+                    vertices.append([float(pts_all[i, 0]), float(pts_all[i, 1])])
+                vertices = np.asarray(vertices, dtype=float)
+
+                # Boundary vertex indices (must exist in mapping)
+                ring_idx = []
+                for x, y in ring_xy:
+                    k = (float(round(x, round_decimals)), float(round(y, round_decimals)))
+                    if k not in mapping:
+                        # Shouldn't happen, but be strict in stitching mode
+                        raise ValueError("stitching_mode: boundary vertex missing from point set")
+                    ring_idx.append(int(mapping[k]))
+
+                segments = []
+                for i in range(len(ring_idx)):
+                    a = ring_idx[i]
+                    b = ring_idx[(i + 1) % len(ring_idx)]
+                    if a == b:
+                        continue
+                    segments.append([a, b])
+                if len(segments) < 3:
+                    raise ValueError("stitching_mode: not enough boundary segments for constrained triangulation")
+
+                tri_in = {"vertices": vertices, "segments": np.asarray(segments, dtype=np.int32)}
+                tri_out = _tri.triangulate(tri_in, "pQ")
+                tri_vertices = np.asarray(tri_out.get("vertices", []), dtype=float)
+                tri_faces = np.asarray(tri_out.get("triangles", []), dtype=np.int32)
+                if tri_vertices.size == 0 or tri_faces.size == 0:
+                    raise ValueError("stitching_mode: constrained triangulation returned empty mesh")
+
+                # Heights for triangulated vertices
+                zs2 = terrain_provider.get_heights_for_points(tri_vertices)
+
+                # Boundary markers: prefer triangle's vertex_markers if present, else fallback to ring membership
+                boundary_mask2 = None
+                vm = tri_out.get("vertex_markers")
+                if vm is not None:
+                    vm = np.asarray(vm).reshape(-1)
+                    boundary_mask2 = vm != 0
+                else:
+                    # fallback: points that match any boundary ring coordinate (rounded)
+                    bset = {tuple(np.round(np.asarray([x, y], dtype=float), round_decimals)) for x, y in ring_xy}
+                    boundary_mask2 = np.array([tuple(np.round(v, round_decimals)) in bset for v in tri_vertices], dtype=bool)
+
+                # Re-sample DEM for boundary vertices (perfect stitching)
                 try:
-                    if boundary_pts and latlon_bbox is not None:
-                        boundary_set = {tuple(np.round(np.asarray(p, dtype=float), 3)) for p in boundary_pts}
-                        rounded_all = np.round(pts_xy_arr, 3)
-                        boundary_mask = np.array([tuple(p) in boundary_set for p in rounded_all], dtype=bool)
-                        if np.any(boundary_mask):
-                            bxy = pts_xy_arr[boundary_mask]
-                            # Convert boundary local XY -> UTM XY for DEM sampling
-                            if global_center is not None:
-                                xb = np.zeros((len(bxy), 1), dtype=float)
-                                yb = np.zeros((len(bxy), 1), dtype=float)
-                                for i in range(len(bxy)):
-                                    x_utm_val, y_utm_val = global_center.from_local(float(bxy[i, 0]), float(bxy[i, 1]))
-                                    xb[i, 0] = x_utm_val
-                                    yb[i, 0] = y_utm_val
-                            else:
-                                xb = (bxy[:, 0].reshape(-1, 1) + float(center_x))
-                                yb = (bxy[:, 1].reshape(-1, 1) + float(center_y))
-
-                            zb = get_elevation_data(
-                                xb,
-                                yb,
-                                latlon_bbox=latlon_bbox,
-                                z_scale=z_scale,
-                                source_crs=source_crs,
-                                terrarium_zoom=terrarium_zoom,
-                                elevation_ref_m=elevation_ref_m,
-                                baseline_offset_m=baseline_offset_m,
-                            )
-                            zb = np.asarray(zb, dtype=float).reshape(-1)
-                            zs = np.asarray(zs, dtype=float)
-                            zs[boundary_mask] = zb
+                    if boundary_mask2 is not None and np.any(boundary_mask2) and latlon_bbox is not None:
+                        bxy = tri_vertices[boundary_mask2]
+                        if global_center is not None:
+                            xb = np.zeros((len(bxy), 1), dtype=float)
+                            yb = np.zeros((len(bxy), 1), dtype=float)
+                            for i in range(len(bxy)):
+                                x_utm_val, y_utm_val = global_center.from_local(float(bxy[i, 0]), float(bxy[i, 1]))
+                                xb[i, 0] = x_utm_val
+                                yb[i, 0] = y_utm_val
+                        else:
+                            xb = (bxy[:, 0].reshape(-1, 1) + float(center_x))
+                            yb = (bxy[:, 1].reshape(-1, 1) + float(center_y))
+                        zb = get_elevation_data(
+                            xb,
+                            yb,
+                            latlon_bbox=latlon_bbox,
+                            z_scale=z_scale,
+                            source_crs=source_crs,
+                            terrarium_zoom=terrarium_zoom,
+                            elevation_ref_m=elevation_ref_m,
+                            baseline_offset_m=baseline_offset_m,
+                        )
+                        zb = np.asarray(zb, dtype=float).reshape(-1)
+                        zs2 = np.asarray(zs2, dtype=float)
+                        zs2[boundary_mask2] = zb
                 except Exception:
-                    # best effort: keep interpolated boundary if direct sampling fails
                     pass
-                pts3 = np.column_stack([pts_xy_arr[:, 0], pts_xy_arr[:, 1], zs.astype(float)])
 
-                # Triangulate and keep triangles inside/touching polygon.
-                # CRITICAL: centroid-only filtering keeps triangles that cross outside the polygon boundary
-                # (centroid inside, but part of triangle outside) -> edge spikes / extra triangles on tile borders.
+                pts3 = np.column_stack([tri_vertices[:, 0], tri_vertices[:, 1], np.asarray(zs2, dtype=float)])
+                terrain_top = trimesh.Trimesh(vertices=pts3, faces=tri_faces, process=True)
+            else:
                 tri = Delaunay(pts_xy_arr)
                 tri_faces = np.asarray(tri.simplices, dtype=np.int32)
 
                 tri_pts = pts_xy_arr[tri_faces]  # (F,3,2)
                 centroids = tri_pts.mean(axis=1)  # (F,2)
-                centroid_keep = np.array(
-                    [
-                        (prep_poly.contains(Point(float(x), float(y))) if stitching_mode else (prep_poly.contains(Point(float(x), float(y))) or prep_poly.touches(Point(float(x), float(y)))))
-                        for x, y in centroids
-                    ],
-                    dtype=bool,
-                )
+                centroid_keep = np.array([_in_poly_for_tris(Point(float(x), float(y))) for x, y in centroids], dtype=bool)
                 if np.any(centroid_keep):
                     kept_idx = np.nonzero(centroid_keep)[0]
                     strict_keep = np.zeros(len(tri_faces), dtype=bool)
@@ -669,8 +855,7 @@ def create_terrain_mesh(
                         for k in range(3):
                             x = float(tri_pts[fi, k, 0])
                             y = float(tri_pts[fi, k, 1])
-                            p = Point(x, y)
-                            if not (prep_poly.contains(p) if stitching_mode else (prep_poly.contains(p) or prep_poly.touches(p))):
+                            if not _in_poly_for_tris(Point(x, y)):
                                 ok = False
                                 break
                         strict_keep[fi] = ok
@@ -680,8 +865,9 @@ def create_terrain_mesh(
 
                 if tri_faces.size > 0:
                     terrain_top = trimesh.Trimesh(vertices=pts3, faces=tri_faces, process=True)
-            except Exception:
-                terrain_top = None
+
+            if stitching_mode and terrain_top is None:
+                raise ValueError("stitching_mode: failed to build polygon-aware terrain_top (would fall back to regular grid).")
 
         if terrain_top is None:
             terrain_top = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
@@ -874,6 +1060,39 @@ def create_terrain_mesh(
         terrain_provider=terrain_provider,  # Передаємо TerrainProvider для отримання висот на полігоні
         stitching_mode=bool(elevation_ref_m is not None and np.isfinite(float(elevation_ref_m))),
     )
+
+    # Stitching-mode sanity: the solid MUST reach the zone polygon boundary.
+    # If boundary triangles are accidentally filtered out (e.g. due to rounding pushing points outside),
+    # the terrain snaps inward by ~one grid step, producing a visible seam gap and "triangular walls"
+    # where roads/water still reach the true border.
+    if zone_polygon is not None and (elevation_ref_m is not None and np.isfinite(float(elevation_ref_m))):
+        try:
+            pb = getattr(zone_polygon, "bounds", None)
+            mb = terrain_solid.bounds
+            if pb is not None and mb is not None:
+                poly_minx, poly_miny, poly_maxx, poly_maxy = map(float, pb)
+                mesh_minx, mesh_miny = float(mb[0][0]), float(mb[0][1])
+                mesh_maxx, mesh_maxy = float(mb[1][0]), float(mb[1][1])
+
+                # expected grid step in local meters
+                dx = float(width_m) / max(1.0, float(res_x - 1))
+                dy = float(height_m) / max(1.0, float(res_y - 1))
+                tol = 0.75 * min(dx, dy)  # ~1 grid step is always wrong; allow some numeric slack
+
+                inset_right = poly_maxx - mesh_maxx
+                inset_left = mesh_minx - poly_minx
+                inset_top = poly_maxy - mesh_maxy
+                inset_bottom = mesh_miny - poly_miny
+
+                if max(inset_right, inset_left, inset_top, inset_bottom) > tol:
+                    raise ValueError(
+                        "stitching_mode: terrain/base does not reach zone polygon boundary "
+                        f"(inset_m right={inset_right:.3f}, left={inset_left:.3f}, top={inset_top:.3f}, bottom={inset_bottom:.3f}; "
+                        f"grid_step_m≈{min(dx, dy):.3f})."
+                    )
+        except Exception as e:
+            # In stitching mode we prefer failing loudly over silently exporting incorrect geometry.
+            raise
     
     return terrain_solid, terrain_provider
 
@@ -1479,6 +1698,29 @@ def create_solid_terrain(
             except Exception:
                 pass
 
+            # Additional: compress collinear points so long straight edges (hex sides) become flat segments.
+            # This keeps walls planar and also helps stitched tiles share exactly the same edge vertices.
+            try:
+                if len(loop_idx) >= 4:
+                    keep = []
+                    n = len(loop_idx)
+                    # NOTE: coordinates are typically in model units (mm) by this stage; allow tiny floating noise.
+                    eps = 1e-6
+                    for i in range(n):
+                        p0 = loop_xy[(i - 1) % n]
+                        p1 = loop_xy[i % n]
+                        p2 = loop_xy[(i + 1) % n]
+                        v1 = p1 - p0
+                        v2 = p2 - p1
+                        cross = float(v1[0] * v2[1] - v1[1] * v2[0])
+                        if abs(cross) > eps:
+                            keep.append(i)
+                    if len(keep) >= 3:
+                        loop_idx = [loop_idx[i] for i in keep]
+                        loop_xy = verts[np.array(loop_idx, dtype=int), :2]
+            except Exception:
+                pass
+
             # Create bottom vertices (aligned with boundary XY)
             bottom_map: dict[int, int] = {}
             new_vertices = verts.tolist()
@@ -1518,6 +1760,11 @@ def create_solid_terrain(
             except Exception:
                 bottom_faces = []
 
+            # In stitching mode we require a watertight solid. If we can't triangulate the bottom,
+            # returning a partial solid will create undefined behavior (and tempting fallbacks).
+            if stitching_mode and not bottom_faces:
+                return None
+
             all_faces = np.vstack([np.asarray(m.faces, dtype=np.int64), np.asarray(wall_faces, dtype=np.int64)] + ([np.asarray(bottom_faces, dtype=np.int64)] if bottom_faces else []))
             solid = trimesh.Trimesh(vertices=np.asarray(new_vertices, dtype=float), faces=all_faces, process=True)
             try:
@@ -1531,15 +1778,21 @@ def create_solid_terrain(
             return None
 
     # Try boundary-based solidify first (best quality)
-    # NOTE: When we have a zone polygon (hex tile), we intentionally skip this path so side walls are flat
-    # and strictly follow the polygon edges (better stitching + no ribbed walls).
-    if zone_polygon is None:
-        try:
-            solid_boundary = _solidify_from_boundary(terrain_top, min_z)
-            if solid_boundary is not None:
-                return solid_boundary
-        except Exception:
-            pass
+    # Stitching mode is STRICT: we must not invent walls/bottoms via bbox fallbacks,
+    # otherwise adjacent tiles can diverge and the seam becomes crooked.
+    if stitching_mode:
+        solid_boundary = _solidify_from_boundary(terrain_top, min_z)
+        if solid_boundary is None:
+            raise ValueError("stitching_mode: failed to solidify terrain from top boundary (would fall back to bbox walls).")
+        return solid_boundary
+    else:
+        if zone_polygon is None:
+            try:
+                solid_boundary = _solidify_from_boundary(terrain_top, min_z)
+                if solid_boundary is not None:
+                    return solid_boundary
+            except Exception:
+                pass
 
     # Отримуємо межі рельєфу
     bounds = terrain_top.bounds
@@ -1967,23 +2220,11 @@ def create_solid_terrain(
         except Exception as e:
             print(f"[WARN] Failed to fix normals: {e}")
         
-        # Перевірка та виправлення watertight
+        # IMPORTANT: avoid aggressive hole filling/repair for zone tiles.
+        # These operations can invent large "sheet" triangles (the mysterious walls you saw).
+        # For stitched hex tiles we prefer a clean, predictable mesh (bottom + explicit walls).
         if not solid_terrain.is_watertight:
-            try:
-                # Спочатку намагаємося заповнити дірки
-                solid_terrain.fill_holes()
-                # Якщо все ще не watertight, використовуємо repair
-                if not solid_terrain.is_watertight:
-                    try:
-                        # Виправляємо mesh за допомогою repair
-                        trimesh.repair.fix_normals(solid_terrain)
-                        trimesh.repair.fix_winding(solid_terrain)
-                        # Повторне об'єднання вершин після repair
-                        solid_terrain.merge_vertices(merge_tex=True, merge_norm=True)
-                    except Exception as repair_e:
-                        print(f"[WARN] Failed to repair mesh: {repair_e}")
-            except Exception as e:
-                print(f"[WARN] Failed to fill holes in solid terrain: {e}")
+            print("[WARN] Solid terrain is not watertight; skipping fill_holes/repair to avoid phantom walls.")
         
         # Фінальна валідація
         if len(solid_terrain.vertices) == 0 or len(solid_terrain.faces) == 0:

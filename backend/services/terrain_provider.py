@@ -7,6 +7,132 @@ from scipy.interpolate import RegularGridInterpolator
 from typing import Optional, Tuple
 
 
+class TerrainSurfaceSampler:
+    """
+    Samples Z from an arbitrary terrain *surface mesh* (top surface) by interpolating
+    within triangles in XY.
+
+    This is used to drape overlays (roads/parks/water) onto the *actual* terrain mesh
+    surface when the terrain was built via polygon-aware triangulation (stitching mode),
+    where a heightfield-grid interpolator can diverge near boundaries/steep areas.
+    """
+
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray):
+        v = np.asarray(vertices, dtype=float)
+        f = np.asarray(faces, dtype=np.int64)
+        if v.ndim != 2 or v.shape[1] < 3 or f.ndim != 2 or f.shape[1] != 3:
+            raise ValueError("TerrainSurfaceSampler: invalid vertices/faces")
+        if len(v) == 0 or len(f) == 0:
+            raise ValueError("TerrainSurfaceSampler: empty mesh")
+
+        self.v = v[:, :3].copy()
+        self.f = f[:, :3].copy()
+
+        # Precompute per-face XY bounds for spatial lookup
+        tri = self.v[self.f]  # (F,3,3)
+        xy = tri[:, :, :2]
+        self.face_min = np.min(xy, axis=1)  # (F,2)
+        self.face_max = np.max(xy, axis=1)  # (F,2)
+
+        # Optional rtree index for fast candidate lookup
+        self._rtree = None
+        try:
+            import importlib
+            rtree_mod = importlib.import_module("rtree")
+            index_mod = importlib.import_module("rtree.index")
+            RTreeIndex = getattr(index_mod, "Index", None)
+            if RTreeIndex is None:
+                raise ImportError("rtree.index.Index not found")
+
+            props = getattr(rtree_mod, "index").Property()
+            props.dimension = 2
+            idx = RTreeIndex(properties=props)  # type: ignore[misc]
+            for fi in range(len(self.f)):
+                mn = self.face_min[fi]
+                mx = self.face_max[fi]
+                # Skip degenerate bounds
+                if not np.isfinite(mn).all() or not np.isfinite(mx).all():
+                    continue
+                if (mx[0] - mn[0]) < 1e-12 and (mx[1] - mn[1]) < 1e-12:
+                    continue
+                idx.insert(int(fi), (float(mn[0]), float(mn[1]), float(mx[0]), float(mx[1])))
+            self._rtree = idx
+        except Exception:
+            self._rtree = None
+
+    @staticmethod
+    def _barycentric_z(pxy: np.ndarray, txy: np.ndarray, tz: np.ndarray, eps: float = 1e-10) -> Optional[float]:
+        """
+        Compute barycentric interpolation of z at point p inside triangle.
+        pxy: (2,), txy: (3,2), tz: (3,)
+        Returns z if inside (with epsilon), else None.
+        """
+        x, y = float(pxy[0]), float(pxy[1])
+        x1, y1 = float(txy[0, 0]), float(txy[0, 1])
+        x2, y2 = float(txy[1, 0]), float(txy[1, 1])
+        x3, y3 = float(txy[2, 0]), float(txy[2, 1])
+
+        det = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if abs(det) < eps:
+            return None
+        w1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / det
+        w2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / det
+        w3 = 1.0 - w1 - w2
+
+        if (w1 >= -eps) and (w2 >= -eps) and (w3 >= -eps):
+            return float(w1 * float(tz[0]) + w2 * float(tz[1]) + w3 * float(tz[2]))
+        return None
+
+    def sample(self, points_xy: np.ndarray) -> np.ndarray:
+        pts = np.asarray(points_xy, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] < 2:
+            return np.array([], dtype=float)
+        pts = pts[:, :2]
+
+        out = np.full((len(pts),), np.nan, dtype=float)
+        tri = self.v[self.f]  # (F,3,3)
+
+        for i in range(len(pts)):
+            px, py = float(pts[i, 0]), float(pts[i, 1])
+            if not np.isfinite(px) or not np.isfinite(py):
+                continue
+
+            # Candidate faces by bbox lookup
+            cand = None
+            if self._rtree is not None:
+                try:
+                    cand = list(self._rtree.intersection((px, py, px, py)))
+                except Exception:
+                    cand = None
+            if not cand:
+                # Fallback: brute-force scan a small number of nearest bbox faces
+                # (still much cheaper than scanning all faces for typical sizes)
+                dx = np.maximum(0.0, np.maximum(self.face_min[:, 0] - px, px - self.face_max[:, 0]))
+                dy = np.maximum(0.0, np.maximum(self.face_min[:, 1] - py, py - self.face_max[:, 1]))
+                d2 = dx * dx + dy * dy
+                # Take a small batch of candidates
+                k = min(64, len(d2))
+                cand = np.argpartition(d2, k - 1)[:k].tolist() if k > 0 else []
+
+            pxy = np.array([px, py], dtype=float)
+            found = None
+            for fi in cand:
+                try:
+                    t = tri[int(fi)]
+                    txy = t[:, :2]
+                    tz = t[:, 2]
+                    z = self._barycentric_z(pxy, txy, tz, eps=1e-10)
+                    if z is not None:
+                        found = z
+                        break
+                except Exception:
+                    continue
+            if found is not None:
+                out[i] = float(found)
+
+        return out
+
+
 class TerrainProvider:
     """
     Надає інтерполяцію висот рельєфу для будь-якої точки (X, Y)
@@ -47,6 +173,9 @@ class TerrainProvider:
             fill_value=self.min_z,
             method='linear'
         )
+
+        # Optional triangle-surface sampler (set by terrain_generator when available)
+        self.surface_sampler: Optional[TerrainSurfaceSampler] = None
 
     def _heights_on_terrain_triangles(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
         """
@@ -164,6 +293,35 @@ class TerrainProvider:
                 return heights
             except Exception:
                 return np.full(len(points), self.min_z)
+
+    def get_surface_heights_for_points(self, points: np.ndarray) -> np.ndarray:
+        """
+        Returns heights sampled from the final terrain *surface mesh* when available.
+        Falls back to the regular heightfield interpolation otherwise.
+        """
+        if points is None:
+            return np.array([], dtype=float)
+        pts = np.asarray(points)
+        if pts.ndim != 2 or pts.shape[1] < 2:
+            return np.array([], dtype=float)
+
+        sampler = getattr(self, "surface_sampler", None)
+        if sampler is None:
+            return self.get_heights_for_points(pts)
+
+        try:
+            z = sampler.sample(pts[:, :2])
+            # Fill any NaN gaps with heightfield interpolation (robust)
+            if z is None or len(z) != len(pts):
+                return self.get_heights_for_points(pts)
+            miss = ~np.isfinite(z)
+            if np.any(miss):
+                z2 = self.get_heights_for_points(pts[miss])
+                z = np.asarray(z, dtype=float)
+                z[miss] = np.asarray(z2, dtype=float).reshape(-1)
+            return np.asarray(z, dtype=float)
+        except Exception:
+            return self.get_heights_for_points(pts)
     
     def get_bounds(self) -> Tuple[float, float, float, float]:
         """

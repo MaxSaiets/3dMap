@@ -121,6 +121,7 @@ def process_water_surface(
     depth_meters: float,
     terrain_provider: Optional[TerrainProvider] = None,
     global_center: Optional[GlobalCenter] = None,
+    surface_offset_m: float = 0.0,
 ) -> Optional[trimesh.Trimesh]:
     """
     Creates a thin "water surface" mesh for preview / multi-color printing.
@@ -287,77 +288,32 @@ def process_water_surface(
                 # (до вирізання depression), а не дно depression
                 # Якщо є original_heights_provider - використовуємо його, інакше - звичайний
                 if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
-                    # РОЗУМНА ЛОГІКА ДЛЯ ВОДИ:
-                    # 1. Отримуємо оригінальні висоти рельєфу (до depression)
-                    # 2. Отримуємо висоти рельєфу з depression (після вирізання)
-                    # 3. Розраховуємо оптимальний рівень води, щоб вона виступала на землю лише на 0.1 мм (після масштабування)
-                    # 4. Вода має бути трохи вище дна depression, але не накладатися на землю
-                    
-                    # Обчислюємо висоти для КОЖНОЇ точки окремо (як з рельєфом)
+                    # Stable water placement:
+                    # - Choose a single water level for the polygon (low quantile of original ground).
+                    # - Clamp per-vertex so water never rises above shoreline (original ground - eps).
+                    # - Ensure water still covers the carved depression floor by at least a tiny amount.
                     original_ground = terrain_provider.original_heights_provider.get_heights_for_points(points_array)
-                    depressed_ground = terrain_provider.get_heights_for_points(points_array)
-                    
-                    # Аналізуємо різницю між оригінальним рельєфом та depression
-                    depression_depth = original_ground - depressed_ground
-                    min_depression = float(np.min(depression_depth))
-                    max_depression = float(np.max(depression_depth))
-                    avg_depression = float(np.mean(depression_depth))
-                    
-                    # Розраховуємо оптимальний рівень води
-                    # Вода має виступати на землю лише на 0.1 мм після масштабування
-                    # Для моделі 100мм це означає ~0.0001м в реальних одиницях (дуже мала величина)
-                    # Але для кращого вигляду зробимо воду трохи вище дна depression
-                    
-                    # ВИПРАВЛЕНА ЛОГІКА: Вода має бути на рівні МІНІМАЛЬНОГО оригінального рельєфу (нижня точка русла)
-                    # або трохи нижче, щоб не виступати над землею
-                    min_original_ground = float(np.min(original_ground))
-                    max_original_ground = float(np.max(original_ground))
-                    
-                    # Вода має бути на рівні найнижчої точки оригінального рельєфу (русло річки)
-                    # Мінус невеликий offset для безпеки (щоб не виступала над берегами)
-                    water_protrusion_m = 0.01  # Мінімальний виступ: 0.01м (1см) - майже на рівні землі
-                    
-                    # Використовуємо мінімальну висоту оригінального рельєфу як базовий рівень
-                    # Це забезпечить, що вода буде на рівні русла, а не вище берегів
-                    base_water_level = min_original_ground - 0.02  # 2см нижче найнижчої точки (безпека)
-                    
-                    # Розраховуємо рівень поверхні води для кожної точки
-                    # Вода має бути на рівні дна depression + мінімальний protrusion
-                    # Але не вище оригінального рельєфу в цій точці
+                    depressed_ground = terrain_provider.get_surface_heights_for_points(points_array)
+
+                    shore_eps = 0.02  # 2cm safety to avoid spilling onto land / z-fighting
+                    min_cover = max(0.01, min(0.20, float(depth_meters) * 0.02))  # 1cm..20cm
+                    try:
+                        water_level = float(np.quantile(original_ground, 0.10)) - shore_eps
+                    except Exception:
+                        water_level = float(np.min(original_ground)) - shore_eps
+
+                    # Clamp: floor+cover <= surface <= shoreline
                     surface_levels = np.minimum(
-                        depressed_ground + water_protrusion_m,  # Дно depression + protrusion
-                        original_ground - 0.02  # Але не вище оригінального рельєфу мінус 2см
+                        np.maximum(depressed_ground + float(min_cover), float(water_level)),
+                        original_ground - shore_eps,
                     )
-                    
-                    # Додаткова перевірка: вода не повинна бути вище мінімального рівня
-                    surface_levels = np.maximum(surface_levels, base_water_level)
-                    
-                    # ФІНАЛЬНА ПЕРЕВІРКА: Переконаємося, що вода виступає на землю лише на потрібну величину
-                    # Для моделі 100мм, 0.1 мм = 0.0001м в реальних одиницях (дуже мала величина)
-                    # Але для кращого вигляду та друку, зробимо воду трохи вище дна depression
-                    # Розраховуємо різницю між поверхнею води та дном depression
-                    water_above_depression = surface_levels - depressed_ground
-                    min_protrusion = float(np.min(water_above_depression))
-                    max_protrusion = float(np.max(water_above_depression))
-                    
-                    # Якщо protrusion занадто великий - зменшуємо
-                    if max_protrusion > 0.1:  # Більше 0.1м - занадто багато
-                        water_protrusion_m = 0.01  # Зменшуємо до 0.01м (мінімальний виступ)
-                        surface_levels = np.minimum(
-                            depressed_ground + water_protrusion_m,  # Дно depression + protrusion
-                            original_ground - 0.02  # Але не вище оригінального рельєфу мінус 2см
-                        )
-                        surface_levels = np.maximum(surface_levels, base_water_level)
-                        # print(f"[DEBUG] Water protrusion занадто великий ({max_protrusion:.3f}м), зменшено до {water_protrusion_m:.3f}м")
-                    
-                    # print(f"[DEBUG] Water analysis: depression=[{min_depression:.3f}, {max_depression:.3f}], avg={avg_depression:.3f}м")
-                    # print(f"[DEBUG] Water surface levels: range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}], median={np.median(surface_levels):.3f}")
-                    # print(f"[DEBUG] Water protrusion над дном depression: min={min_protrusion:.3f}м, max={max_protrusion:.3f}м, target={water_protrusion_m:.3f}м")
+                    if float(surface_offset_m) != 0.0:
+                        surface_levels = surface_levels + float(surface_offset_m)
                 else:
                     # Fallback: використовуємо дно depression + глибина
-                    ground = terrain_provider.get_heights_for_points(points_array if len(points_array) > 0 else v[:, :2])
+                    ground = terrain_provider.get_surface_heights_for_points(points_array if len(points_array) > 0 else v[:, :2])
                     # Дно depression + глибина = рівень поверхні води
-                    surface_levels = ground + float(depth_meters)
+                    surface_levels = ground + float(depth_meters) + float(surface_offset_m)
                     print(f"[WARN] Використовується fallback для water surface: ground range=[{np.min(ground):.3f}, {np.max(ground):.3f}], surface range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}]")
                 
                 # КРИТИЧНЕ ВИПРАВЛЕННЯ: old_z від extrude_polygon - це товщина води (0 до thickness_m)
@@ -400,7 +356,7 @@ def process_water_surface(
                 max_water_z = float(np.max(v[:, 2]))
                 
                 # Отримуємо висоти рельєфу (з depression) для порівняння
-                ground_depressed = terrain_provider.get_heights_for_points(v[:, :2])
+                ground_depressed = terrain_provider.get_surface_heights_for_points(v[:, :2])
                 min_ground_depressed = float(np.min(ground_depressed))
                 max_ground_depressed = float(np.max(ground_depressed))
                 
@@ -527,7 +483,7 @@ def create_water_depression(
         if terrain_provider is not None and len(mesh.vertices) > 0:
             verts = mesh.vertices.copy()
             old_z = verts[:, 2].copy()
-            ground = terrain_provider.get_heights_for_points(verts[:, :2])
+            ground = terrain_provider.get_surface_heights_for_points(verts[:, :2])
             verts[:, 2] = ground + old_z
             mesh.vertices = verts
 

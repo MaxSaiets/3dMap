@@ -78,6 +78,8 @@ async function loadColoredPartsFromBlobs(blobs: Partial<Record<"base" | "roads" 
   for (const [part, blob] of entries) {
     if (!blob) continue;
     const mesh = await loadStlAsMesh(blob, colors[part as string] ?? 0x888888);
+    // mark part type for later preview toggles (e.g. shading)
+    (mesh as any).userData = { ...(mesh as any).userData, part };
     const mat = mesh.material as THREE.MeshStandardMaterial;
     // Налаштування матеріалів для кращої читабельності
     if (part === "base") {
@@ -449,7 +451,7 @@ function FreeFlyControls({
 }
 
 function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
-  const { downloadUrl, activeTaskId, exportFormat, showAllZones, taskIds, taskStatuses, batchZoneMetaByTaskId } = useGenerationStore();
+  const { downloadUrl, activeTaskId, exportFormat, showAllZones, taskIds, taskStatuses, batchZoneMetaByTaskId, terrainSmoothShading } = useGenerationStore();
   const [model, setModel] = useState<THREE.Group | THREE.Mesh | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -881,6 +883,25 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
     loadModel();
   }, [downloadUrl, activeTaskId, exportFormat, showAllZones]);
 
+  // Terrain shading toggle: seam lines on slopes are often just normal discontinuity between separate tiles.
+  useEffect(() => {
+    if (!model) return;
+    (model as any).traverse?.((child: any) => {
+      if (!(child instanceof THREE.Mesh)) return;
+      if (child.userData?.part !== "base") return;
+      const mat = child.material as THREE.MeshStandardMaterial | undefined;
+      if (!mat) return;
+      // smooth shading = vertex normals; can show a seam line between separate meshes
+      mat.flatShading = !terrainSmoothShading;
+      mat.needsUpdate = true;
+      try {
+        (child.geometry as THREE.BufferGeometry | undefined)?.computeVertexNormals();
+      } catch {
+        // ignore
+      }
+    });
+  }, [model, terrainSmoothShading]);
+
   if (loading) {
     return (
       <>
@@ -1030,7 +1051,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
 }
 
 export function Preview3D() {
-  const { downloadUrl, isGenerating, progress } = useGenerationStore();
+  const { downloadUrl, isGenerating, progress, terrainSmoothShading, setTerrainSmoothShading } = useGenerationStore();
   const [gridVisible, setGridVisible] = useState(true);
   const [axesVisible, setAxesVisible] = useState(true);
   const [rotateMode, setRotateMode] = useState<RotateMode>("camera");
@@ -1102,6 +1123,16 @@ export function Preview3D() {
               />
             </div>
           )}
+          <div className="flex items-center justify-between gap-3 pt-1">
+            <span>Terrain</span>
+            <button
+              className="px-2 py-1 rounded bg-white/10 hover:bg-white/20"
+              onClick={() => setTerrainSmoothShading(!terrainSmoothShading)}
+              title="Smooth = плавні нормалі (може бути видимий шов між тайлами). Flat = шов майже не видно (але видно грані)."
+            >
+              {terrainSmoothShading ? "Smooth" : "Flat"}
+            </button>
+          </div>
         </div>
       </div>
       {isGenerating && (

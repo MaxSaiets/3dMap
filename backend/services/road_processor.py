@@ -7,7 +7,7 @@ import osmnx as ox
 import trimesh
 import numpy as np
 import warnings
-from shapely.ops import unary_union, transform
+from shapely.ops import unary_union, transform, snap
 from shapely.geometry import Polygon, MultiPolygon, box, LineString, Point
 from typing import Optional, List, Tuple
 import geopandas as gpd
@@ -138,8 +138,8 @@ def create_bridge_supports(
                     [x, y]  # Центр
                 ])
                 
-                # Отримуємо висоти для всіх точок семплінгу
-                ground_zs = terrain_provider.get_heights_for_points(sample_points)
+                # Отримуємо висоти для всіх точок семплінгу (по реальній поверхні terrain mesh, якщо доступно)
+                ground_zs = terrain_provider.get_surface_heights_for_points(sample_points)
                 ground_z = float(np.mean(ground_zs))  # Середнє значення для стабільності
                 min_ground_z_sample = float(np.min(ground_zs))  # Мінімальне для перевірки води
                 
@@ -194,7 +194,7 @@ def detect_bridges(
     water_geometries: Optional[List] = None,
     bridge_tag: str = 'bridge',
     bridge_buffer_m: float = 12.0,  # buffer around bridge centerline to mark only the bridge area
-) -> List[Tuple[object, float]]:
+) -> List[Tuple[object, object, float]]:
     """
     Визначає мости: дороги, які перетинають воду або мають тег bridge=yes
     
@@ -204,7 +204,10 @@ def detect_bridges(
         bridge_tag: Тег для визначення мостів в OSM
         
     Returns:
-        Список кортежів (bridge_area_geometry, bridge_height_offset) - геометрія ОБЛАСТІ моста та зміщення висоти
+        List of tuples (bridge_line_geometry, bridge_area_geometry, bridge_height_offset).
+        - bridge_line_geometry: line-like geometry used for ramping (ideally LineString)
+        - bridge_area_geometry: buffered polygon area used to intersect road polygons
+        - bridge_height_offset: suggested lift/clearance (world meters)
     """
     bridges = []
     
@@ -266,6 +269,21 @@ def detect_bridges(
                 # OSM sometimes uses "viaduct" etc as bridge values
                 return s in {"yes", "true", "1", "viaduct", "aqueduct"} or s.startswith("viaduct")
 
+            # Helper: parse numeric layer
+            def _layer_value(v) -> Optional[float]:
+                if v is None:
+                    return None
+                if isinstance(v, (list, tuple, set)):
+                    for x in v:
+                        lv = _layer_value(x)
+                        if lv is not None:
+                            return lv
+                    return None
+                try:
+                    return float(str(v).strip())
+                except Exception:
+                    return None
+
             # 1. Перевірка тегу bridge в OSM
             if bridge_tag in row and _is_bridge_value(row.get(bridge_tag)):
                 is_bridge = True
@@ -286,6 +304,18 @@ def detect_bridges(
                     if _is_bridge_value(row.get("bridge:structure")) or _is_bridge_value(row.get("man_made")):
                         is_bridge = True
                         bridge_height = max(bridge_height, 2.5)
+                except Exception:
+                    pass
+
+            # 1.2 Layer-based elevation (for viaducts/overpasses even without water)
+            # NOTE: we treat positive layer as "elevated" but keep the lift modest.
+            if not is_bridge:
+                try:
+                    layer = _layer_value(row.get("layer"))
+                    if layer is not None and layer >= 1.0:
+                        is_bridge = True
+                        # ~3m per layer is a reasonable visual cue in world units
+                        bridge_height = max(bridge_height, float(layer) * 3.0)
                 except Exception:
                     pass
             
@@ -327,25 +357,34 @@ def detect_bridges(
                 # IMPORTANT: return an AREA geometry for bridge marking.
                 # Using raw edge LineString causes almost all buffered road polygons to "intersect a bridge".
                 try:
-                    bridge_area = geom
+                    bridge_line = geom
                     # If bridge is detected by water intersection, constrain to the water-crossing portion.
                     if water_union is not None:
                         try:
                             inter = geom.intersection(water_union)
                             if inter is not None and not inter.is_empty:
-                                bridge_area = inter
+                                bridge_line = inter
                         except Exception:
                             pass
+                    # If MultiLineString -> take the longest part for ramp projection
+                    try:
+                        if getattr(bridge_line, "geom_type", "") == "MultiLineString":
+                            bridge_line = max(list(bridge_line.geoms), key=lambda g: getattr(g, "length", 0.0), default=geom)
+                    except Exception:
+                        bridge_line = geom
                     # Buffer into an area (polygon) so later intersection is spatially tight.
                     try:
-                        bridge_area = bridge_area.buffer(float(bridge_buffer_m), cap_style=2, join_style=2)
+                        bridge_area = bridge_line.buffer(float(bridge_buffer_m), cap_style=2, join_style=2)
                     except Exception:
-                        bridge_area = geom.buffer(float(bridge_buffer_m))
+                        bridge_area = bridge_line.buffer(float(bridge_buffer_m))
                     if bridge_area is not None and not bridge_area.is_empty:
-                        bridges.append((bridge_area, bridge_height))
+                        bridges.append((bridge_line, bridge_area, bridge_height))
                 except Exception:
                     # Fallback to raw geometry if buffering fails
-                    bridges.append((geom, bridge_height))
+                    try:
+                        bridges.append((geom, geom.buffer(float(bridge_buffer_m)), bridge_height))
+                    except Exception:
+                        pass
                 
         except Exception as e:
             print(f"[WARN] Помилка обробки дороги для визначення моста: {e}")
@@ -526,6 +565,12 @@ def process_roads(
             # If clip_polygon came in UTM, convert too
             clip_poly_local = _to_local_geom(clip_poly_local)
             merged_roads = merged_roads.intersection(clip_poly_local)
+            # Snap cut edges to the zone boundary to keep border coordinates stable across adjacent tiles.
+            # This reduces tiny per-tile numerical differences that show up as Z seams after draping.
+            try:
+                merged_roads = snap(merged_roads, clip_poly_local.boundary, 1e-6)
+            except Exception:
+                pass
             if merged_roads is None or merged_roads.is_empty:
                 return None
         except Exception:
@@ -608,7 +653,7 @@ def process_roads(
     bridges = detect_bridges(G_roads, water_geometries=water_geoms_local)
     
     # Precompute bridge union for splitting polygons: generate bridge deck only where needed.
-    bridge_areas = [g for g, _h in (bridges or []) if g is not None and not getattr(g, "is_empty", False)]
+    bridge_areas = [area for _line, area, _h in (bridges or []) if area is not None and not getattr(area, "is_empty", False)]
     bridge_union = None
     if bridge_areas:
         try:
@@ -638,7 +683,7 @@ def process_roads(
                         return [gg for gg in g.geoms if getattr(gg, "geom_type", "") == "Polygon"]
                     return []
 
-                def _process_one(poly_part: Polygon, is_bridge: bool, bridge_height_offset: float):
+                def _process_one(poly_part: Polygon, is_bridge: bool, bridge_height_offset: float, bridge_line=None):
                     # embed not > road height
                     rh = max(float(road_height), 0.0001)
                     re = float(road_embed) if road_embed is not None else 0.0
@@ -666,7 +711,8 @@ def process_roads(
                     if terrain_provider is not None:
                         vertices = mesh.vertices.copy()
                         old_z = vertices[:, 2].copy()
-                        ground_z_values = terrain_provider.get_heights_for_points(vertices[:, :2])
+                        # IMPORTANT: sample from the actual terrain surface mesh when available
+                        ground_z_values = terrain_provider.get_surface_heights_for_points(vertices[:, :2])
 
                         if is_bridge:
                             water_level_under_bridge = None
@@ -678,13 +724,55 @@ def process_roads(
                                 max_water_level = float(np.max(water_levels_per_point))
 
                                 min_clearance_above_water = max(float(bridge_height_offset), float(rh) * 2.0)
-                                bridge_base_z_per_point = water_levels_per_point + min_clearance_above_water
                                 bridge_base_z_per_point = np.maximum(
-                                    bridge_base_z_per_point,
-                                    ground_z_values + float(bridge_height_offset)
+                                    water_levels_per_point + min_clearance_above_water,
+                                    ground_z_values + float(bridge_height_offset),
                                 )
+                                # Flat bridge deck: use a single base Z (median) for stability/printability
                                 bridge_base_z = float(np.median(bridge_base_z_per_point))
-                                vertices[:, 2] = bridge_base_z + old_z
+
+                                # Compute ramp factor based on position along bridge_line (0 at ends, 1 in middle)
+                                ramp_t = None
+                                try:
+                                    if bridge_line is not None and getattr(bridge_line, "length", 0.0) and float(bridge_line.length) > 1e-6:
+                                        from shapely.geometry import Point as _Pt
+                                        line_len = float(bridge_line.length)
+                                        # Desired ramp length scales with lift, but capped by half bridge length
+                                        desired_ramp = max(10.0, float(bridge_height_offset) * 8.0)
+                                        ramp_len = min(desired_ramp, max(0.5, line_len * 0.5))
+
+                                        # Use unique XY points to reduce shapely calls (top/bottom/side verts repeat)
+                                        xy = vertices[:, :2].astype(float, copy=False)
+                                        key = np.round(xy, 6)
+                                        _, inv = np.unique(key, axis=0, return_inverse=True)
+                                        uniq = np.unique(key, axis=0)
+                                        tuniq = np.zeros((len(uniq),), dtype=float)
+                                        for ui, (xv, yv) in enumerate(uniq):
+                                            s = float(bridge_line.project(_Pt(float(xv), float(yv))))
+                                            dist_to_end = min(s, max(0.0, line_len - s))
+                                            t = float(np.clip(dist_to_end / ramp_len, 0.0, 1.0))
+                                            # smoothstep
+                                            t = t * t * (3.0 - 2.0 * t)
+                                            tuniq[ui] = t
+                                        ramp_t = tuniq[inv]
+                                except Exception:
+                                    ramp_t = None
+
+                                # Blend between ground-based base and bridge base near ends to avoid "step walls"
+                                # Non-bridge baseline uses adaptive embed (same as below)
+                                min_ground_z = float(np.min(ground_z_values))
+                                max_ground_z = float(np.max(ground_z_values))
+                                slope = max_ground_z - min_ground_z
+                                adaptive_embed = float(re)
+                                if slope > float(re) * 2.0:
+                                    adaptive_embed = float(re) * (1.0 - min(0.5, (slope - float(re) * 2.0) / (slope + 1.0)))
+                                base_nonbridge = ground_z_values - adaptive_embed
+
+                                if ramp_t is None:
+                                    base = np.full((len(vertices),), bridge_base_z, dtype=float)
+                                else:
+                                    base = base_nonbridge * (1.0 - ramp_t) + float(bridge_base_z) * ramp_t
+                                vertices[:, 2] = base + old_z
 
                                 print(f"  [BRIDGE] Розрахунок: water_level=[{min_water_level:.2f}, {median_water_level:.2f}, {max_water_level:.2f}]м (median), clearance={min_clearance_above_water:.2f}м, bridge_base={bridge_base_z:.2f}м (median)")
                                 water_level_under_bridge = median_water_level
@@ -760,7 +848,7 @@ def process_roads(
                 parts_to_process: List[Tuple[Polygon, bool, float]] = []
                 if bridges and bridge_union is not None:
                     # bridge pieces per bridge area
-                    for bridge_area, bridge_h in bridges:
+                    for bridge_line, bridge_area, bridge_h in bridges:
                         if bridge_area is None or bridge_area.is_empty:
                             continue
                         try:
@@ -772,7 +860,7 @@ def process_roads(
                                 continue
                             if float(getattr(g, "area", 0.0) or 0.0) < 1.0:
                                 continue
-                            parts_to_process.append((g, True, float(bridge_h) * float(bridge_height_multiplier)))
+                            parts_to_process.append((g, True, float(bridge_h) * float(bridge_height_multiplier), bridge_line))
                     # normal remainder
                     try:
                         remainder = poly.difference(bridge_union)
@@ -783,13 +871,13 @@ def process_roads(
                             continue
                         if float(getattr(g, "area", 0.0) or 0.0) < 1.0:
                             continue
-                        parts_to_process.append((g, False, 0.0))
+                        parts_to_process.append((g, False, 0.0, None))
                 else:
-                    parts_to_process = [(poly, False, 0.0)]
+                    parts_to_process = [(poly, False, 0.0, None)]
                 
                 # Process parts
-                for part_poly, is_bridge, bridge_height_offset in parts_to_process:
-                    _process_one(part_poly, is_bridge, bridge_height_offset)
+                for part_poly, is_bridge, bridge_height_offset, bridge_line in parts_to_process:
+                    _process_one(part_poly, is_bridge, bridge_height_offset, bridge_line=bridge_line)
                 
             except Exception as extrude_error:
                 print(f"  Помилка екструзії полігону: {extrude_error}")

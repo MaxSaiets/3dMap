@@ -64,8 +64,8 @@ def fetch_city_data(
 
     bbox = (north, south, east, west)
     
-    # Налаштування osmnx для кращої продуктивності
-    ox.settings.use_cache = True
+    # Налаштування osmnx: кеш ВИМКНЕНО для меншого використання пам'яті
+    ox.settings.use_cache = False
     ox.settings.log_console = False
     
     # 1. Будівлі (+ building:part для більшої деталізації)

@@ -21,4 +21,5 @@ Pillow==10.2.0
 pyrosm==0.6.2
 pyarrow==16.1.0
 pyogrio==0.10.0
+triangle==20250106
 

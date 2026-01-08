@@ -119,8 +119,6 @@ class GenerationRequest(BaseModel):
     terrain_z_scale: float = 3.0  # Збільшено для кращої видимості рельєфу
     # Тонка основа для друку: за замовчуванням 1мм (користувач може змінити).
     terrain_base_thickness_mm: float = Field(default=1.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
-    # Тонка основа для друку: за замовчуванням 1мм (користувач може змінити).
-    terrain_base_thickness_mm: float = Field(default=1.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
     # Деталізація рельєфу
     # - terrain_resolution: кількість точок по осі (mesh деталь). Вища = детальніше, повільніше.
     terrain_resolution: int = Field(default=350, ge=80, le=600)  # Висока деталізація для максимально плавного рельєфу
@@ -1017,8 +1015,13 @@ async def generate_model_task(
                     scale_factor = float(request.model_size_mm) / float(avg_xy)
                     print(f"[DEBUG] Scale factor (polygon) для зони: {scale_factor:.6f} мм/м (reference: {sx:.1f} x {sy:.1f} м)")
             if scale_factor is None:
-                size_x = float(maxx_local - minx_local)
-                size_y = float(maxy_local - miny_local)
+                # Fallback: use bbox_meters (already in local coords) if local vars are not available
+                try:
+                    size_x = float(bbox_meters[2] - bbox_meters[0])
+                    size_y = float(bbox_meters[3] - bbox_meters[1])
+                except Exception:
+                    size_x = 0.0
+                    size_y = 0.0
                 avg_xy = (size_x + size_y) / 2.0 if (size_x > 0 and size_y > 0) else max(size_x, size_y)
                 if avg_xy and avg_xy > 0:
                     scale_factor = float(request.model_size_mm) / float(avg_xy)
@@ -1027,30 +1030,12 @@ async def generate_model_task(
             print(f"[WARN] Помилка обчислення scale_factor: {e}")
             scale_factor = None
 
-        # 2) Контекстний bbox для OSM/Extras (padding навколо зони), щоб бачити мости/перетини біля межі.
-        # Фінальний меш все одно обріжемо строго по полігону зони.
-        ctx_north, ctx_south, ctx_east, ctx_west = request.north, request.south, request.east, request.west
-        try:
-            pad_m = float(getattr(request, "context_padding_m", 0.0) or 0.0)
-            if pad_m > 0 and global_center is not None:
-                # Конвертуємо bbox в UTM, розширюємо на pad_m, повертаємо назад в WGS84
-                x1, y1 = global_center.to_utm(ctx_west, ctx_south)
-                x2, y2 = global_center.to_utm(ctx_east, ctx_north)
-                minx = float(min(x1, x2) - pad_m)
-                maxx = float(max(x1, x2) + pad_m)
-                miny = float(min(y1, y2) - pad_m)
-                maxy = float(max(y1, y2) + pad_m)
-                lon_w, lat_s = global_center.to_wgs84(minx, miny)
-                lon_e, lat_n = global_center.to_wgs84(maxx, maxy)
-                ctx_north, ctx_south, ctx_east, ctx_west = float(lat_n), float(lat_s), float(lon_e), float(lon_w)
-                print(f"[DEBUG] Context bbox (+{pad_m:.0f}m): north={ctx_north:.6f}, south={ctx_south:.6f}, east={ctx_east:.6f}, west={ctx_west:.6f}")
-        except Exception as e:
-            print(f"[WARN] Не вдалося порахувати context bbox: {e}")
+        # 2) Завантаження даних ТІЛЬКИ для конкретної зони (без padding, без кешу)
+        # Дані будуть одразу обрізатись по полігону зони після завантаження
+        task.update_status("processing", 10, "Завантаження даних OSM для зони...")
 
-        task.update_status("processing", 10, "Завантаження даних OSM (з контекстом)...")
-
-        # 3) Завантаження даних (OSM/Extras) з контекстним bbox
-        gdf_buildings, gdf_water, G_roads = fetch_city_data(ctx_north, ctx_south, ctx_east, ctx_west)
+        # Завантажуємо дані ТІЛЬКИ для цієї зони (без padding для швидкості та меншого використання пам'яті)
+        gdf_buildings, gdf_water, G_roads = fetch_city_data(request.north, request.south, request.east, request.west)
 
         task.update_status("processing", 20, "Генерація рельєфу...")
         
@@ -1444,8 +1429,10 @@ async def generate_model_task(
             min_road_width_m = None
             try:
                 if scale_factor and scale_factor > 0:
-                    # Slightly thicker minimum so roads don't become hairlines on small models
-                    min_road_width_m = float(1.5) / float(scale_factor)  # 1.5mm мінімум
+                    # Minimum printable road width on the model -> world meters
+                    # Keep it small and cap to avoid absurd widths on huge bboxes.
+                    min_road_width_m = float(1.0) / float(scale_factor)  # 1.0mm мінімум
+                    min_road_width_m = float(min(min_road_width_m, 14.0))
             except Exception:
                 min_road_width_m = None
 
@@ -1457,7 +1444,7 @@ async def generate_model_task(
                 road_embed=float(road_embed_m) if road_embed_m is not None else 0.0,
                 merged_roads=merged_roads_for_mesh,
                 water_geometries=water_geoms_for_bridges_final,  # Для визначення мостів
-                bridge_height_multiplier=1.0,  # Множник висоти мостів
+                bridge_height_multiplier=1.5,  # make bridges/overpasses visibly elevated
                 global_center=gc_for_roads,
                 min_width_m=min_road_width_m,
                 clip_polygon=zone_polygon_local,  # pre-clip roads to zone BEFORE extrusion
@@ -1530,8 +1517,8 @@ async def generate_model_task(
         parks_mesh = None
         poi_mesh = None
         try:
-            # Extras також тягнемо з контекстним bbox, щоб не втрачати парки/POI на межі зони
-            gdf_green, gdf_pois = fetch_extras(ctx_north, ctx_south, ctx_east, ctx_west)
+            # Extras також завантажуємо тільки для цієї зони (без padding)
+            gdf_green, gdf_pois = fetch_extras(request.north, request.south, request.east, request.west)
             if scale_factor and scale_factor > 0 and terrain_provider is not None:
                 if request.include_parks and gdf_green is not None and not gdf_green.empty:
                     # ВАЖЛИВО: gdf_green приходить в UTM (метри), але terrain_provider + вся сцена вже в локальних координатах.
@@ -1582,6 +1569,7 @@ async def generate_model_task(
                         embed_m=float(request.parks_embed_mm) / float(scale_factor),
                         terrain_provider=terrain_provider,
                         global_center=None,  # already in local coords
+                        scale_factor=float(scale_factor),
                     )
                     if parks_mesh is None:
                         print(f"[WARN] process_green_areas повернув None для {len(gdf_green)} парків")

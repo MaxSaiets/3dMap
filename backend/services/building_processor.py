@@ -12,6 +12,7 @@ from services.terrain_provider import TerrainProvider
 from services.global_center import GlobalCenter
 import mapbox_earcut  # Для fallback методу extrude_building
 import re
+import gc  # For memory cleanup
 
 
 def process_buildings(
@@ -183,296 +184,195 @@ def process_buildings(
             mz = float(getattr(terrain_provider, "min_z", 0.0))
             return np.array([mz], dtype=float)
     
-    for idx, row in gdf_buildings.iterrows():
-        try:
-            geom = row.geometry
-            
-            # Пропускаємо невалідні геометрії
-            if geom is None:
-                continue
-            
-            # Перевіряємо валідність геометрії
+    # MEMORY OPTIMIZATION: Process buildings in batches to reduce RAM usage
+    # iterrows() is very slow and memory-intensive, so we process by indexing instead
+    # Adaptive batch size: smaller batches for large datasets to avoid memory exhaustion
+    total_buildings = len(gdf_buildings)
+    if total_buildings > 5000:
+        batch_size = 50  # Smaller batches for very large datasets
+    elif total_buildings > 2000:
+        batch_size = 75
+    else:
+        batch_size = 100  # Default batch size
+    
+    print(f"[INFO] Processing {total_buildings} buildings in batches of {batch_size}...")
+    
+    for batch_start in range(0, total_buildings, batch_size):
+        batch_end = min(batch_start + batch_size, total_buildings)
+        batch_indices = gdf_buildings.index[batch_start:batch_end]
+        batch_gdf = gdf_buildings.loc[batch_indices]
+        
+        print(f"[INFO] Processing buildings batch {batch_start//batch_size + 1}/{(total_buildings + batch_size - 1)//batch_size} ({batch_start+1}-{batch_end}/{total_buildings})...")
+        
+        # Process this batch
+        for idx in batch_indices:
             try:
-                if geom.is_empty:
+                row = gdf_buildings.loc[idx]
+                geom = row.geometry
+                
+                # Пропускаємо невалідні геометрії
+                if geom is None:
                     continue
-                if not geom.is_valid:
-                    # Спробуємо виправити геометрію
-                    geom = geom.buffer(0)
+                
+                # Перевіряємо валідність геометрії
+                try:
                     if geom.is_empty:
                         continue
-                    # Перевіряємо чи після виправлення геометрія має достатньо точок
-                    if hasattr(geom, 'exterior') and len(geom.exterior.coords) < 3:
-                        continue
-            except Exception as e:
-                print(f"  [WARN] Помилка перевірки геометрії будівлі {idx}: {e}")
-                continue
-            
-            # Отримуємо висоту будівлі
-            height = get_building_height(row, min_height) * height_multiplier
-
-            # Розраховуємо foundation_depth_eff заздалегідь (для використання в обох гілках)
-            foundation_depth_eff = max(float(foundation_depth), float(embed_depth), 0.1)
-            if max_foundation_depth is not None:
-                try:
-                    foundation_depth_eff = min(float(foundation_depth_eff), float(max_foundation_depth))
-                except Exception:
-                    pass
-            foundation_depth_eff = max(float(foundation_depth_eff), 0.05)
-
-            # Якщо рельєфу нема — не "топимо" будівлі фундаментом у нуль,
-            # достатньо мінімального embed (щоб не було щілини з плоскою базою).
-            if terrain_provider is None:
-                translate_z = -float(embed_depth) if float(embed_depth) > 0 else 0.0
-            else:
-                # СПРОЩЕНА ЛОГІКА: Беремо висоти безпосередньо з terrain mesh для координат будівлі
-                # ВАЖЛИВО: geom вже в локальних координатах (після перетворення через global_center)
-                # Рельєф під будівлями вже вирівняний через flatten_heightfield_under_buildings
-                heights = ground_heights_for_geom(geom)
+                    if not geom.is_valid:
+                        # Спробуємо виправити геометрію
+                        geom = geom.buffer(0)
+                        if geom.is_empty:
+                            continue
+                        # Перевіряємо чи після виправлення геометрія має достатньо точок
+                        if hasattr(geom, 'exterior') and len(geom.exterior.coords) < 3:
+                            continue
+                except Exception as e:
+                    print(f"  [WARN] Помилка перевірки геометрії будівлі {idx}: {e}")
+                    continue
                 
-                if heights.size == 0:
-                    # Якщо не вдалося отримати висоти - використовуємо fallback
+                # Отримуємо висоту будівлі
+                height = get_building_height(row, min_height) * height_multiplier
+
+                # Розраховуємо foundation_depth_eff заздалегідь (для використання в обох гілках)
+                foundation_depth_eff = max(float(foundation_depth), float(embed_depth), 0.1)
+                if max_foundation_depth is not None:
+                    try:
+                        foundation_depth_eff = min(float(foundation_depth_eff), float(max_foundation_depth))
+                    except Exception:
+                        pass
+                foundation_depth_eff = max(float(foundation_depth_eff), 0.05)
+
+                # Якщо рельєфу нема — не "топимо" будівлі фундаментом у нуль,
+                # достатньо мінімального embed (щоб не було щілини з плоскою базою).
+                if terrain_provider is None:
                     translate_z = -float(embed_depth) if float(embed_depth) > 0 else 0.0
-                    print(f"  [WARN] Будівля {idx}: не вдалося отримати висоти рельєфу")
                 else:
-                    # Використовуємо мінімальну висоту рельєфу (рельєф вирівняний, тому різниця мінімальна)
-                    ground_min = float(np.min(heights))
-                    ground_max = float(np.max(heights))
-                    ground_mean = float(np.mean(heights))
+                    # СПРОЩЕНА ЛОГІКА: Беремо висоти безпосередньо з terrain mesh для координат будівлі
+                    # ВАЖЛИВО: geom вже в локальних координатах (після перетворення через global_center)
+                    # Рельєф під будівлями вже вирівняний через flatten_heightfield_under_buildings
+                    heights = ground_heights_for_geom(geom)
                     
-                    # ВИПРАВЛЕННЯ: Правильна логіка з safety_margin та embed_depth
-                    # Мінімальний запас над землею (гарантуємо, що будівля не під землею)
-                    safety_margin = 0.1  # 10см запас
-                    
-                    # base_z - рівень підлоги будівлі
-                    # Якщо embed_depth > 0, то "втискаємо" будівлю в землю, але не нижче ground_min
-                    # Гарантуємо: base_z >= ground_min (підлога не нижче мінімальної висоти рельєфу)
-                    if float(embed_depth) > 0:
-                        # Втискаємо в землю, але не нижче ground_min
-                        base_z = max(ground_min - float(embed_depth), ground_min - safety_margin)
+                    if heights.size == 0:
+                        # Якщо не вдалося отримати висоти - використовуємо fallback
+                        translate_z = -float(embed_depth) if float(embed_depth) > 0 else 0.0
+                        print(f"  [WARN] Будівля {idx}: не вдалося отримати висоти рельєфу")
                     else:
-                        # Не втискаємо, додаємо запас
-                        base_z = ground_min + safety_margin
-                    
-                    # translate_z - Z координата нижньої точки будівлі (base_z мінус фундамент)
-                    translate_z = float(base_z) - float(foundation_depth_eff)
-                    
-                    # Додаткова перевірка: translate_z не повинен бути нижче ground_min - foundation_depth_eff
-                    # Це гарантує, що навіть з фундаментом будівля не буде під землею
-                    min_allowed_z = ground_min - float(foundation_depth_eff) + safety_margin
-                    if translate_z < min_allowed_z:
-                        translate_z = min_allowed_z
-                        base_z = translate_z + float(foundation_depth_eff)
-                    
-                    # Діагностика для складних випадків
-                    # if ground_max - ground_min > 0.5:
-                    #     print(f"  [DEBUG] Будівля {idx}: великий ухил рельєфу {ground_max - ground_min:.2f}м, "
-                    #           f"ground_min={ground_min:.2f}м, base_z={base_z:.2f}м, translate_z={translate_z:.2f}м")
-            
-            # Екструзія полігону (використовуємо trimesh.creation.extrude_polygon)
-            if isinstance(geom, Polygon):
-                try:
+                        # Використовуємо мінімальну висоту рельєфу (рельєф вирівняний, тому різниця мінімальна)
+                        ground_min = float(np.min(heights))
+                        ground_max = float(np.max(heights))
+                        ground_mean = float(np.mean(heights))
+                        
+                        # ВИПРАВЛЕННЯ: Правильна логіка з safety_margin та embed_depth
+                        # Мінімальний запас над землею (гарантуємо, що будівля не під землею)
+                        safety_margin = 0.1  # 10см запас
+                        
+                        # base_z - рівень підлоги будівлі
+                        # Якщо embed_depth > 0, то "втискаємо" будівлю в землю, але не нижче ground_min
+                        # Гарантуємо: base_z >= ground_min (підлога не нижче мінімальної висоти рельєфу)
+                        if float(embed_depth) > 0:
+                            # Втискаємо в землю, але не нижче ground_min
+                            base_z = max(ground_min - float(embed_depth), ground_min - safety_margin)
+                        else:
+                            # Не втискаємо, додаємо запас
+                            base_z = ground_min + safety_margin
+                        
+                        # translate_z - Z координата нижньої точки будівлі (base_z мінус фундамент)
+                        translate_z = float(base_z) - float(foundation_depth_eff)
+                        
+                        # Додаткова перевірка: translate_z не повинен бути нижче ground_min - foundation_depth_eff
+                        # Це гарантує, що навіть з фундаментом будівля не буде під землею
+                        min_allowed_z = ground_min - float(foundation_depth_eff) + safety_margin
+                        if translate_z < min_allowed_z:
+                            translate_z = min_allowed_z
+                            base_z = translate_z + float(foundation_depth_eff)
+                        
+                        # Діагностика для складних випадків
+                        # if ground_max - ground_min > 0.5:
+                        #     print(f"  [DEBUG] Будівля {idx}: великий ухил рельєфу {ground_max - ground_min:.2f}м, "
+                        #           f"ground_min={ground_min:.2f}м, base_z={base_z:.2f}м, translate_z={translate_z:.2f}м")
+                
+                # Екструзія полігону (використовуємо trimesh.creation.extrude_polygon)
+                if isinstance(geom, Polygon):
                     # Перевіряємо чи полігон має достатньо точок
                     if hasattr(geom, 'exterior') and len(geom.exterior.coords) < 3:
                         print(f"  [SKIP] Будівля {idx}: полігон має менше 3 точок")
                         continue
                     
-                    # Використовуємо вбудовану функцію trimesh для екструзії
-                    mesh = trimesh.creation.extrude_polygon(geom, height=height)
-                    
-                    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-                        print(f"  [WARN] Будівля {idx}: extrude_polygon повернув порожній mesh")
-                        # Fallback на старий метод
-                        mesh = extrude_building(geom, height)
-                        if mesh is None or len(mesh.faces) == 0:
-                            continue
-                    
-                    # Садимо від translate_z (нижня точка будівлі)
-                    mesh.apply_translation([0, 0, translate_z])
-                    
-                    # ПОКРАЩЕНА АГРЕСИВНА ПЕРЕВІРКА: Перевіряємо всі нижні вершини та піднімаємо будівлю, якщо потрібно
-                    if terrain_provider is not None and len(mesh.vertices) > 0:
-                        vertices = mesh.vertices.copy()
-                        
-                        # ВИПРАВЛЕННЯ: Використовуємо нижні 20% висоти будівлі замість фіксованого порогу
-                        # Це працює для будівель будь-якої форми
-                        building_height = float(height)
-                        bottom_percentage = 0.2  # Нижні 20% висоти будівлі
-                        bottom_threshold = translate_z + (building_height * bottom_percentage)
-                        is_bottom = vertices[:, 2] <= bottom_threshold
-                        
-                        if np.any(is_bottom):
-                            # Отримуємо висоти рельєфу для нижніх вершин
-                            bottom_vertices_xy = vertices[is_bottom, :2]
-                            ground_heights = terrain_provider.get_heights_for_points(bottom_vertices_xy)
-                            
-                            if len(ground_heights) > 0:
-                                # Знаходимо мінімальну висоту рельєфу під нижніми вершинами
-                                min_ground_h = float(np.min(ground_heights))
-                                
-                                # Мінімальна висота над землею (з урахуванням embed_depth)
-                                min_height_above_ground = max(float(embed_depth), 0.05) + 0.05
-                                required_base_z = min_ground_h + min_height_above_ground
-                                
-                                # Перевіряємо, чи будівля не під землею
-                                current_bottom_z = float(np.min(vertices[is_bottom, 2]))
-                                required_bottom_z = required_base_z - foundation_depth_eff
-                                
-                                if current_bottom_z < required_bottom_z:
-                                    # Піднімаємо всю будівлю
-                                    elevation_adjustment = required_bottom_z - current_bottom_z
-                                    vertices[:, 2] += elevation_adjustment
-                                    translate_z = required_bottom_z
-                                    
-                                    # print(f"  [FIX] Будівля {idx}: піднято на {elevation_adjustment:.3f}м "
-                                    #       f"(current_bottom={current_bottom_z:.3f}, required={required_bottom_z:.3f})")
-                            
-                            mesh.vertices = vertices
-                        
-                        # ФІНАЛЬНА ПЕРЕВІРКА: Перевіряємо ВСІ вершини, щоб переконатися, що нічого не під землею
-                        all_vertices_xy = vertices[:, :2]
-                        all_ground_heights = terrain_provider.get_heights_for_points(all_vertices_xy)
-                        
-                        if len(all_ground_heights) > 0:
-                            # Знаходимо вершини, які під землею
-                            vertices_below_ground = vertices[:, 2] < (all_ground_heights - 0.05)  # 5см допуск
-                            
-                            if np.any(vertices_below_ground):
-                                # Агресивне виправлення: піднімаємо всі вершини, що під землею
-                                min_required_z = np.max(all_ground_heights[vertices_below_ground]) + 0.1
-                                current_min_z = float(np.min(vertices[:, 2]))
-                                
-                                if current_min_z < min_required_z:
-                                    elevation_adjustment = min_required_z - current_min_z
-                                    vertices[:, 2] += elevation_adjustment
-                                    translate_z += elevation_adjustment
-                                    
-                                    # print(f"  [FIX] Будівля {idx}: агресивне виправлення - піднято на {elevation_adjustment:.3f}м "
-                                    #       f"({np.sum(vertices_below_ground)} вершин під землею)")
-                                
-                                mesh.vertices = vertices
-                    
-                    # Перевірка на валідність mesh
                     try:
-                        if not mesh.is_volume:
-                            mesh.fill_holes()
-                        mesh.remove_duplicate_faces()
-                        mesh.remove_unreferenced_vertices()
-                    except Exception as fix_error:
-                        print(f"  [WARN] Будівля {idx}: помилка виправлення mesh: {fix_error}")
-                    
-                    if mesh and len(mesh.faces) > 0 and len(mesh.vertices) > 0:
-                        building_meshes.append(mesh)
-                    else:
-                        print(f"  [SKIP] Будівля {idx}: mesh невалідний після обробки")
-                except Exception as e:
-                    print(f"  [WARN] Помилка екструзії будівлі {idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # Fallback на старий метод
-                    mesh = extrude_building(geom, height)
-                    mesh.apply_translation([0, 0, translate_z])
-                    if len(mesh.faces) > 0:
-                        building_meshes.append(mesh)
-            # ВИПРАВЛЕННЯ: Якщо MultiPolygon, обробляємо кожен полігон окремо з ОКРЕМИМ translate_z
-            elif hasattr(geom, 'geoms') or isinstance(geom, MultiPolygon):
-                geoms_list = geom.geoms if hasattr(geom, 'geoms') else [geom]
-                for poly_idx, poly in enumerate(geoms_list):
-                    if not isinstance(poly, Polygon):
-                        continue
-                    
-                    # Перевіряємо валідність полігону
-                    try:
-                        if poly.is_empty or not poly.is_valid:
-                            poly = poly.buffer(0)
-                            if poly.is_empty:
-                                continue
-                        if hasattr(poly, 'exterior') and len(poly.exterior.coords) < 3:
-                            continue
-                    except Exception:
-                        continue
-                    
-                    # ВИПРАВЛЕННЯ: Розраховуємо translate_z окремо для кожного полігону
-                    poly_translate_z = translate_z  # Початкове значення
-                    if terrain_provider is not None:
-                        poly_heights = ground_heights_for_geom(poly)
-                        if poly_heights.size > 0:
-                            poly_ground_min = float(np.min(poly_heights))
-                            poly_ground_max = float(np.max(poly_heights))
-                            
-                            # Така сама логіка як для одиночних полігонів
-                            safety_margin = 0.1
-                            if float(embed_depth) > 0:
-                                poly_base_z = max(poly_ground_min - float(embed_depth), poly_ground_min - safety_margin)
-                            else:
-                                poly_base_z = poly_ground_min + safety_margin
-                            
-                            poly_translate_z = float(poly_base_z) - float(foundation_depth_eff)
-                            
-                            # Додаткова перевірка
-                            min_allowed_z = poly_ground_min - float(foundation_depth_eff) + safety_margin
-                            if poly_translate_z < min_allowed_z:
-                                poly_translate_z = min_allowed_z
-                    
-                    try:
-                        mesh = trimesh.creation.extrude_polygon(poly, height=height)
+                        # Використовуємо вбудовану функцію trimesh для екструзії
+                        mesh = trimesh.creation.extrude_polygon(geom, height=height)
                         
                         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-                            # Fallback
-                            mesh = extrude_building(poly, height)
+                            print(f"  [WARN] Будівля {idx}: extrude_polygon повернув порожній mesh")
+                            # Fallback на старий метод
+                            mesh = extrude_building(geom, height)
                             if mesh is None or len(mesh.faces) == 0:
                                 continue
                         
-                        mesh.apply_translation([0, 0, poly_translate_z])
+                        # Садимо від translate_z (нижня точка будівлі)
+                        mesh.apply_translation([0, 0, translate_z])
                         
-                        # Така сама покращена агресивна перевірка як для одиночних полігонів
+                        # ПОКРАЩЕНА АГРЕСИВНА ПЕРЕВІРКА: Перевіряємо всі нижні вершини та піднімаємо будівлю, якщо потрібно
                         if terrain_provider is not None and len(mesh.vertices) > 0:
                             vertices = mesh.vertices.copy()
                             
-                            # Використовуємо нижні 20% висоти будівлі
+                            # ВИПРАВЛЕННЯ: Використовуємо нижні 20% висоти будівлі замість фіксованого порогу
+                            # Це працює для будівель будь-якої форми
                             building_height = float(height)
-                            bottom_percentage = 0.2
-                            bottom_threshold = poly_translate_z + (building_height * bottom_percentage)
+                            bottom_percentage = 0.2  # Нижні 20% висоти будівлі
+                            bottom_threshold = translate_z + (building_height * bottom_percentage)
                             is_bottom = vertices[:, 2] <= bottom_threshold
                             
                             if np.any(is_bottom):
+                                # Отримуємо висоти рельєфу для нижніх вершин
                                 bottom_vertices_xy = vertices[is_bottom, :2]
                                 ground_heights = terrain_provider.get_heights_for_points(bottom_vertices_xy)
                                 
                                 if len(ground_heights) > 0:
+                                    # Знаходимо мінімальну висоту рельєфу під нижніми вершинами
                                     min_ground_h = float(np.min(ground_heights))
+                                    
+                                    # Мінімальна висота над землею (з урахуванням embed_depth)
                                     min_height_above_ground = max(float(embed_depth), 0.05) + 0.05
                                     required_base_z = min_ground_h + min_height_above_ground
                                     
+                                    # Перевіряємо, чи будівля не під землею
                                     current_bottom_z = float(np.min(vertices[is_bottom, 2]))
                                     required_bottom_z = required_base_z - foundation_depth_eff
                                     
                                     if current_bottom_z < required_bottom_z:
+                                        # Піднімаємо всю будівлю
                                         elevation_adjustment = required_bottom_z - current_bottom_z
                                         vertices[:, 2] += elevation_adjustment
-                                        poly_translate_z = required_bottom_z
+                                        translate_z = required_bottom_z
+                                        
+                                        # print(f"  [FIX] Будівля {idx}: піднято на {elevation_adjustment:.3f}м "
+                                        #       f"(current_bottom={current_bottom_z:.3f}, required={required_bottom_z:.3f})")
+                                
+                                mesh.vertices = vertices
                             
-                            # Фінальна перевірка всіх вершин
+                            # ФІНАЛЬНА ПЕРЕВІРКА: Перевіряємо ВСІ вершини, щоб переконатися, що нічого не під землею
                             all_vertices_xy = vertices[:, :2]
                             all_ground_heights = terrain_provider.get_heights_for_points(all_vertices_xy)
                             
                             if len(all_ground_heights) > 0:
-                                vertices_below_ground = vertices[:, 2] < (all_ground_heights - 0.05)
+                                # Знаходимо вершини, які під землею
+                                vertices_below_ground = vertices[:, 2] < (all_ground_heights - 0.05)  # 5см допуск
                                 
                                 if np.any(vertices_below_ground):
+                                    # Агресивне виправлення: піднімаємо всі вершини, що під землею
                                     min_required_z = np.max(all_ground_heights[vertices_below_ground]) + 0.1
                                     current_min_z = float(np.min(vertices[:, 2]))
                                     
                                     if current_min_z < min_required_z:
                                         elevation_adjustment = min_required_z - current_min_z
                                         vertices[:, 2] += elevation_adjustment
-                                        poly_translate_z += elevation_adjustment
-                                
-                                mesh.vertices = vertices
-                                
-                                try:
-                                    mesh.fix_normals()
-                                except:
-                                    pass
+                                        translate_z += elevation_adjustment
+                                        
+                                        # print(f"  [FIX] Будівля {idx}: агресивне виправлення - піднято на {elevation_adjustment:.3f}м "
+                                        #       f"({np.sum(vertices_below_ground)} вершин під землею)")
+                                    
+                                    mesh.vertices = vertices
                         
                         # Перевірка на валідність mesh
                         try:
@@ -480,26 +380,159 @@ def process_buildings(
                                 mesh.fill_holes()
                             mesh.remove_duplicate_faces()
                             mesh.remove_unreferenced_vertices()
-                        except Exception:
-                            pass
+                        except Exception as fix_error:
+                            print(f"  [WARN] Будівля {idx}: помилка виправлення mesh: {fix_error}")
                         
                         if mesh and len(mesh.faces) > 0 and len(mesh.vertices) > 0:
                             building_meshes.append(mesh)
+                        else:
+                            print(f"  [SKIP] Будівля {idx}: mesh невалідний після обробки")
                     except Exception as e:
-                        # Fallback
+                        print(f"  [WARN] Помилка екструзії будівлі {idx}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Fallback на старий метод
                         try:
-                            mesh = extrude_building(poly, height)
+                            mesh = extrude_building(geom, height)
                             if mesh:
-                                mesh.apply_translation([0, 0, poly_translate_z])
-                                if mesh and len(mesh.faces) > 0:
+                                mesh.apply_translation([0, 0, translate_z])
+                                if len(mesh.faces) > 0:
                                     building_meshes.append(mesh)
                         except Exception:
+                            pass
+                # ВИПРАВЛЕННЯ: Якщо MultiPolygon, обробляємо кожен полігон окремо з ОКРЕМИМ translate_z
+                elif hasattr(geom, 'geoms') or isinstance(geom, MultiPolygon):
+                    geoms_list = geom.geoms if hasattr(geom, 'geoms') else [geom]
+                    for poly_idx, poly in enumerate(geoms_list):
+                        if not isinstance(poly, Polygon):
                             continue
-        except Exception as e:
-            print(f"Помилка обробки будівлі {idx}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+                        
+                        # Перевіряємо валідність полігону
+                        try:
+                            if poly.is_empty or not poly.is_valid:
+                                poly = poly.buffer(0)
+                                if poly.is_empty:
+                                    continue
+                            if hasattr(poly, 'exterior') and len(poly.exterior.coords) < 3:
+                                continue
+                        except Exception:
+                            continue
+                        
+                        # ВИПРАВЛЕННЯ: Розраховуємо translate_z окремо для кожного полігону
+                        poly_translate_z = translate_z  # Початкове значення
+                        if terrain_provider is not None:
+                            poly_heights = ground_heights_for_geom(poly)
+                            if poly_heights.size > 0:
+                                poly_ground_min = float(np.min(poly_heights))
+                                poly_ground_max = float(np.max(poly_heights))
+                                
+                                # Така сама логіка як для одиночних полігонів
+                                safety_margin = 0.1
+                                if float(embed_depth) > 0:
+                                    poly_base_z = max(poly_ground_min - float(embed_depth), poly_ground_min - safety_margin)
+                                else:
+                                    poly_base_z = poly_ground_min + safety_margin
+                                
+                                poly_translate_z = float(poly_base_z) - float(foundation_depth_eff)
+                                
+                                # Додаткова перевірка
+                                min_allowed_z = poly_ground_min - float(foundation_depth_eff) + safety_margin
+                                if poly_translate_z < min_allowed_z:
+                                    poly_translate_z = min_allowed_z
+                        
+                        try:
+                            mesh = trimesh.creation.extrude_polygon(poly, height=height)
+                            
+                            if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+                                # Fallback
+                                mesh = extrude_building(poly, height)
+                                if mesh is None or len(mesh.faces) == 0:
+                                    continue
+                            
+                            mesh.apply_translation([0, 0, poly_translate_z])
+                            
+                            # Така сама покращена агресивна перевірка як для одиночних полігонів
+                            if terrain_provider is not None and len(mesh.vertices) > 0:
+                                vertices = mesh.vertices.copy()
+                                
+                                # Використовуємо нижні 20% висоти будівлі
+                                building_height = float(height)
+                                bottom_percentage = 0.2
+                                bottom_threshold = poly_translate_z + (building_height * bottom_percentage)
+                                is_bottom = vertices[:, 2] <= bottom_threshold
+                                
+                                if np.any(is_bottom):
+                                    bottom_vertices_xy = vertices[is_bottom, :2]
+                                    ground_heights = terrain_provider.get_heights_for_points(bottom_vertices_xy)
+                                    
+                                    if len(ground_heights) > 0:
+                                        min_ground_h = float(np.min(ground_heights))
+                                        min_height_above_ground = max(float(embed_depth), 0.05) + 0.05
+                                        required_base_z = min_ground_h + min_height_above_ground
+                                        
+                                        current_bottom_z = float(np.min(vertices[is_bottom, 2]))
+                                        required_bottom_z = required_base_z - foundation_depth_eff
+                                        
+                                        if current_bottom_z < required_bottom_z:
+                                            elevation_adjustment = required_bottom_z - current_bottom_z
+                                            vertices[:, 2] += elevation_adjustment
+                                            poly_translate_z = required_bottom_z
+                                
+                                # Фінальна перевірка всіх вершин
+                                all_vertices_xy = vertices[:, :2]
+                                all_ground_heights = terrain_provider.get_heights_for_points(all_vertices_xy)
+                                
+                                if len(all_ground_heights) > 0:
+                                    vertices_below_ground = vertices[:, 2] < (all_ground_heights - 0.05)
+                                    
+                                    if np.any(vertices_below_ground):
+                                        min_required_z = np.max(all_ground_heights[vertices_below_ground]) + 0.1
+                                        current_min_z = float(np.min(vertices[:, 2]))
+                                        
+                                        if current_min_z < min_required_z:
+                                            elevation_adjustment = min_required_z - current_min_z
+                                            vertices[:, 2] += elevation_adjustment
+                                            poly_translate_z += elevation_adjustment
+                                    
+                                    mesh.vertices = vertices
+                                    
+                                    try:
+                                        mesh.fix_normals()
+                                    except:
+                                        pass
+                            
+                            # Перевірка на валідність mesh
+                            try:
+                                if not mesh.is_volume:
+                                    mesh.fill_holes()
+                                mesh.remove_duplicate_faces()
+                                mesh.remove_unreferenced_vertices()
+                            except Exception:
+                                pass
+                            
+                            if mesh and len(mesh.faces) > 0 and len(mesh.vertices) > 0:
+                                building_meshes.append(mesh)
+                        except Exception as e:
+                            # Fallback
+                            try:
+                                mesh = extrude_building(poly, height)
+                                if mesh:
+                                    mesh.apply_translation([0, 0, poly_translate_z])
+                                    if mesh and len(mesh.faces) > 0:
+                                        building_meshes.append(mesh)
+                            except Exception:
+                                continue
+            except Exception as e:
+                print(f"Помилка обробки будівлі {idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # MEMORY OPTIMIZATION: Explicitly free batch data after processing
+        del batch_gdf
+        gc.collect()
+        
+        print(f"[INFO] Batch {batch_start//batch_size + 1} completed. Total buildings so far: {len(building_meshes)}")
     
     print(f"Створено {len(building_meshes)} будівель")
     return building_meshes

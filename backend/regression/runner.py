@@ -251,7 +251,7 @@ def run_regression_case(case_path: str, artifacts_root: str = "output/regression
                     return (xl, yl) if z is None else (xl, yl, z)
 
                 water_geoms_local = [shp_transform(to_local, g) for g in water_geoms_for_bridges if g is not None and not g.is_empty]
-            bridges = detect_bridges(G_roads, water_geometries=water_geoms_local, global_center=gc)
+            bridges = detect_bridges(G_roads, water_geometries=water_geoms_local)
             bridge_count = int(len(bridges))
         except Exception:
             bridge_count = 0
@@ -264,8 +264,6 @@ def run_regression_case(case_path: str, artifacts_root: str = "output/regression
             road_embed=(float(req.get("road_embed_mm", 0.3)) / float(scale_factor)) if scale_factor else 0.0,
             merged_roads=merged_roads,
             water_geometries=water_geoms_for_bridges,
-            water_depth_m=float(water_depth_m) if water_depth_m is not None else None,
-            bridge_clearance_m=(float(req.get("bridge_clearance_mm", 2.0)) / float(scale_factor)) if scale_factor else None,
             bridge_height_multiplier=1.0,
             global_center=gc,
         )
@@ -319,6 +317,7 @@ def run_regression_case(case_path: str, artifacts_root: str = "output/regression
             embed_m=(float(req.get("parks_embed_mm", 0.2)) / float(scale_factor)) if scale_factor else 0.0,
             terrain_provider=terrain_provider,
             global_center=gc,
+            scale_factor=float(scale_factor) if scale_factor else None,
         )
     report["meshes"]["green"] = mesh_stats(green_mesh)
 

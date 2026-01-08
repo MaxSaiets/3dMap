@@ -33,7 +33,7 @@ def hexagon_center_to_corner(center_x: float, center_y: float, size: float) -> L
 
 def generate_square_grid(
     bbox: Tuple[float, float, float, float],
-    square_size_m: float = 500.0  # 0.5 км = 500 м
+    square_size_m: float = 300.0  # 0.5 км = 500 м
 ) -> List[Dict]:
     """
     Генерує квадратну сітку для заданого bbox.

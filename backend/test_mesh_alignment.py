@@ -93,7 +93,7 @@ print(f"Дороги: {len(G_roads.edges) if hasattr(G_roads, 'edges') else 'N/A
 print("\n3. Обробка доріг...")
 road_mesh = None
 try:
-    merged_roads = build_road_polygons(G_roads, road_width_multiplier=1.0)
+    merged_roads = build_road_polygons(G_roads, width_multiplier=1.0)
     if merged_roads is not None:
         print(f"Merged roads: {type(merged_roads)}")
         
