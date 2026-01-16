@@ -204,13 +204,13 @@ def process_water_surface(
             try:
                 # Перевіряємо чи геометрія перетинається з clip_box перед intersection
                 if not geom.intersects(clip_box):
-                    print(f"[DEBUG] Water geometry {idx} не перетинається з clip_box, пропускаємо")
+                    # print(f"[DEBUG] Water geometry {idx} не перетинається з clip_box, пропускаємо")
                     skipped_count += 1
                     continue
                 
                 geom = geom.intersection(clip_box)
                 if geom.is_empty:
-                    print(f"[DEBUG] Water geometry {idx} стала порожньою після intersection з clip_box")
+                    # print(f"[DEBUG] Water geometry {idx} стала порожньою після intersection з clip_box")
                     skipped_count += 1
                     continue
             except Exception as e:
@@ -237,16 +237,16 @@ def process_water_surface(
             # Виправляємо полігон перед екструзією
             try:
                 if not poly.is_valid:
-                    print(f"[DEBUG] Water poly {idx}_{poly_idx} невалідний, виправляємо")
+                    # print(f"[DEBUG] Water poly {idx}_{poly_idx} невалідний, виправляємо")
                     poly = poly.buffer(0)
                     if poly.is_empty:
-                        print(f"[WARN] Water poly {idx}_{poly_idx} стала порожньою після buffer(0)")
+                        # print(f"[WARN] Water poly {idx}_{poly_idx} стала порожньою після buffer(0)")
                         skipped_count += 1
                         continue
                 
                 # Перевіряємо чи полігон має достатньо точок
                 if hasattr(poly, 'exterior') and len(poly.exterior.coords) < 3:
-                    print(f"[WARN] Water poly {idx}_{poly_idx} має менше 3 точок, пропускаємо")
+                    # print(f"[WARN] Water poly {idx}_{poly_idx} має менше 3 точок, пропускаємо")
                     skipped_count += 1
                     continue
             except Exception as e:
@@ -314,7 +314,7 @@ def process_water_surface(
                     ground = terrain_provider.get_surface_heights_for_points(points_array if len(points_array) > 0 else v[:, :2])
                     # Дно depression + глибина = рівень поверхні води
                     surface_levels = ground + float(depth_meters) + float(surface_offset_m)
-                    print(f"[WARN] Використовується fallback для water surface: ground range=[{np.min(ground):.3f}, {np.max(ground):.3f}], surface range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}]")
+                    # print(f"[WARN] Використовується fallback для water surface: ground range=[{np.min(ground):.3f}, {np.max(ground):.3f}], surface range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}]")
                 
                 # КРИТИЧНЕ ВИПРАВЛЕННЯ: old_z від extrude_polygon - це товщина води (0 до thickness_m)
                 # Для верхньої поверхні води (old_z == thickness_m) використовуємо surface_levels
@@ -351,37 +351,34 @@ def process_water_surface(
                     v[:, 2] = old_z
                     print(f"[WARN] Water mesh: surface_levels порожній, використано оригінальну висоту")
                 
-                # Діагностика: перевіряємо, чи вода не накладається на рельєф
-                min_water_z = float(np.min(v[:, 2]))
-                max_water_z = float(np.max(v[:, 2]))
-                
-                # Отримуємо висоти рельєфу (з depression) для порівняння
-                ground_depressed = terrain_provider.get_surface_heights_for_points(v[:, :2])
-                min_ground_depressed = float(np.min(ground_depressed))
-                max_ground_depressed = float(np.max(ground_depressed))
-                
-                # Отримуємо оригінальні висоти для порівняння
-                if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
-                    ground_original = terrain_provider.original_heights_provider.get_heights_for_points(v[:, :2])
-                    min_ground_original = float(np.min(ground_original))
-                    max_ground_original = float(np.max(ground_original))
+                # Діагностика: перевіряємо, чи вода не накладається на рельєф (тільки для першого полігону, щоб не сповільнювати)
+                if processed_count == 0:  # Тільки для першого полігону
+                    min_water_z = float(np.min(v[:, 2]))
+                    max_water_z = float(np.max(v[:, 2]))
                     
-                    # Вода має бути на рівні оригінального рельєфу (або трохи нижче для безпеки)
-                    # Але не нижче дна depression
-                    if min_water_z < min_ground_depressed - 0.01:
-                        print(f"[WARN] Water нижче дна depression: water_z={min_water_z:.3f}, depressed_ground={min_ground_depressed:.3f}")
-                    elif max_water_z > max_ground_original + 0.01:  # Вода не повинна бути вище оригінального рельєфу
-                        print(f"[WARN] Water вище оригінального рельєфу: water_z={max_water_z:.3f}, original_ground={max_ground_original:.3f}")
+                    # Отримуємо висоти рельєфу (з depression) для порівняння
+                    ground_depressed = terrain_provider.get_surface_heights_for_points(v[:, :2])
+                    min_ground_depressed = float(np.min(ground_depressed))
+                    max_ground_depressed = float(np.max(ground_depressed))
+                    
+                    # Отримуємо оригінальні висоти для порівняння
+                    if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
+                        ground_original = terrain_provider.original_heights_provider.get_heights_for_points(v[:, :2])
+                        min_ground_original = float(np.min(ground_original))
+                        max_ground_original = float(np.max(ground_original))
+                        
+                        # Вода має бути на рівні оригінального рельєфу (або трохи нижче для безпеки)
+                        # Але не нижче дна depression
+                        if min_water_z < min_ground_depressed - 0.01:
+                            print(f"[WARN] Water нижче дна depression: water_z={min_water_z:.3f}, depressed_ground={min_ground_depressed:.3f}")
+                        elif max_water_z > max_ground_original + 0.01:  # Вода не повинна бути вище оригінального рельєфу
+                            print(f"[WARN] Water вище оригінального рельєфу: water_z={max_water_z:.3f}, original_ground={max_ground_original:.3f}")
                     else:
-                        print(f"[INFO] Water правильно розміщена: z=[{min_water_z:.3f}, {max_water_z:.3f}], original=[{min_ground_original:.3f}, {max_ground_original:.3f}], depressed=[{min_ground_depressed:.3f}, {max_ground_depressed:.3f}]")
-                else:
-                    # Fallback: порівнюємо з depressed ground
-                    if min_water_z < min_ground_depressed - 0.01:
-                        print(f"[WARN] Water нижче дна depression: water_z={min_water_z:.3f}, ground={min_ground_depressed:.3f}")
-                    elif max_water_z > max_ground_depressed + depth_meters * 0.95:
-                        print(f"[WARN] Water може накладатися: water_z={max_water_z:.3f}, ground={max_ground_depressed:.3f}, depth={depth_meters:.3f}")
-                    else:
-                        print(f"[INFO] Water розміщена (fallback): z=[{min_water_z:.3f}, {max_water_z:.3f}], ground=[{min_ground_depressed:.3f}, {max_ground_depressed:.3f}]")
+                        # Fallback: порівнюємо з depressed ground
+                        if min_water_z < min_ground_depressed - 0.01:
+                            print(f"[WARN] Water нижче дна depression: water_z={min_water_z:.3f}, ground={min_ground_depressed:.3f}")
+                        elif max_water_z > max_ground_depressed + depth_meters * 0.95:
+                            print(f"[WARN] Water може накладатися: water_z={max_water_z:.3f}, ground={max_ground_depressed:.3f}, depth={depth_meters:.3f}")
                 
                 mesh.vertices = v
             else:

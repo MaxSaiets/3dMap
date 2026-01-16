@@ -1,7 +1,7 @@
 """
-Сервіс для обробки доріг з буферизацією та об'єднанням
-Покращена версія з фізичною шириною доріг та підтримкою мостів
-Використовує trimesh.creation.extrude_polygon для надійної тріангуляції
+Сервіс для обробки доріг.
+Версія: FINAL FIXED (Layer separation logic).
+Виправляє: зникнення доріг під естакадами, артефакти на розв'язках, обрізання країв.
 """
 import osmnx as ox
 import trimesh
@@ -21,12 +21,12 @@ warnings.filterwarnings('ignore', category=DeprecationWarning, module='pandas')
 
 def create_bridge_supports(
     bridge_polygon: Polygon,
-    bridge_height: float,
+    bridge_deck_z: float,
     terrain_provider: Optional[TerrainProvider],
     water_level: Optional[float],
-    support_spacing: float = 20.0,  # Відстань між опорами (метри)
-    support_width: float = 2.0,  # Ширина опори (метри)
-    min_support_height: float = 1.0,  # Мінімальна висота опори (метри)
+    support_spacing: float = 25.0,
+    support_width: float = 2.5,
+    min_support_height: float = 2.0,
 ) -> List[trimesh.Trimesh]:
     """
     Створює опори для моста, які йдуть від моста до землі/води.
@@ -45,7 +45,6 @@ def create_bridge_supports(
         Список Trimesh об'єктів опор
     """
     supports = []
-    
     if bridge_polygon is None or terrain_provider is None:
         return supports
     
@@ -594,21 +593,42 @@ def process_roads(
     merged_roads = _to_local_geom(merged_roads)
     
     # Pre-clip to zone polygon (LOCAL coords) to prevent roads outside the zone.
+    # ВАЖЛИВО: Дороги вже мають буфер від буферизації при завантаженні (padded_bbox),
+    # тому обрізка до зони тут гарантує, що дороги доходять до країв, але не виходять за межі
     if clip_polygon is not None:
         try:
             clip_poly_local = clip_polygon
             # If clip_polygon came in UTM, convert too
             clip_poly_local = _to_local_geom(clip_poly_local)
-            merged_roads = merged_roads.intersection(clip_poly_local)
+            
+            # ВИПРАВЛЕННЯ: Обрізаємо дороги до зони з невеликим розширенням
+            # Буфер 0.5м гарантує, що дороги доходять до країв зони навіть з урахуванням похибок
+            try:
+                # Розширюємо зону на 0.5м для гарантії, що дороги доходять до країв
+                expanded_zone = clip_poly_local.buffer(0.5)
+                
+                # Обрізаємо дороги до розширеної зони (це гарантує, що дороги доходять до країв)
+                merged_roads = merged_roads.intersection(expanded_zone)
+                
+                # ВАЖЛИВО: НЕ обрізаємо до точної зони тут - залишаємо з буфером
+                # Це забезпечує, що дороги доходять до країв зони
+                # Точна обрізка виконується в main.py після екструзії (якщо потрібно)
+            except Exception:
+                # Fallback: звичайне обрізання без розширення
+                merged_roads = merged_roads.intersection(clip_poly_local)
+            
             # Snap cut edges to the zone boundary to keep border coordinates stable across adjacent tiles.
             # This reduces tiny per-tile numerical differences that show up as Z seams after draping.
             try:
                 merged_roads = snap(merged_roads, clip_poly_local.boundary, 1e-6)
             except Exception:
                 pass
+            
             if merged_roads is None or merged_roads.is_empty:
+                print("[WARN] Дороги стали порожніми після обрізання до зони")
                 return None
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] Помилка обрізання доріг до зони: {e}")
             pass
 
     # Якщо є рельєф — кліпимо дороги в межі рельєфу (буферизація може виходити за bbox і давати "провали")
@@ -689,13 +709,28 @@ def process_roads(
     bridges = detect_bridges(G_roads, water_geometries=water_geoms_local)
     
     # РОЗДІЛЯЄМО МОСТИ НА КАТЕГОРІЇ
-    # Layer 1 (Low): Це частина розв'язки, яка замінює дорогу на землі. Їх треба "вирізати".
-    # Layer 2+ (High): Це естакади, що летять зверху. Вони НЕ повинні вирізати дороги під собою.
-    bridges_low = [b for b in bridges if len(b) >= 5 and b[4] <= 1]  # Layer <= 1
-    bridges_high = [b for b in bridges if len(b) >= 5 and b[4] > 1]   # Layer > 1
+    # Layer 0: Звичайні дороги на землі (layer=None або layer=0)
+    # Layer 1: Низькі мости/розв'язки (layer=1) - замінюють дорогу на землі
+    # Layer 2+: Високі естакади (layer=2+) - не вирізають дороги під собою
     
-    # Маска для вирізання (тільки низькі мости + мости над водою)
-    cut_mask_polys = [b[1] for b in bridges_low if b[1] is not None and not getattr(b[1], "is_empty", False)]
+    # ВИПРАВЛЕННЯ: Розділяємо мости точніше за layer
+    bridges_layer0 = []  # Мости без layer або з layer=0 (не обробляємо як мости)
+    bridges_layer1 = []  # Мости layer=1
+    bridges_layer2plus = []  # Мости layer=2+
+    
+    for b in bridges:
+        if len(b) >= 5:
+            b_layer = b[4]
+            if b_layer == 1:
+                bridges_layer1.append(b)
+            elif b_layer > 1:
+                bridges_layer2plus.append(b)
+            else:
+                bridges_layer0.append(b)
+    
+    # Маска для вирізання з землі (тільки layer=1 мости + мости над водою)
+    # ВАЖЛИВО: Не вирізаємо layer=2+, щоб дороги layer=1 могли проходити під ними
+    cut_mask_polys = [b[1] for b in bridges_layer1 if b[1] is not None and not getattr(b[1], "is_empty", False)]
     # Додаємо мости над водою в маску вирізання (щоб не було доріг на дні річки)
     cut_mask_polys.extend([b[1] for b in bridges if len(b) >= 4 and b[3] and b[1] is not None and not getattr(b[1], "is_empty", False)])
     
@@ -707,6 +742,18 @@ def process_roads(
                 bridge_cut_union = None
         except Exception:
             bridge_cut_union = None
+    
+    # ВИПРАВЛЕННЯ: Створюємо маску тільки для мостів layer=2+ (для правильної обробки перетинів)
+    bridge_layer2plus_union = None
+    if bridges_layer2plus:
+        try:
+            layer2plus_polys = [b[1] for b in bridges_layer2plus if b[1] is not None and not getattr(b[1], "is_empty", False)]
+            if layer2plus_polys:
+                bridge_layer2plus_union = unary_union(layer2plus_polys)
+                if bridge_layer2plus_union is not None and getattr(bridge_layer2plus_union, "is_empty", False):
+                    bridge_layer2plus_union = None
+        except Exception:
+            bridge_layer2plus_union = None
 
     print(f"Створення 3D мешу доріг з {len(road_geoms)} полігонів (мостів: {len(bridges) if bridges else 0})...")
     road_meshes = []
@@ -888,9 +935,10 @@ def process_roads(
                 # ВИПРАВЛЕННЯ: Розділяємо обробку високих та низьких мостів
                 parts_to_process: List[Tuple[Polygon, bool, float, object]] = []
                 
-                # 1. ОБРОБКА ВИСОКИХ МОСТІВ (Layer 2+)
+                # ВИПРАВЛЕНА ЛОГІКА: Правильна обробка доріг різних рівнів
+                # 1. Спочатку обробляємо високі мости (Layer 2+)
                 # Вони накладаються "поверх" всього, не змінюючи геометрію знизу
-                for b_line, b_area, b_h, b_water, b_layer in bridges_high:
+                for b_line, b_area, b_h, b_water, b_layer in bridges_layer2plus:
                     if b_area is None or b_area.is_empty:
                         continue
                     try:
@@ -904,35 +952,73 @@ def process_roads(
                             continue
                         parts_to_process.append((g, True, float(b_h) * float(bridge_height_multiplier), b_line))
                 
-                # 2. ОБРОБКА НИЗЬКИХ МОСТІВ (Layer 1) - вони вирізаються з землі
-                if bridge_cut_union is not None:
-                    try:
-                        # Спочатку знаходимо шматки, які Є мостами Layer 1
-                        b_inter = poly.intersection(bridge_cut_union)
-                        for p in _iter_polys(b_inter):
-                            if p.area < 0.1:
-                                continue
-                            # Знаходимо параметри моста
-                            p_cent = p.centroid
-                            match = next((b for b in bridges_low if b[1] is not None and b[1].intersects(p_cent)), None)
-                            if match:
-                                parts_to_process.append((p, True, float(match[2]) * float(bridge_height_multiplier), match[0]))
-                        
-                        # Тепер знаходимо шматки, які НЕ є мостами (залишок - земля)
-                        r_diff = poly.difference(bridge_cut_union)
-                        for p in _iter_polys(r_diff):
-                            if p.area < 0.1:
-                                continue
-                            # Це звичайна дорога на землі
-                            parts_to_process.append((p, False, 0.0, None))
-                    except Exception:
-                        # Fallback: якщо помилка, обробляємо як звичайну дорогу
-                        parts_to_process.append((poly, False, 0.0, None))
-                else:
-                    # Немає вирізання - все земля (крім того, що вже додано як High Bridge)
-                    # УВАГА: Ми вже додали High Bridges вище.
-                    # Якщо ми просто додамо poly як землю, то під високим мостом буде дорога. ЦЕ ПРАВИЛЬНО.
-                    parts_to_process.append((poly, False, 0.0, None))
+                # 2. Тепер обробляємо мости Layer 1 та звичайні дороги
+                # ВИПРАВЛЕННЯ: НЕ вирізаємо мости layer=2+ з полігону
+                # Якщо дорога layer=1 перетинає міст layer=2+, вона все ще має бути дорогою layer=1
+                # Ми просто обробляємо частини, які перетинаються з мостами layer=2+, як мости
+                # Але частини, які НЕ перетинаються з мостами, обробляємо як звичайні дороги або мости layer=1
+                working_poly = poly
+                
+                # 3. Обробляємо мости Layer 1 та звичайні дороги
+                if working_poly is not None and not working_poly.is_empty:
+                    if bridge_cut_union is not None:
+                        try:
+                            # Спочатку знаходимо шматки, які Є мостами Layer 1 (або над водою)
+                            b_inter = working_poly.intersection(bridge_cut_union)
+                            for p in _iter_polys(b_inter):
+                                if p.area < 0.1:
+                                    continue
+                                # Знаходимо параметри моста
+                                p_cent = p.centroid
+                                # Шукаємо в bridges_layer1 або мости над водою
+                                match = None
+                                for b in bridges_layer1:
+                                    if b[1] is not None and b[1].intersects(p_cent):
+                                        match = b
+                                        break
+                                if not match:
+                                    # Шукаємо мости над водою
+                                    for b in bridges:
+                                        if len(b) >= 4 and b[3] and b[1] is not None and b[1].intersects(p_cent):
+                                            match = b
+                                            break
+                                if match:
+                                    match_h = match[2] if len(match) > 2 else 2.0
+                                    parts_to_process.append((p, True, float(match_h) * float(bridge_height_multiplier), match[0]))
+                            
+                            # Тепер знаходимо шматки, які НЕ є мостами Layer 1 (залишок - земля)
+                            # ВИПРАВЛЕННЯ: Ці частини можуть бути дорогами layer=1, які проходять під мостами layer=2+
+                            # Або звичайними дорогами layer=0
+                            r_diff = working_poly.difference(bridge_cut_union)
+                            for p in _iter_polys(r_diff):
+                                if p.area < 0.1:
+                                    continue
+                                
+                                # ВИПРАВЛЕННЯ: Перевіряємо, чи ця частина перетинається з мостами layer=2+
+                                # Якщо так, це дорога layer=1 під мостом layer=2+ - обробляємо як міст layer=1
+                                is_layer1_under_layer2 = False
+                                if bridge_layer2plus_union is not None:
+                                    try:
+                                        if p.intersects(bridge_layer2plus_union):
+                                            # Це дорога layer=1 під мостом layer=2+ - обробляємо як міст layer=1
+                                            # Використовуємо висоту моста layer=1 (6м)
+                                            is_layer1_under_layer2 = True
+                                            parts_to_process.append((p, True, 6.0 * float(bridge_height_multiplier), None))
+                                    except Exception:
+                                        pass
+                                
+                                # Якщо не перетинається з мостами layer=2+, це звичайна дорога на землі
+                                if not is_layer1_under_layer2:
+                                    parts_to_process.append((p, False, 0.0, None))
+                        except Exception as e:
+                            # Fallback: якщо помилка, обробляємо як звичайну дорогу
+                            print(f"[WARN] Помилка обробки мостів layer=1: {e}")
+                            parts_to_process.append((working_poly, False, 0.0, None))
+                    else:
+                        # Немає мостів layer=1 - все земля (крім того, що вже додано як High Bridge)
+                        # УВАГА: Ми вже додали High Bridges вище.
+                        # Якщо ми просто додамо poly як землю, то під високим мостом буде дорога. ЦЕ ПРАВИЛЬНО.
+                        parts_to_process.append((working_poly, False, 0.0, None))
                 
                 # Якщо не було мостів взагалі
                 if not parts_to_process:

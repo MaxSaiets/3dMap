@@ -308,6 +308,78 @@ async def download_model(
     )
 
 
+@app.post("/api/merge-zones")
+async def merge_zones_endpoint(
+    task_ids: List[str] = Query(..., description="Список task_id зон для об'єднання"),
+    format: str = Query(default="3mf", description="Формат вихідного файлу (stl або 3mf)")
+):
+    """
+    Об'єднує кілька зон в один файл для відображення разом.
+    
+    Args:
+        task_ids: Список task_id зон для об'єднання
+        format: Формат вихідного файлу (stl або 3mf)
+    
+    Returns:
+        Об'єднаний файл моделі
+    """
+    if not task_ids or len(task_ids) == 0:
+        raise HTTPException(status_code=400, detail="Не вказано task_ids для об'єднання")
+    
+    # Перевіряємо, чи всі задачі завершені
+    completed_tasks = []
+    for tid in task_ids:
+        if tid not in tasks:
+            raise HTTPException(status_code=404, detail=f"Task {tid} not found")
+        task = tasks[tid]
+        if task.status != "completed":
+            raise HTTPException(status_code=400, detail=f"Task {tid} not completed yet")
+        completed_tasks.append(task)
+    
+    # Завантажуємо всі меші
+    import trimesh
+    all_meshes = []
+    
+    for task in completed_tasks:
+        try:
+            # Завантажуємо STL файл (він містить об'єднану модель)
+            stl_file = task.output_file
+            if stl_file and stl_file.endswith('.stl'):
+                mesh = trimesh.load(stl_file)
+                if mesh is not None:
+                    all_meshes.append(mesh)
+        except Exception as e:
+            print(f"[WARN] Помилка завантаження мешу з {task.task_id}: {e}")
+            continue
+    
+    if not all_meshes:
+        raise HTTPException(status_code=400, detail="Не вдалося завантажити жодного мешу")
+    
+    # Об'єднуємо всі меші
+    try:
+        merged_mesh = trimesh.util.concatenate(all_meshes)
+        if merged_mesh is None:
+            raise HTTPException(status_code=500, detail="Не вдалося об'єднати меші")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Помилка об'єднання мешів: {str(e)}")
+    
+    # Зберігаємо об'єднаний файл
+    import uuid
+    merged_id = f"merged_{uuid.uuid4()}"
+    if format.lower() == "3mf":
+        output_file = OUTPUT_DIR / f"{merged_id}.3mf"
+        merged_mesh.export(str(output_file), file_type="3mf")
+    else:
+        output_file = OUTPUT_DIR / f"{merged_id}.stl"
+        merged_mesh.export(str(output_file), file_type="stl")
+    
+    return FileResponse(
+        str(output_file),
+        media_type="model/3mf" if format.lower() == "3mf" else "model/stl",
+        filename=output_file.name
+    )
+
+
 @app.get("/api/test-model")
 async def get_test_model():
     """
@@ -862,14 +934,17 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
         main_task_id = f"batch_{uuid.uuid4()}"
         multiple_tasks_map[main_task_id] = task_ids
         print(f"[INFO] Batch задачі: {main_task_id} -> {task_ids}")
+        print(f"[INFO] Для відображення всіх зон разом використовуйте all_task_ids: {task_ids}")
     else:
         main_task_id = task_ids[0]
     
     # Повертаємо список task_id
+    # ВАЖЛИВО: all_task_ids містить всі task_id для кожної зони
+    # Фронтенд має завантажити всі файли з цих task_id та об'єднати їх
     return GenerationResponse(
         task_id=main_task_id,
         status="processing",
-        message=f"Створено {len(task_ids)} задач для генерації зон",
+        message=f"Створено {len(task_ids)} задач для генерації зон. Використовуйте all_task_ids для завантаження всіх зон.",
         all_task_ids=task_ids  # Додаємо список всіх task_id
     )
 
@@ -1035,7 +1110,21 @@ async def generate_model_task(
         task.update_status("processing", 10, "Завантаження даних OSM для зони...")
 
         # Завантажуємо дані ТІЛЬКИ для цієї зони (без padding для швидкості та меншого використання пам'яті)
+        print(f"[DEBUG] Завантаження даних для зони: north={request.north}, south={request.south}, east={request.east}, west={request.west}")
         gdf_buildings, gdf_water, G_roads = fetch_city_data(request.north, request.south, request.east, request.west)
+        
+        # Логування завантажених даних
+        num_buildings = len(gdf_buildings) if gdf_buildings is not None and not gdf_buildings.empty else 0
+        num_water = len(gdf_water) if gdf_water is not None and not gdf_water.empty else 0
+        num_roads = 0
+        if G_roads is not None:
+            if hasattr(G_roads, 'edges'):
+                num_roads = len(G_roads.edges)
+            else:
+                import geopandas as gpd
+                if isinstance(G_roads, gpd.GeoDataFrame) and not G_roads.empty:
+                    num_roads = len(G_roads)
+        print(f"[DEBUG] Завантажено: {num_buildings} будівель, {num_water} вод, {num_roads} доріг")
 
         task.update_status("processing", 20, "Генерація рельєфу...")
         
@@ -1190,6 +1279,7 @@ async def generate_model_task(
         building_geometries_for_flatten = None
         if gdf_buildings is not None and not gdf_buildings.empty and global_center is not None:
             try:
+                from shapely.ops import transform as _transform_buildings
                 print(f"[DEBUG] Перетворюємо координати будівель ОДИН РАЗ для використання в flatten та process_buildings")
                 def to_local_transform(x, y, z=None):
                     """Трансформер: UTM -> локальні координати"""
@@ -1201,7 +1291,7 @@ async def generate_model_task(
                 # Створюємо копію з перетвореними координатами
                 gdf_buildings_local = gdf_buildings.copy()
                 gdf_buildings_local['geometry'] = gdf_buildings_local['geometry'].apply(
-                    lambda geom: transform(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
+                    lambda geom: _transform_buildings(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
                 )
                 
                 # Створюємо список геометрій для flatten (в локальних координатах)
@@ -1524,6 +1614,8 @@ async def generate_model_task(
                     # ВАЖЛИВО: gdf_green приходить в UTM (метри), але terrain_provider + вся сцена вже в локальних координатах.
                     # Якщо не перетворити, intersection з clip_box (локальним) обнулить все -> parks_mesh стане None.
                     try:
+                        from shapely.ops import transform as _transform_geom
+                        
                         def to_local_transform(x, y, z=None):
                             x_local, y_local = global_center.to_local(x, y)
                             if z is not None:
@@ -1531,7 +1623,7 @@ async def generate_model_task(
                             return (x_local, y_local)
                         gdf_green = gdf_green.copy()
                         gdf_green["geometry"] = gdf_green["geometry"].apply(
-                            lambda geom: transform(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
+                            lambda geom: _transform_geom(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
                         )
                     except Exception as e:
                         print(f"[WARN] Не вдалося перетворити gdf_green в локальні координати: {e}")
@@ -1563,13 +1655,71 @@ async def generate_model_task(
                         except Exception:
                             pass
 
+                    # Підготовка полігонів доріг для вирізання з парків
+                    # СТРАТЕГІЯ "ШИРОКОГО ВИРІЗУ": Створюємо широку маску (з додатковим буфером 1.5м)
+                    # для створення "узбіччя" між дорогою та стіною парку
+                    road_polygons_for_clipping = None
+                    try:
+                        print("[INFO] Генерація маски для вирізання доріг (ШИРОКА, з узбіччям 1.5м)...")
+                        # Створюємо полігони з додатковим буфером 1.5 метра з кожного боку
+                        # Ця геометрія НЕ буде видимою, вона тільки для вирізання дірок у траві
+                        cutting_mask_polys = build_road_polygons(
+                            G_roads,
+                            width_multiplier=float(request.road_width_multiplier),
+                            extra_buffer_m=1.5  # <-- ВАЖЛИВО: Додаємо "узбіччя" 1.5м з кожного боку
+                        )
+                        
+                        # Перетворюємо в локальні координати, якщо потрібно
+                        if cutting_mask_polys is not None and global_center is not None:
+                            from shapely.ops import transform as _transform_cutting_mask
+                            def _to_local_cutting(x, y, z=None):
+                                x_local, y_local = global_center.to_local(x, y)
+                                return (x_local, y_local) if z is None else (x_local, y_local, z)
+                            # Перевіряємо, чи потрібно перетворювати (чи вже в локальних)
+                            sample_bounds = cutting_mask_polys.bounds if hasattr(cutting_mask_polys, 'bounds') else None
+                            if sample_bounds and max(abs(float(sample_bounds[0])), abs(float(sample_bounds[1])), 
+                                                      abs(float(sample_bounds[2])), abs(float(sample_bounds[3]))) > 100000.0:
+                                # Виглядає як UTM, перетворюємо
+                                road_polygons_for_clipping = _transform_cutting_mask(_to_local_cutting, cutting_mask_polys)
+                            else:
+                                # Вже в локальних координатах
+                                road_polygons_for_clipping = cutting_mask_polys
+                        else:
+                            road_polygons_for_clipping = cutting_mask_polys
+                        
+                        # Обрізаємо по зоні, якщо потрібно
+                        if road_polygons_for_clipping is not None and zone_polygon_local is not None:
+                            try:
+                                road_polygons_for_clipping = road_polygons_for_clipping.intersection(zone_polygon_local)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"[WARN] Не вдалося підготувати широку маску доріг для вирізання: {e}")
+                        # Fallback до старої логіки
+                        try:
+                            road_polygons_for_clipping = locals().get("merged_roads_geom_local_raw")
+                            if road_polygons_for_clipping is None:
+                                road_polygons_for_clipping = locals().get("merged_roads_geom_local")
+                            if road_polygons_for_clipping is None and locals().get("merged_roads_geom") is not None and global_center is not None:
+                                from shapely.ops import transform as _transform_roads
+                                def _to_local_roads(x, y, z=None):
+                                    x_local, y_local = global_center.to_local(x, y)
+                                    return (x_local, y_local) if z is None else (x_local, y_local, z)
+                                road_polygons_for_clipping = _transform_roads(_to_local_roads, locals().get("merged_roads_geom"))
+                        except Exception as e2:
+                            print(f"[WARN] Fallback також не вдався: {e2}")
+                            road_polygons_for_clipping = None
+                    
+                    # Зменшуємо висоту зелених зон в 2 рази для кращого візуального балансу
                     parks_mesh = process_green_areas(
                         gdf_green,
-                        height_m=float(request.parks_height_mm) / float(scale_factor),
+                        height_m=(float(request.parks_height_mm) / float(scale_factor)) / 1.2,  # Висота зменшена в 2 рази
                         embed_m=float(request.parks_embed_mm) / float(scale_factor),
                         terrain_provider=terrain_provider,
                         global_center=None,  # already in local coords
                         scale_factor=float(scale_factor),
+                        # --- КРИТИЧНО: Передаємо полігони доріг для вирізання ---
+                        road_polygons=road_polygons_for_clipping,
                     )
                     if parks_mesh is None:
                         print(f"[WARN] process_green_areas повернув None для {len(gdf_green)} парків")
