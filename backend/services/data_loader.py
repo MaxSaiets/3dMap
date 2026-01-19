@@ -34,6 +34,42 @@ def _cache_key(north: float, south: float, east: float, west: float, padding: fl
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
 
 
+def _clean_gdf_for_parquet(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Очищує GeoDataFrame від колонок зі складними типами даних для збереження в Parquet"""
+    df = gdf.copy()
+    
+    # 1. Явно видаляємо відомі проблемні колонки (але НЕ u/v!)
+    problematic_cols = ['nodes', 'ways', 'relations', 'members', 'restrictions']
+    cols_to_drop = [c for c in problematic_cols if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+
+    # 2. Конвертуємо всі object-колонки в рядки (КРІМ u, v, geometry)
+    protected_cols = ['geometry', 'u', 'v', 'key']  # Захищені колонки для графу
+    for col in df.columns:
+        if col in protected_cols:
+            continue
+            
+        if df[col].dtype == 'object':
+            try:
+                # Перевіряємо, чи містить колонка списки/словники
+                has_complex = False
+                sample = df[col].dropna().head(20)
+                for val in sample:
+                    if isinstance(val, (list, dict, set, tuple)):
+                        has_complex = True
+                        break
+                
+                # Конвертуємо в string для безпечного збереження
+                df[col] = df[col].astype(str)
+            except Exception:
+                # Якщо конвертація не вдалася - видаляємо колонку (але не u/v!)
+                if col not in protected_cols and col in df.columns:
+                    df = df.drop(columns=[col])
+                    
+    return df
+
+
 def _save_to_cache(north: float, south: float, east: float, west: float, padding: float,
                    buildings: gpd.GeoDataFrame, water: gpd.GeoDataFrame, roads_graph) -> None:
     """Зберігає дані в кеш"""
@@ -47,41 +83,19 @@ def _save_to_cache(north: float, south: float, east: float, west: float, padding
         
         # Зберігаємо будівлі
         if buildings is not None and not buildings.empty:
-            buildings.to_parquet(cache_base / "buildings.parquet", index=False)
+            try:
+                buildings_clean = _clean_gdf_for_parquet(buildings)
+                buildings_clean.to_parquet(cache_base / "buildings.parquet", index=False)
+            except Exception as e:
+                 print(f"[WARN] Помилка збереження будівель в кеш: {e}")
         
         # Зберігаємо воду
         if water is not None and not water.empty:
             try:
-                # Видаляємо проблемні колонки зі складними об'єктами (як у дорогах)
-                water_clean = water.copy()
-                problematic_cols = ['nodes', 'refs', 'ways', 'lanes']  # Колонки, які часто містять списки
-                cols_to_drop = [col for col in problematic_cols if col in water_clean.columns]
-                
-                # Перевіряємо object колонки
-                for col in water_clean.columns:
-                    if col in ['geometry'] or col in cols_to_drop:
-                        continue
-                    if water_clean[col].dtype == 'object':
-                        try:
-                            sample = water_clean[col].dropna().head(5)
-                            for val in sample:
-                                if isinstance(val, (list, dict, set, tuple)):
-                                    if col not in cols_to_drop:
-                                        cols_to_drop.append(col)
-                                    break
-                        except:
-                            if col not in cols_to_drop:
-                                cols_to_drop.append(col)
-                
-                if cols_to_drop:
-                    print(f"[CACHE] Видаляємо {len(cols_to_drop)} проблемних колонок з води: {cols_to_drop}")
-                    water_clean = water_clean.drop(columns=cols_to_drop)
-                
+                water_clean = _clean_gdf_for_parquet(water)
                 water_clean.to_parquet(cache_base / "water.parquet", index=False)
             except Exception as e:
                 print(f"[WARN] Помилка збереження води в кеш: {e}")
-                import traceback
-                traceback.print_exc()
         
         # Зберігаємо дороги як GeoDataFrame edges
         if roads_graph is not None:
@@ -92,78 +106,9 @@ def _save_to_cache(north: float, south: float, east: float, west: float, padding
                     print(f"[CACHE] Конвертація {len(edges_list)} edges в GeoDataFrame...")
                     gdf_edges = ox.graph_to_gdfs(roads_graph, nodes=False)
                     if not gdf_edges.empty:
-                        print(f"[CACHE] GeoDataFrame має {len(gdf_edges.columns)} колонок: {list(gdf_edges.columns)[:10]}...")
-                        # Видаляємо колонки зі складними об'єктами, які не можуть бути збережені в Parquet
-                        # (наприклад, lists, dicts, або інші об'єкти)
-                        # Спочатку видаляємо відомі проблемні колонки
-                        known_problematic_cols = ['nodes', 'refs', 'lanes']  # Колонки, які часто містять списки
-                        columns_to_drop = [col for col in known_problematic_cols if col in gdf_edges.columns]
-                        if columns_to_drop:
-                            print(f"[CACHE] Виявлено відомі проблемні колонки: {columns_to_drop}")
+                        print(f"[CACHE] GeoDataFrame має {len(gdf_edges.columns)} колонок.")
                         
-                        # Перевіряємо інші колонки
-                        for col in gdf_edges.columns:
-                            if col in ['geometry', 'u', 'v'] or col in columns_to_drop:
-                                continue  # Залишаємо важливі колонки або вже позначені для видалення
-                            
-                            # Перевіряємо тип даних у колонці
-                            try:
-                                non_null = gdf_edges[col].dropna()
-                                if not non_null.empty:
-                                    sample_val = non_null.iloc[0]
-                                    # Якщо значення - це список, словник або інший складний об'єкт - видаляємо колонку
-                                    if isinstance(sample_val, (list, dict, set, tuple)):
-                                        columns_to_drop.append(col)
-                                    # Якщо це об'єкт (не простий тип) - також видаляємо
-                                    elif not isinstance(sample_val, (int, float, str, bool, type(None))):
-                                        # Перевіряємо, чи це не geometry (вона вже окремо обробляється)
-                                        if not hasattr(sample_val, '__geo_interface__'):
-                                            columns_to_drop.append(col)
-                                    # Додаткова перевірка: якщо dtype - object, але значення складні
-                                    elif gdf_edges[col].dtype == 'object':
-                                        # Перевіряємо кілька значень
-                                        try:
-                                            for val in non_null.head(5):
-                                                if isinstance(val, (list, dict, set, tuple)):
-                                                    columns_to_drop.append(col)
-                                                    break
-                                        except:
-                                            pass
-                            except (IndexError, AttributeError, TypeError) as e:
-                                # Якщо не вдалося перевірити - видаляємо для безпеки
-                                if col not in columns_to_drop:
-                                    columns_to_drop.append(col)
-                        
-                        # Додатково: видаляємо всі object колонки, які не є geometry, u, v
-                        # (Parquet має проблеми з object колонками, які містять складні типи)
-                        object_cols_to_check = [col for col in gdf_edges.columns 
-                                               if col not in ['geometry', 'u', 'v'] 
-                                               and col not in columns_to_drop
-                                               and gdf_edges[col].dtype == 'object']
-                        
-                        for col in object_cols_to_check:
-                            # Перевіряємо, чи можна безпечно зберегти цю колонку
-                            try:
-                                # Спробуємо конвертувати в string
-                                test_series = gdf_edges[col].dropna().head(10)
-                                for val in test_series:
-                                    if isinstance(val, (list, dict, set, tuple)):
-                                        columns_to_drop.append(col)
-                                        break
-                                    # Якщо це не простий тип - видаляємо
-                                    elif not isinstance(val, (int, float, str, bool, type(None))):
-                                        if not hasattr(val, '__geo_interface__'):
-                                            columns_to_drop.append(col)
-                                            break
-                            except:
-                                # Якщо не вдалося перевірити - видаляємо для безпеки
-                                if col not in columns_to_drop:
-                                    columns_to_drop.append(col)
-                        
-                        if columns_to_drop:
-                            print(f"[CACHE] Видаляємо {len(columns_to_drop)} колонок зі складними об'єктами: {columns_to_drop}")
-                            gdf_edges = gdf_edges.drop(columns=columns_to_drop)
-                            print(f"[CACHE] Після очищення залишилось {len(gdf_edges.columns)} колонок: {list(gdf_edges.columns)}")
+                        gdf_edges = _clean_gdf_for_parquet(gdf_edges)
                         
                         # Перевіряємо наявність 'u' та 'v' (потрібні для відновлення графу)
                         if 'u' not in gdf_edges.columns or 'v' not in gdf_edges.columns:
@@ -171,6 +116,8 @@ def _save_to_cache(north: float, south: float, east: float, west: float, padding
                             # Спробуємо відновити з індексів, якщо можливо
                             if hasattr(gdf_edges.index, 'names') and len(gdf_edges.index.names) >= 2:
                                 gdf_edges = gdf_edges.reset_index()
+                                # Ще раз чистимо, бо reset_index може повернути index-колонки як object
+                                gdf_edges = _clean_gdf_for_parquet(gdf_edges)
                         
                         try:
                             gdf_edges.to_parquet(cache_base / "roads_edges.parquet", index=False)
@@ -188,9 +135,9 @@ def _save_to_cache(north: float, south: float, east: float, west: float, padding
                                 with open(cache_base / "roads_metadata.json", 'w') as f:
                                     json.dump(graph_metadata, f)
                             
-                            print(f"[CACHE] ✅ Збережено {len(gdf_edges)} доріг в кеш: {cache_base}")
+                            print(f"[CACHE] ✅ Збережено {len(roads_graph.edges())} доріг в кеш: {cache_base}")
                         except Exception as parquet_error:
-                            print(f"[WARN] Помилка збереження в Parquet: {parquet_error}")
+                            print(f"[WARN] Помилка збереження доріг в Parquet: {parquet_error}")
                             # Спробуємо зберегти тільки основні колонки
                             try:
                                 basic_cols = ['geometry', 'u', 'v'] + [c for c in gdf_edges.columns if c not in ['geometry', 'u', 'v'] and gdf_edges[c].dtype in ['int64', 'float64', 'object']]

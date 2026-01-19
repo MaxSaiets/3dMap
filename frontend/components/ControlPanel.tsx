@@ -23,8 +23,8 @@ interface ControlPanelProps {
   setHexSizeM?: (size: number) => void;
 }
 
-export function ControlPanel({ 
-  showHexGrid: externalShowHexGrid, 
+export function ControlPanel({
+  showHexGrid: externalShowHexGrid,
   setShowHexGrid: externalSetShowHexGrid,
   selectedZones: externalSelectedZones,
   setSelectedZones: externalSetSelectedZones,
@@ -88,7 +88,7 @@ export function ControlPanel({
   // Використовуємо зовнішні стани якщо передані, інакше внутрішні
   const [internalShowHexGrid, setInternalShowHexGrid] = useState(false);
   const [internalSelectedZones, setInternalSelectedZones] = useState<any[]>([]);
-  
+
   const showHexGrid = externalShowHexGrid !== undefined ? externalShowHexGrid : internalShowHexGrid;
   const setShowHexGrid = externalSetShowHexGrid || setInternalShowHexGrid;
   const selectedZones = externalSelectedZones !== undefined ? externalSelectedZones : internalSelectedZones;
@@ -97,7 +97,7 @@ export function ControlPanel({
   // Налаштування сітки (використовуємо зовнішні якщо передані)
   const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square">("hexagonal");
   const [internalHexSizeM, setInternalHexSizeM] = useState(500.0);
-  
+
   const gridType = externalGridType !== undefined ? externalGridType : internalGridType;
   const setGridType = externalSetGridType || setInternalGridType;
   const hexSizeM = externalHexSizeM !== undefined ? externalHexSizeM : internalHexSizeM;
@@ -309,6 +309,9 @@ export function ControlPanel({
         : [response.task_id];
       setTaskGroup(response.task_id, ids);
       setActiveTaskId(ids[0] ?? null);
+      if (ids.length > 1) {
+        setShowAllZones(true);
+      }
 
       // Batch preview positioning: keep mapping taskId -> selected zone (row/col) in the same order
       try {
@@ -333,7 +336,7 @@ export function ControlPanel({
   return (
     <div className="p-4 space-y-6 overflow-y-auto h-full">
       <h1 className="text-2xl font-bold">3D Map Generator</h1>
-      
+
       {/* Секція вибору режиму роботи */}
       <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
         <h2 className="text-lg font-semibold">Режим роботи</h2>
@@ -344,11 +347,10 @@ export function ControlPanel({
               setSelectedZones([]);
               setError(null);
             }}
-            className={`flex-1 px-4 py-2 rounded transition-colors ${
-              !showHexGrid
+            className={`flex-1 px-4 py-2 rounded transition-colors ${!showHexGrid
                 ? "bg-blue-600 text-white"
                 : "bg-gray-200 text-gray-700 hover:bg-gray-300"
-            }`}
+              }`}
           >
             Одна область
           </button>
@@ -357,11 +359,10 @@ export function ControlPanel({
               setShowHexGrid(true);
               setError(null);
             }}
-            className={`flex-1 px-4 py-2 rounded transition-colors ${
-              showHexGrid
+            className={`flex-1 px-4 py-2 rounded transition-colors ${showHexGrid
                 ? "bg-blue-600 text-white"
                 : "bg-gray-200 text-gray-700 hover:bg-gray-300"
-            }`}
+              }`}
           >
             <Grid size={16} className="inline mr-1" />
             Сітка зон
@@ -373,7 +374,7 @@ export function ControlPanel({
       {showHexGrid && (
         <div className="space-y-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
           <h2 className="text-lg font-semibold text-blue-900">Налаштування сітки</h2>
-          
+
           <div>
             <label className="block text-sm font-medium mb-1">
               Тип сітки
@@ -480,9 +481,8 @@ export function ControlPanel({
                 // тригеримо перезавантаження превʼю
                 setDownloadUrl(null);
               }}
-              className={`px-3 py-1 rounded text-xs ${
-                showAllZones ? "bg-purple-600 text-white" : "bg-purple-100 text-purple-800 hover:bg-purple-200"
-              }`}
+              className={`px-3 py-1 rounded text-xs ${showAllZones ? "bg-purple-600 text-white" : "bg-purple-100 text-purple-800 hover:bg-purple-200"
+                }`}
             >
               {showAllZones ? "Показувати одну зону" : "Показати всі зони разом"}
             </button>
@@ -516,9 +516,8 @@ export function ControlPanel({
                     // ignore
                   }
                 }}
-                className={`w-full text-left px-2 py-1 rounded text-sm ${
-                  id === activeTaskId ? "bg-blue-100" : "hover:bg-gray-100"
-                }`}
+                className={`w-full text-left px-2 py-1 rounded text-sm ${id === activeTaskId ? "bg-blue-100" : "hover:bg-gray-100"
+                  }`}
               >
                 {id === activeTaskId ? "▶ " : ""}
                 {id}
@@ -538,256 +537,256 @@ export function ControlPanel({
           <span>Параметри генерації</span>
           <span className="text-sm">{isParamsExpanded ? "▼" : "▶"}</span>
         </button>
-        
+
         {isParamsExpanded && (
-        <div className="space-y-4">
+          <div className="space-y-4">
 
-        {/* Дороги */}
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Ширина доріг (множник): {roadWidthMultiplier.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.3"
-            max="2.0"
-            step="0.1"
-            value={roadWidthMultiplier}
-            onChange={(e) => setRoadWidthMultiplier(parseFloat(e.target.value))}
-            className="w-full"
-          />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Висота доріг (мм на моделі): {roadHeightMm.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.2"
-            max="3.0"
-            step="0.1"
-            value={roadHeightMm}
-            onChange={(e) => setRoadHeightMm(parseFloat(e.target.value))}
-            className="w-full"
-          />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Втиснення доріг у рельєф (мм): {roadEmbedMm.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.0"
-            max="1.0"
-            step="0.1"
-            value={roadEmbedMm}
-            onChange={(e) => setRoadEmbedMm(parseFloat(e.target.value))}
-            className="w-full"
-          />
-          <div className="text-xs text-gray-500 mt-1">
-            Допомагає прибрати “висять/мерехтять” на стику з землею.
-          </div>
-        </div>
-
-        {/* Будівлі */}
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Мінімальна висота будівлі (м): {buildingMinHeight.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="1.0"
-            max="10.0"
-            step="0.5"
-            value={buildingMinHeight}
-            onChange={(e) => setBuildingMinHeight(parseFloat(e.target.value))}
-            className="w-full"
-          />
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Множник висоти будівель: {buildingHeightMultiplier.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.5"
-            max="3.0"
-            step="0.1"
-            value={buildingHeightMultiplier}
-            onChange={(e) => setBuildingHeightMultiplier(parseFloat(e.target.value))}
-            className="w-full"
-          />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Фундамент будівель (мм): {buildingFoundationMm.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.1"
-            max="3.0"
-            step="0.1"
-            value={buildingFoundationMm}
-            onChange={(e) => setBuildingFoundationMm(parseFloat(e.target.value))}
-            className="w-full"
-          />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Втиснення будівель у землю (мм): {buildingEmbedMm.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.0"
-            max="1.0"
-            step="0.1"
-            value={buildingEmbedMm}
-            onChange={(e) => setBuildingEmbedMm(parseFloat(e.target.value))}
-            className="w-full"
-          />
-          <div className="text-xs text-gray-500 mt-1">
-            Якщо будівлі “залазять під землю” — зменшуй. Якщо “висять” — збільшуй.
-          </div>
-        </div>
-
-        {/* Вода */}
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Глибина води (мм): {waterDepth.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.5"
-            max="5.0"
-            step="0.5"
-            value={waterDepth}
-            onChange={(e) => setWaterDepth(parseFloat(e.target.value))}
-            className="w-full"
-          />
-        </div>
-
-        {/* Рельєф */}
-        <div className="flex items-center space-x-2">
-          <input
-            type="checkbox"
-            id="terrain"
-            checked={terrainEnabled}
-            onChange={(e) => setTerrainEnabled(e.target.checked)}
-            className="w-4 h-4"
-          />
-          <label htmlFor="terrain" className="text-sm font-medium">
-            Увімкнути рельєф
-          </label>
-        </div>
-
-        {terrainEnabled && (
-          <div className="space-y-3">
+            {/* Дороги */}
             <div>
               <label className="block text-sm font-medium mb-1">
-                Множник висоти рельєфу: {terrainZScale.toFixed(1)}
+                Ширина доріг (множник): {roadWidthMultiplier.toFixed(1)}
+              </label>
+              <input
+                type="range"
+                min="0.3"
+                max="2.0"
+                step="0.1"
+                value={roadWidthMultiplier}
+                onChange={(e) => setRoadWidthMultiplier(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Висота доріг (мм на моделі): {roadHeightMm.toFixed(1)}
+              </label>
+              <input
+                type="range"
+                min="0.2"
+                max="3.0"
+                step="0.1"
+                value={roadHeightMm}
+                onChange={(e) => setRoadHeightMm(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Втиснення доріг у рельєф (мм): {roadEmbedMm.toFixed(1)}
+              </label>
+              <input
+                type="range"
+                min="0.0"
+                max="1.0"
+                step="0.1"
+                value={roadEmbedMm}
+                onChange={(e) => setRoadEmbedMm(parseFloat(e.target.value))}
+                className="w-full"
+              />
+              <div className="text-xs text-gray-500 mt-1">
+                Допомагає прибрати “висять/мерехтять” на стику з землею.
+              </div>
+            </div>
+
+            {/* Будівлі */}
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Мінімальна висота будівлі (м): {buildingMinHeight.toFixed(1)}
+              </label>
+              <input
+                type="range"
+                min="1.0"
+                max="10.0"
+                step="0.5"
+                value={buildingMinHeight}
+                onChange={(e) => setBuildingMinHeight(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Множник висоти будівель: {buildingHeightMultiplier.toFixed(1)}
               </label>
               <input
                 type="range"
                 min="0.5"
                 max="3.0"
                 step="0.1"
-                value={terrainZScale}
-                onChange={(e) => setTerrainZScale(parseFloat(e.target.value))}
+                value={buildingHeightMultiplier}
+                onChange={(e) => setBuildingHeightMultiplier(parseFloat(e.target.value))}
                 className="w-full"
               />
             </div>
-
             <div>
               <label className="block text-sm font-medium mb-1">
-                Деталізація рельєфу (mesh): {terrainResolution}×{terrainResolution}
+                Фундамент будівель (мм): {buildingFoundationMm.toFixed(1)}
               </label>
               <input
                 type="range"
-                min="120"
-                max="320"
-                step="20"
-                value={terrainResolution}
-                onChange={(e) => setTerrainResolution(parseInt(e.target.value, 10))}
+                min="0.1"
+                max="3.0"
+                step="0.1"
+                value={buildingFoundationMm}
+                onChange={(e) => setBuildingFoundationMm(parseFloat(e.target.value))}
                 className="w-full"
               />
-              <div className="text-xs text-gray-500 mt-1">
-                Більше = детальніше, але повільніше генерує.
-              </div>
             </div>
-
             <div>
               <label className="block text-sm font-medium mb-1">
-                Terrarium zoom (DEM tiles): {terrariumZoom}
+                Втиснення будівель у землю (мм): {buildingEmbedMm.toFixed(1)}
               </label>
               <input
                 type="range"
-                min="11"
-                max="16"
-                step="1"
-                value={terrariumZoom}
-                onChange={(e) => setTerrariumZoom(parseInt(e.target.value, 10))}
+                min="0.0"
+                max="1.0"
+                step="0.1"
+                value={buildingEmbedMm}
+                onChange={(e) => setBuildingEmbedMm(parseFloat(e.target.value))}
                 className="w-full"
               />
               <div className="text-xs text-gray-500 mt-1">
-                14–15 рекомендовано. 16 може бути повільно (багато тайлів).
+                Якщо будівлі “залазять під землю” — зменшуй. Якщо “висять” — збільшуй.
               </div>
             </div>
 
+            {/* Вода */}
             <div>
               <label className="block text-sm font-medium mb-1">
-                Товщина основи рельєфу (мм): {terrainBaseThicknessMm.toFixed(1)}
+                Глибина води (мм): {waterDepth.toFixed(1)}
               </label>
               <input
                 type="range"
-                min="1.0"
-                max="12.0"
+                min="0.5"
+                max="5.0"
                 step="0.5"
-                value={terrainBaseThicknessMm}
-                onChange={(e) => setTerrainBaseThicknessMm(parseFloat(e.target.value))}
+                value={waterDepth}
+                onChange={(e) => setWaterDepth(parseFloat(e.target.value))}
                 className="w-full"
               />
-              <div className="text-xs text-gray-500 mt-1">
-                Робить “цеглину”, а не “листок” — важливо для 3D-друку.
+            </div>
+
+            {/* Рельєф */}
+            <div className="flex items-center space-x-2">
+              <input
+                type="checkbox"
+                id="terrain"
+                checked={terrainEnabled}
+                onChange={(e) => setTerrainEnabled(e.target.checked)}
+                className="w-4 h-4"
+              />
+              <label htmlFor="terrain" className="text-sm font-medium">
+                Увімкнути рельєф
+              </label>
+            </div>
+
+            {terrainEnabled && (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Множник висоти рельєфу: {terrainZScale.toFixed(1)}
+                  </label>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="3.0"
+                    step="0.1"
+                    value={terrainZScale}
+                    onChange={(e) => setTerrainZScale(parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Деталізація рельєфу (mesh): {terrainResolution}×{terrainResolution}
+                  </label>
+                  <input
+                    type="range"
+                    min="120"
+                    max="320"
+                    step="20"
+                    value={terrainResolution}
+                    onChange={(e) => setTerrainResolution(parseInt(e.target.value, 10))}
+                    className="w-full"
+                  />
+                  <div className="text-xs text-gray-500 mt-1">
+                    Більше = детальніше, але повільніше генерує.
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Terrarium zoom (DEM tiles): {terrariumZoom}
+                  </label>
+                  <input
+                    type="range"
+                    min="11"
+                    max="16"
+                    step="1"
+                    value={terrariumZoom}
+                    onChange={(e) => setTerrariumZoom(parseInt(e.target.value, 10))}
+                    className="w-full"
+                  />
+                  <div className="text-xs text-gray-500 mt-1">
+                    14–15 рекомендовано. 16 може бути повільно (багато тайлів).
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Товщина основи рельєфу (мм): {terrainBaseThicknessMm.toFixed(1)}
+                  </label>
+                  <input
+                    type="range"
+                    min="1.0"
+                    max="12.0"
+                    step="0.5"
+                    value={terrainBaseThicknessMm}
+                    onChange={(e) => setTerrainBaseThicknessMm(parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                  <div className="text-xs text-gray-500 mt-1">
+                    Робить “цеглину”, а не “листок” — важливо для 3D-друку.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Формат експорту */}
+            <div>
+              <label className="block text-sm font-medium mb-1">Формат експорту</label>
+              <select
+                value={exportFormat}
+                onChange={(e) => setExportFormat(e.target.value as "stl" | "3mf")}
+                className="w-full p-2 border rounded"
+              >
+                <option value="3mf">3MF (рекомендовано)</option>
+                <option value="stl">STL</option>
+              </select>
+            </div>
+
+            {/* Розмір моделі */}
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Розмір моделі: {modelSizeMm.toFixed(0)} мм ({(modelSizeMm / 10).toFixed(1)} см)
+              </label>
+              <input
+                type="range"
+                min="50"
+                max="500"
+                step="10"
+                value={modelSizeMm}
+                onChange={(e) => setModelSizeMm(parseFloat(e.target.value))}
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>50 мм (5 см)</span>
+                <span>250 мм (25 см)</span>
+                <span>500 мм (50 см)</span>
               </div>
             </div>
           </div>
-        )}
-
-        {/* Формат експорту */}
-        <div>
-          <label className="block text-sm font-medium mb-1">Формат експорту</label>
-          <select
-            value={exportFormat}
-            onChange={(e) => setExportFormat(e.target.value as "stl" | "3mf")}
-            className="w-full p-2 border rounded"
-          >
-            <option value="3mf">3MF (рекомендовано)</option>
-            <option value="stl">STL</option>
-          </select>
-        </div>
-
-        {/* Розмір моделі */}
-        <div>
-          <label className="block text-sm font-medium mb-1">
-            Розмір моделі: {modelSizeMm.toFixed(0)} мм ({(modelSizeMm / 10).toFixed(1)} см)
-          </label>
-          <input
-            type="range"
-            min="50"
-            max="500"
-            step="10"
-            value={modelSizeMm}
-            onChange={(e) => setModelSizeMm(parseFloat(e.target.value))}
-            className="w-full"
-          />
-          <div className="flex justify-between text-xs text-gray-500 mt-1">
-            <span>50 мм (5 см)</span>
-            <span>250 мм (25 см)</span>
-            <span>500 мм (50 см)</span>
-          </div>
-        </div>
-        </div>
         )}
       </div>
 

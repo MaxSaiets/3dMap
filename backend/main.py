@@ -1109,9 +1109,19 @@ async def generate_model_task(
         # Дані будуть одразу обрізатись по полігону зони після завантаження
         task.update_status("processing", 10, "Завантаження даних OSM для зони...")
 
-        # Завантажуємо дані ТІЛЬКИ для цієї зони (без padding для швидкості та меншого використання пам'яті)
+        # Завантажуємо дані ТІЛЬКИ для цієї зони
+        # ВАЖЛИВО: Для доріг використовуємо padding, щоб отримати повні мости з сусідніх зон
         print(f"[DEBUG] Завантаження даних для зони: north={request.north}, south={request.south}, east={request.east}, west={request.west}")
-        gdf_buildings, gdf_water, G_roads = fetch_city_data(request.north, request.south, request.east, request.west)
+        
+        # Padding для доріг (0.01° ≈ 1км) для детекції мостів
+        road_padding = 0.01
+        gdf_buildings, gdf_water, G_roads = fetch_city_data(
+            request.north + road_padding, 
+            request.south - road_padding, 
+            request.east + road_padding, 
+            request.west - road_padding,
+            padding=0.002  # Стандартний padding для будівель/води
+        )
         
         # Логування завантажених даних
         num_buildings = len(gdf_buildings) if gdf_buildings is not None and not gdf_buildings.empty else 0
@@ -1498,13 +1508,47 @@ async def generate_model_task(
             road_height_m = float(request.road_height_mm) / float(scale_factor)
             road_embed_m = float(request.road_embed_mm) / float(scale_factor)
 
+
         # Підготовка водних геометрій для визначення мостів
+        # КРИТИЧНО: Використовуємо КЕШІ МІСТА для детекції мостів
+        # Це вирішує проблему, коли міст перетинає межу зони (другий берег в іншій зоні)
         water_geoms_for_bridges = None
         if gdf_water is not None and not gdf_water.empty:
             try:
                 water_geoms_for_bridges = list(gdf_water.geometry.values)
             except Exception:
                 water_geoms_for_bridges = None
+        
+        # Додатково завантажуємо воду з КЕШУ МІСТА для детекції мостів на краях зони
+        # Кеш містить дані для всієї області (всі зони), тому захоплює віддалені береги
+        try:
+            city_cache_key = getattr(request, 'city_cache_key', None)
+            if city_cache_key:
+                print(f"[DEBUG] Завантаження води з кешу міста для детекції мостів (key={city_cache_key})...")
+                from services.data_loader import load_city_cache
+                
+                city_data = load_city_cache(city_cache_key)
+                if city_data and 'water' in city_data:
+                    gdf_water_city = city_data['water']
+                    if gdf_water_city is not None and not gdf_water_city.empty:
+                        # Об'єднуємо з оригінальною водою (щоб не втратити локальні водойми)
+                        if water_geoms_for_bridges is None:
+                            water_geoms_for_bridges = list(gdf_water_city.geometry.values)
+                        else:
+                            # Додаємо тільки унікальні геометрії (щоб не дублювати)
+                            existing_bounds = {g.bounds for g in water_geoms_for_bridges if g is not None}
+                            for g in gdf_water_city.geometry.values:
+                                if g is not None and g.bounds not in existing_bounds:
+                                    water_geoms_for_bridges.append(g)
+                        print(f"[DEBUG] Додано {len(gdf_water_city)} водних об'єктів з кешу міста для детекції мостів")
+                else:
+                    print(f"[DEBUG] Кеш міста не містить води, використовуємо тільки локальну воду")
+            else:
+                print(f"[DEBUG] city_cache_key не задано, використовуємо тільки локальну воду для детекції мостів")
+        except Exception as e:
+            print(f"[WARN] Не вдалося завантажити воду з кешу міста: {e}")
+            # Продовжуємо з оригінальною водою
+        
         
         road_mesh = None
         if G_roads is not None:
@@ -1538,6 +1582,7 @@ async def generate_model_task(
                 global_center=gc_for_roads,
                 min_width_m=min_road_width_m,
                 clip_polygon=zone_polygon_local,  # pre-clip roads to zone BEFORE extrusion
+                city_cache_key=city_cache_key,  # For cross-zone bridge detection
             )
             if road_mesh is None:
                 print("[WARN] process_roads повернув None")

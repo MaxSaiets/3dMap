@@ -18,7 +18,7 @@ interface GenerationState {
   showAllZones: boolean;
   // Batch preview: mapping taskId -> zone meta (so we can place tiles like on the map)
   batchZoneMetaByTaskId: Record<string, { zoneId: string; row?: number; col?: number }>;
-  
+
   // Параметри генерації
   roadWidthMultiplier: number;
   roadHeightMm: number;
@@ -38,7 +38,7 @@ interface GenerationState {
 
   // Preview only
   terrainSmoothShading: boolean;
-  
+
   // Actions
   setSelectedArea: (area: LatLngBounds | null) => void;
   setGenerating: (isGenerating: boolean) => void;
@@ -49,7 +49,7 @@ interface GenerationState {
   setBatchZoneMetaByTaskId: (value: Record<string, { zoneId: string; row?: number; col?: number }>) => void;
   updateProgress: (progress: number, status: string) => void;
   setDownloadUrl: (url: string | null) => void;
-  
+
   // Параметри
   setRoadWidthMultiplier: (value: number) => void;
   setRoadHeightMm: (value: number) => void;
@@ -68,7 +68,7 @@ interface GenerationState {
   setModelSizeMm: (value: number) => void;
 
   setTerrainSmoothShading: (value: boolean) => void;
-  
+
   reset: () => void;
 }
 
@@ -97,7 +97,7 @@ const initialState = {
   buildingEmbedMm: 0.2,
   waterDepth: 2.0,
   terrainEnabled: true,
-  terrainZScale: 0.5,
+  terrainZScale: 1.0,
   // Тонка “підложка” під рельєф (мм на фінальній моделі)
   terrainBaseThicknessMm: 2.0,
   // Вища деталізація рельєфу -> менші трикутники, більше “реальності”
@@ -112,7 +112,7 @@ const initialState = {
 
 export const useGenerationStore = create<GenerationState>((set) => ({
   ...initialState,
-  
+
   setSelectedArea: (area) => set({ selectedArea: area }),
   setGenerating: (isGenerating) => set({ isGenerating }),
   setTaskGroup: (taskGroupId, taskIds) =>
@@ -135,7 +135,7 @@ export const useGenerationStore = create<GenerationState>((set) => ({
   setBatchZoneMetaByTaskId: (batchZoneMetaByTaskId) => set({ batchZoneMetaByTaskId }),
   updateProgress: (progress, status) => set({ progress, status }),
   setDownloadUrl: (url) => set({ downloadUrl: url }),
-  
+
   setRoadWidthMultiplier: (value) => set({ roadWidthMultiplier: value }),
   setRoadHeightMm: (value) => set({ roadHeightMm: value }),
   setRoadEmbedMm: (value) => set({ roadEmbedMm: value }),
@@ -153,7 +153,7 @@ export const useGenerationStore = create<GenerationState>((set) => ({
   setModelSizeMm: (value) => set({ modelSizeMm: value }),
 
   setTerrainSmoothShading: (value) => set({ terrainSmoothShading: value }),
-  
+
   reset: () => set(initialState),
 }));
 

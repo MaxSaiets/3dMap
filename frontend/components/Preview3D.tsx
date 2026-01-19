@@ -141,13 +141,13 @@ async function loadColoredPartsFromBlobs(blobs: Partial<Record<"base" | "roads" 
 // Функція для завантаження 3MF (3MF це ZIP з XML та STL файлами всередині)
 async function load3MF(blob: Blob): Promise<THREE.Group> {
   console.log("Завантаження 3MF, розмір:", blob.size);
-  
+
   try {
     // ThreeMFLoader потребує URL, але може не працювати з blob URL
     // Спробуємо спочатку через ThreeMFLoader, якщо не вийде - розпакуємо ZIP вручну
     const zipUrl = URL.createObjectURL(blob);
     console.log("Створено URL для 3MF ZIP");
-    
+
     try {
       return await new Promise<THREE.Group>((resolve, reject) => {
         const loader = new ThreeMFLoader();
@@ -157,11 +157,11 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
             URL.revokeObjectURL(zipUrl);
             console.log("3MF модель завантажена через ThreeMFLoader");
             console.log("Об'єктів в моделі:", object.children.length);
-            
+
             // ThreeMFLoader повертає Object3D, обгортаємо в Group
             const group = new THREE.Group();
             group.add(object);
-            
+
             // Логуємо інформацію про модель
             let totalVertices = 0;
             let totalMeshes = 0;
@@ -175,12 +175,12 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
               }
             });
             console.log("Загальна кількість вершин:", totalVertices, "мешів:", totalMeshes);
-            
+
             if (totalVertices === 0) {
               reject(new Error("Модель не містить вершин"));
               return;
             }
-            
+
             resolve(group);
           },
           undefined,
@@ -194,24 +194,24 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
     } catch (loaderError: any) {
       URL.revokeObjectURL(zipUrl);
       console.log("ThreeMFLoader не спрацював, розпаковуємо ZIP вручну...");
-      
+
       // Fallback: розпаковуємо ZIP і шукаємо STL або використовуємо .model файл
       const zip = await JSZip.loadAsync(blob);
       console.log("3MF ZIP розпаковано, файлів:", Object.keys(zip.files).length);
-      
+
       // Шукаємо .model файл
       const modelFile = zip.file("3D/3dmodel.model");
       if (!modelFile) {
         throw new Error("Не знайдено файл 3D/3dmodel.model в 3MF");
       }
-      
+
       const modelBlob = await modelFile.async('blob');
       console.log("Файл моделі витягнуто, розмір:", modelBlob.size);
-      
+
       // Перевіряємо, чи це XML (3MF формат) або бінарний (STL)
       const firstBytes = await modelBlob.slice(0, 50).text();
       const isXML = firstBytes.trim().startsWith('<?xml') || firstBytes.trim().startsWith('<model');
-      
+
       if (isXML) {
         // Це XML 3MF - потрібен парсер, але наразі використаємо fallback
         throw new Error("XML 3MF формат потребує спеціального парсера. Використовуйте STL формат або встановіть 3MF парсер.");
@@ -225,9 +225,9 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
             (geometry) => {
               URL.revokeObjectURL(stlUrl);
               console.log("STL геометрія завантажена:", geometry.attributes.position.count, "вершин");
-              const material = new THREE.MeshStandardMaterial({ 
+              const material = new THREE.MeshStandardMaterial({
                 color: 0x888888,
-                flatShading: true 
+                flatShading: true
               });
               const mesh = new THREE.Mesh(geometry, material);
               bakeStlZUpToThreeYUp(mesh);
@@ -255,7 +255,7 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
 function CameraController() {
   const { downloadUrl, showAllZones, taskIds } = useGenerationStore();
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  
+
   useEffect(() => {
     // Налаштовуємо камеру для кращого перегляду
     const timer = setTimeout(() => {
@@ -280,15 +280,15 @@ function CameraController() {
         cameraRef.current.updateProjectionMatrix();
       }
     }, 100);
-    
+
     return () => clearTimeout(timer);
   }, [downloadUrl, showAllZones, taskIds]);
-  
+
   return (
-    <PerspectiveCamera 
+    <PerspectiveCamera
       ref={cameraRef}
-      makeDefault 
-      position={[300, 300, 300]} 
+      makeDefault
+      position={[300, 300, 300]}
       fov={50}
       near={0.1}
       far={2000}
@@ -471,7 +471,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
   useEffect(() => {
     if (showAllZones) return;
     if (hasLoadedTestModel || downloadUrl) return;
-    
+
     const loadTestModel = async () => {
       setLoading(true);
       try {
@@ -517,7 +517,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
           const blob = await response.blob();
           loadedModel = await loadStlAsMesh(blob, 0x888888);
         }
-        
+
         // ВАЖЛИВО: для стабільного превʼю не центруємо по "висоті".
         // Ми ставимо модель на "підлогу" (minY=0) і центруємо тільки X/Z.
         // Інакше камера часто опиняється під моделлю, а обʼєкти виглядають так, ніби "висять".
@@ -550,7 +550,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
         } else {
           console.error("❌ Модель має нульовий розмір!");
         }
-        
+
         console.log("✅ Тестова модель готова до відображення");
         setModel(loadedModel);
         setHasLoadedTestModel(true);
@@ -560,7 +560,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
         setLoading(false);
       }
     };
-    
+
     loadTestModel();
   }, [hasLoadedTestModel, downloadUrl]);
 
@@ -729,6 +729,24 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
               item.model.obj.position.y = -item.min.y;
               item.model.obj.updateMatrixWorld(true);
             });
+          } else {
+            // Fallback: Simple grid layout based on index if no row/col meta
+            console.warn("Batch preview: No row/col metadata found, using fallback grid layout");
+            const count = zoneInfo.length;
+            const cols = Math.ceil(Math.sqrt(count));
+            const maxW = Math.max(...zoneInfo.map((z) => z.size.x));
+            const maxD = Math.max(...zoneInfo.map((z) => z.size.z));
+            const padding = 20; // mm
+
+            zoneInfo.forEach((item, index) => {
+              const r = Math.floor(index / cols);
+              const c = index % cols;
+
+              item.model.obj.position.x = c * (maxW + padding) - item.center.x;
+              item.model.obj.position.z = r * (maxD + padding) - item.center.z;
+              item.model.obj.position.y = -item.min.y;
+              item.model.obj.updateMatrixWorld(true);
+            });
           }
         }
 
@@ -743,7 +761,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
 
         // Додаємо легкі візуальні індикатори для кожної зони (опціонально)
         // Для продуктивності не додаємо складні об'єкти, але зберігаємо інформацію
-        
+
         (group as any).userData = { batch: true, ids: idsToLoad, zoneCount: idsToLoad.length };
         setModel(group);
       } catch (e: any) {
@@ -771,14 +789,14 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
       }
       return;
     }
-    
+
     // Якщо модель вже завантажена для цього taskId, не перезавантажуємо
     const currentTaskId = (model as any)?.userData?.taskId;
     if (model && currentTaskId === activeTaskId) {
       console.log("Модель вже завантажена для цього taskId, пропускаємо перезавантаження");
       return;
     }
-    
+
     // Якщо завантажуємо нову модель, скидаємо попередню (якщо вона не тестова)
     if (model && !hasLoadedTestModel) {
       console.log("Завантажуємо нову модель, скидаємо попередню");
@@ -859,7 +877,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
         console.log("Розміри моделі після обробки:", sizeAfter.x, sizeAfter.y, sizeAfter.z);
         console.log("Центр моделі після обробки:", centerAfter.x, centerAfter.y, centerAfter.z);
         console.log("Модель успішно завантажена та оброблена");
-        
+
         // Зберігаємо інформацію про модель для налаштування камери
         (loadedModel as any).userData = {
           size: sizeAfter,
@@ -868,7 +886,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
           taskId: activeTaskId,  // Зберігаємо taskId, щоб не перезавантажувати
           exportFormat: exportFormat
         };
-        
+
         console.log("✅ Модель готова до відображення, встановлюємо в state");
         setModel(loadedModel);
         setLoading(false);
@@ -952,7 +970,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
 
   console.log("ModelLoader: відображаємо модель", model);
   console.log("ModelLoader: downloadUrl:", downloadUrl, "taskId:", activeTaskId, "loading:", loading, "error:", error);
-  
+
   // Перевіряємо, чи модель має геометрію
   let hasGeometry = false;
   let vertexCount = 0;
@@ -971,9 +989,9 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
       vertexCount = model.geometry.attributes.position.count;
     }
   }
-  
+
   console.log("ModelLoader: модель має геометрію:", hasGeometry, "вершин:", vertexCount);
-  
+
   if (!hasGeometry || vertexCount === 0) {
     console.warn("⚠️ Модель не містить геометрії або має 0 вершин!");
     // Не повертаємо null, щоб не зникнути - показуємо placeholder
@@ -1057,7 +1075,7 @@ export function Preview3D() {
   const [rotateMode, setRotateMode] = useState<RotateMode>("camera");
   const [cameraMode, setCameraMode] = useState<CameraMode>("orbit");
   const [flySpeed, setFlySpeed] = useState<number>(120);
-  
+
   return (
     <div className="w-full h-full bg-gray-900 relative" style={{ minHeight: '100%' }}>
       {/* UI overlay */}

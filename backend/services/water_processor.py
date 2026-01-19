@@ -125,334 +125,220 @@ def process_water_surface(
 ) -> Optional[trimesh.Trimesh]:
     """
     Creates a thin "water surface" mesh for preview / multi-color printing.
-    Assumes the terrain was already depressed by depth_meters, so we place the surface at:
-      surface_z = ground_z + depth_meters
     """
     if gdf_water is None or gdf_water.empty:
         return None
     if thickness_m <= 0:
         return None
 
-    # ВАЖЛИВО: Перетворюємо gdf_water в локальні координати, якщо використовується глобальний центр
-    # gdf_water приходить з pbf_loader в UTM координатах, але terrain_provider працює з локальними координатами
+    # Noise parameters for water texture
+    ADD_TEXTURE = True
+    NOISE_SCALE = 20.0  # Scale of the waves (meters)
+    NOISE_AMPLITUDE = 0.15  # Height of the waves (meters) - increased for 3D printing visibility
+    
+    if ADD_TEXTURE:
+        try:
+            # Use opensimplex or simple numpy noise
+            try:
+                from opensimplex import OpenSimplex
+                noise_gen = OpenSimplex(seed=42)
+                def get_noise(x, y):
+                    # 2D noise
+                    return noise_gen.noise2(x / NOISE_SCALE, y / NOISE_SCALE) * NOISE_AMPLITUDE
+            except ImportError:
+                 # Fallback to simple sine interference
+                def get_noise(x, y):
+                    v1 = np.sin(x / NOISE_SCALE * 3.0)
+                    v2 = np.cos(y / NOISE_SCALE * 2.5)
+                    v3 = np.sin((x + y) / NOISE_SCALE * 4.0)
+                    return (v1 + v2 + v3) * 0.33 * NOISE_AMPLITUDE
+        except Exception:
+            ADD_TEXTURE = False
+
+
     if global_center is not None:
         try:
             print(f"[DEBUG] Перетворюємо gdf_water з UTM в локальні координати (глобальний центр)")
-            # Створюємо функцію трансформації для Shapely
             def to_local_transform(x, y, z=None):
-                """Трансформер: UTM -> локальні координати"""
                 x_local, y_local = global_center.to_local(x, y)
                 if z is not None:
                     return (x_local, y_local, z)
                 return (x_local, y_local)
             
-            # Перетворюємо всі геометрії в локальні координати
             gdf_water_local = gdf_water.copy()
             gdf_water_local['geometry'] = gdf_water_local['geometry'].apply(
                 lambda geom: transform(to_local_transform, geom) if geom is not None and not geom.is_empty else geom
             )
             gdf_water = gdf_water_local
-            print(f"[DEBUG] Перетворено {len(gdf_water)} геометрій води в локальні координати")
         except Exception as e:
             print(f"[WARN] Не вдалося перетворити gdf_water в локальні координати: {e}")
-            import traceback
-            traceback.print_exc()
-    
+
     meshes = []
     clip_box = None
-    # ВАЖЛИВО: terrain_provider.get_bounds() вже повертає локальні координати
-    # (X та Y вже центровані в terrain_generator), тому НЕ потрібно перетворювати через global_center
     if terrain_provider is not None:
         try:
             min_x, max_x, min_y, max_y = terrain_provider.get_bounds()
             clip_box = box(min_x, min_y, max_x, max_y)
-            # print(f"[DEBUG] Water clip_box (локальні): x=[{min_x:.2f}, {max_x:.2f}], y=[{min_y:.2f}, {max_y:.2f}]")
-        except Exception as e:
-            print(f"[WARN] Не вдалося створити clip_box для води: {e}")
+        except Exception:
             clip_box = None
 
     processed_count = 0
     skipped_count = 0
+    
     for idx, row in gdf_water.iterrows():
         geom = row.geometry
         if geom is None:
-            # print(f"[DEBUG] Water geometry {idx} is None, пропускаємо")
-            skipped_count += 1
             continue
         
-        # Діагностика геометрії
-        try:
-            geom_bounds = geom.bounds if hasattr(geom, 'bounds') else None
-            # print(f"[DEBUG] Water geometry {idx} bounds: {geom_bounds}, valid={geom.is_valid if hasattr(geom, 'is_valid') else 'unknown'}")
-        except:
-            pass
-        
-        try:
-            if not geom.is_valid:
-                # print(f"[DEBUG] Water geometry {idx} невалідна, виправляємо через buffer(0)")
-                geom = geom.buffer(0)
-                if geom.is_empty:
-                    print(f"[WARN] Water geometry {idx} стала порожньою після buffer(0)")
-                    skipped_count += 1
-                    continue
-        except Exception as e:
-            print(f"[WARN] Не вдалося виправити геометрію води {idx}: {e}")
-            skipped_count += 1
-            continue
+        # Validations
+        if not geom.is_valid:
+            geom = geom.buffer(0)
         
         if clip_box is not None:
-            try:
-                # Перевіряємо чи геометрія перетинається з clip_box перед intersection
-                if not geom.intersects(clip_box):
-                    # print(f"[DEBUG] Water geometry {idx} не перетинається з clip_box, пропускаємо")
-                    skipped_count += 1
-                    continue
-                
-                geom = geom.intersection(clip_box)
-                if geom.is_empty:
-                    # print(f"[DEBUG] Water geometry {idx} стала порожньою після intersection з clip_box")
-                    skipped_count += 1
-                    continue
-            except Exception as e:
-                print(f"[WARN] Не вдалося обрізати геометрію води {idx}: {e}")
-                import traceback
-                traceback.print_exc()
-                skipped_count += 1
+            if not geom.intersects(clip_box):
+                continue
+            geom = geom.intersection(clip_box)
+            if geom.is_empty:
                 continue
 
-        try:
-            geom = geom.simplify(0.5, preserve_topology=True)
-        except Exception:
-            pass
+        # Simplify to avoid excessive complexity but keep shape
+        geom = geom.simplify(0.2, preserve_topology=True)
 
         polys = [geom] if isinstance(geom, Polygon) else list(getattr(geom, "geoms", []))
-        # print(f"[DEBUG] Water geometry {idx} розбито на {len(polys)} полігонів")
         
-        for poly_idx, poly in enumerate(polys):
+        for poly in polys:
             if not isinstance(poly, Polygon) or poly.is_empty:
-                print(f"[DEBUG] Water poly {idx}_{poly_idx} не Polygon або порожній, пропускаємо")
-                skipped_count += 1
                 continue
-            
-            # Виправляємо полігон перед екструзією
-            try:
-                if not poly.is_valid:
-                    # print(f"[DEBUG] Water poly {idx}_{poly_idx} невалідний, виправляємо")
-                    poly = poly.buffer(0)
-                    if poly.is_empty:
-                        # print(f"[WARN] Water poly {idx}_{poly_idx} стала порожньою після buffer(0)")
-                        skipped_count += 1
-                        continue
-                
-                # Перевіряємо чи полігон має достатньо точок
-                if hasattr(poly, 'exterior') and len(poly.exterior.coords) < 3:
-                    # print(f"[WARN] Water poly {idx}_{poly_idx} має менше 3 точок, пропускаємо")
-                    skipped_count += 1
-                    continue
-            except Exception as e:
-                print(f"[WARN] Помилка виправлення water poly {idx}_{poly_idx}: {e}")
-                skipped_count += 1
+            if poly.area < 1.0: # Skip tiny puddles
                 continue
             
             try:
+                # Use trimesh extrude
                 mesh = trimesh.creation.extrude_polygon(poly, height=float(thickness_m))
+                
+                # Fix "Single Point" issue:
+                # This often happens if the polygon is non-convex and triangulation is bad.
+                # trimesh uses 'triangle' or 'earcut'. To improve quality, we can subdivide the mesh
+                # to ensure we have internal vertices for the water texture.
+                # Earcut only gives huge triangles for the top cap.
+                
+                # Subdivide to get more vertices for noise
+                if ADD_TEXTURE:
+                    # Simple subdivision might maintain bad topology. 
+                    # Better: sample points inside polygon and triangulate? 
+                    # Too complex. Let's precise subdivide.
+                    # mesh.subdivide() works on existing faces. If top face is one huge ngon triangulated into slivers, 
+                    # subdivide helps.
+                    # Recalculate UVs or just use XYZ.
+                    
+                    # We iterate subdivision a few times to get enough density for noise
+                    # Don't overdo it. 2 levels is usually enough for visual noise.
+                    # Check edge lengths?
+                    for _ in range(2):
+                        if len(mesh.vertices) < 10000: # Limit count
+                             mesh = mesh.subdivide()
+                
                 if mesh is None or len(mesh.vertices) == 0:
-                    print(f"[WARN] extrude_polygon повернув порожній mesh для poly {idx}_{poly_idx}")
-                    skipped_count += 1
                     continue
-                
-                # ВИПРАВЛЕННЯ: НЕ використовуємо subdivision для води
-                # Subdivision створює нерегулярну сітку, що призводить до "розділених" точок
-                # Замість цього використовуємо оригінальний mesh з extrude_polygon
-                # Якщо потрібна більша деталізація - краще збільшити кількість точок в полігоні
-                # mesh = mesh.subdivide()  # ВИМКНЕНО - створює нерегулярну сітку
-                # print(f"[DEBUG] Water mesh: {len(mesh.vertices)} вершин (без subdivision для регулярної сітки)")
-            except Exception as e:
-                print(f"[WARN] Помилка extrude_polygon для poly {idx}_{poly_idx}: {e}")
-                import traceback
-                traceback.print_exc()
-                skipped_count += 1
-                continue
 
-            if terrain_provider is not None and len(mesh.vertices) > 0:
                 v = mesh.vertices.copy()
-                old_z = v[:, 2].copy()  # old_z від 0 до thickness_m (від extrude_polygon)
+                old_z = v[:, 2].copy()
+                thickness = float(thickness_m)
                 
-                # ВИПРАВЛЕННЯ: Використовуємо ТІЛЬКИ вершини mesh для семплінгу
-                # Це забезпечує регулярну сітку без "розділених" точок
-                # Всі точки семплінгу відповідають вершинам mesh, що гарантує узгодженість
-                points_array = v[:, :2]  # Використовуємо тільки вершини mesh (регулярна сітка)
-                # print(f"[DEBUG] Water polygon {idx}_{poly_idx}: використовуємо {len(points_array)} вершин mesh для семплінгу (регулярна сітка)")
+                # Identify surfaces
+                is_top = old_z > (thickness * 0.9)
+                is_bottom = old_z < (thickness * 0.1)
                 
-                # ВАЖЛИВО: для правильного розміщення води потрібно використовувати ОРИГІНАЛЬНІ висоти рельєфу
-                # (до вирізання depression), а не дно depression
-                # Якщо є original_heights_provider - використовуємо його, інакше - звичайний
-                if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
-                    # Stable water placement:
-                    # - Choose a single water level for the polygon (low quantile of original ground).
-                    # - Clamp per-vertex so water never rises above shoreline (original ground - eps).
-                    # - Ensure water still covers the carved depression floor by at least a tiny amount.
-                    original_ground = terrain_provider.original_heights_provider.get_heights_for_points(points_array)
+
+                if terrain_provider is not None and len(v) > 0:
+                    points_array = v[:, :2]
+                    
+                    # 1. Get Depressed Ground (Current 'ground' after carving)
                     depressed_ground = terrain_provider.get_surface_heights_for_points(points_array)
-
-                    shore_eps = 0.02  # 2cm safety to avoid spilling onto land / z-fighting
-                    min_cover = max(0.01, min(0.20, float(depth_meters) * 0.02))  # 1cm..20cm
-                    try:
-                        water_level = float(np.quantile(original_ground, 0.10)) - shore_eps
-                    except Exception:
-                        water_level = float(np.min(original_ground)) - shore_eps
-
-                    # Clamp: floor+cover <= surface <= shoreline
-                    surface_levels = np.minimum(
-                        np.maximum(depressed_ground + float(min_cover), float(water_level)),
-                        original_ground - shore_eps,
-                    )
-                    if float(surface_offset_m) != 0.0:
-                        surface_levels = surface_levels + float(surface_offset_m)
-                else:
-                    # Fallback: використовуємо дно depression + глибина
-                    ground = terrain_provider.get_surface_heights_for_points(points_array if len(points_array) > 0 else v[:, :2])
-                    # Дно depression + глибина = рівень поверхні води
-                    surface_levels = ground + float(depth_meters) + float(surface_offset_m)
-                    # print(f"[WARN] Використовується fallback для water surface: ground range=[{np.min(ground):.3f}, {np.max(ground):.3f}], surface range=[{np.min(surface_levels):.3f}, {np.max(surface_levels):.3f}]")
-                
-                # КРИТИЧНЕ ВИПРАВЛЕННЯ: old_z від extrude_polygon - це товщина води (0 до thickness_m)
-                # Для верхньої поверхні води (old_z == thickness_m) використовуємо surface_levels
-                # Для нижньої поверхні води (old_z == 0) використовуємо surface_levels - thickness_m
-                # Це забезпечить правильну товщину води без "підняття" над землею
-                if len(surface_levels) == len(v):
-                    # Визначаємо які вершини на верхній поверхні (old_z == thickness_m)
-                    # та які на нижній (old_z == 0)
-                    thickness = float(thickness_m)
-                    is_top_surface = (old_z >= thickness * 0.9)  # Верхня поверхня (90%+ від товщини)
-                    is_bottom_surface = (old_z <= thickness * 0.1)  # Нижня поверхня (10% від товщини)
                     
-                    # Для верхньої поверхні: використовуємо surface_levels (рівень води)
-                    # Для нижньої поверхні: використовуємо surface_levels - thickness (дно води)
-                    # Для проміжних вершин: інтерполюємо
-                    v[:, 2] = np.where(
-                        is_top_surface,
-                        surface_levels,  # Верхня поверхня = рівень води
-                        np.where(
-                            is_bottom_surface,
-                            surface_levels - thickness,  # Нижня поверхня = дно води
-                            surface_levels - (thickness - old_z)  # Проміжні: інтерполяція
-                        )
-                    )
-                    # print(f"[DEBUG] Water mesh: використано {len(surface_levels)} значень для вершин (верх: {np.sum(is_top_surface)}, низ: {np.sum(is_bottom_surface)})")
-                elif len(surface_levels) > 0:
-                    # Якщо кількість не співпадає (не повинно бути, але на всяк випадок)
-                    # Використовуємо медіанне значення для всіх вершин
-                    median_level = np.median(surface_levels)
-                    v[:, 2] = np.full(len(v), median_level) + old_z
-                    print(f"[WARN] Water mesh: кількість не співпадає ({len(surface_levels)} vs {len(v)}), використано медіанне значення")
-                else:
-                    # Fallback: використовуємо оригінальну логіку
-                    v[:, 2] = old_z
-                    print(f"[WARN] Water mesh: surface_levels порожній, використано оригінальну висоту")
-                
-                # Діагностика: перевіряємо, чи вода не накладається на рельєф (тільки для першого полігону, щоб не сповільнювати)
-                if processed_count == 0:  # Тільки для першого полігону
-                    min_water_z = float(np.min(v[:, 2]))
-                    max_water_z = float(np.max(v[:, 2]))
-                    
-                    # Отримуємо висоти рельєфу (з depression) для порівняння
-                    ground_depressed = terrain_provider.get_surface_heights_for_points(v[:, :2])
-                    min_ground_depressed = float(np.min(ground_depressed))
-                    max_ground_depressed = float(np.max(ground_depressed))
-                    
-                    # Отримуємо оригінальні висоти для порівняння
+                    # 2. Get Original Ground (Shoreline reference)
+                    original_ground = None
                     if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider is not None:
-                        ground_original = terrain_provider.original_heights_provider.get_heights_for_points(v[:, :2])
-                        min_ground_original = float(np.min(ground_original))
-                        max_ground_original = float(np.max(ground_original))
-                        
-                        # Вода має бути на рівні оригінального рельєфу (або трохи нижче для безпеки)
-                        # Але не нижче дна depression
-                        if min_water_z < min_ground_depressed - 0.01:
-                            print(f"[WARN] Water нижче дна depression: water_z={min_water_z:.3f}, depressed_ground={min_ground_depressed:.3f}")
-                        elif max_water_z > max_ground_original + 0.01:  # Вода не повинна бути вище оригінального рельєфу
-                            print(f"[WARN] Water вище оригінального рельєфу: water_z={max_water_z:.3f}, original_ground={max_ground_original:.3f}")
+                        original_ground = terrain_provider.original_heights_provider.get_heights_for_points(points_array)
                     else:
-                        # Fallback: порівнюємо з depressed ground
-                        if min_water_z < min_ground_depressed - 0.01:
-                            print(f"[WARN] Water нижче дна depression: water_z={min_water_z:.3f}, ground={min_ground_depressed:.3f}")
-                        elif max_water_z > max_ground_depressed + depth_meters * 0.95:
-                            print(f"[WARN] Water може накладатися: water_z={max_water_z:.3f}, ground={max_ground_depressed:.3f}, depth={depth_meters:.3f}")
-                
-                mesh.vertices = v
-            else:
-                # No terrain: just keep near Z=0
-                mesh.apply_translation([0, 0, 0.0])
+                        original_ground = depressed_ground + float(depth_meters) if depth_meters else depressed_ground + 2.0
 
-            if len(mesh.faces) > 0 and len(mesh.vertices) > 0:
+                    # 3. Calculate Water Level per vertex
+                    # Default: slightly below original ground (shoreline)
+                    base_water_level = original_ground - 0.15
+                    
+                    # 4. Apply Noise (only to top surface)
+                    height_offsets = np.zeros(len(v))
+                    if ADD_TEXTURE and get_noise:
+                        # Vectorized noise is hard without lib, use loop or simple numpy op
+                        # Try to use numpy if possible for speed, but our get_noise is scalar
+                        # Let's map it.
+                        if len(v) < 50000: # Limit noise calc for performance
+                             # Optimization: use numpy operations if get_noise was simple, but it is valid python func.
+                             # vectorized wrapper:
+                             n_v = np.vectorize(get_noise)
+                             noise_val = n_v(v[:, 0], v[:, 1])
+                             height_offsets = noise_val
+                        else:
+                             height_offsets = np.zeros(len(v))
+
+                    # 5. Set Z Values
+                    # For Top vertices:
+                    # Z = max(base_water_level + noise, depressed_ground + epsilon)
+                    # We strictly verify water is ABOVE the carved bed.
+                    
+                    top_z = base_water_level + height_offsets
+                    # Constraint: Water must be at least 0.2m above the depressed bed to avoid Z-fighting
+                    top_z = np.maximum(top_z, depressed_ground + 0.2)
+                    
+                    # For Bottom vertices:
+                    # just offset from top by thickness
+                    # OR clamp to depressed_ground? No, we extrude down.
+                    
+                    # Apply
+                    # We rely on is_top / is_bottom masks
+                    v[is_top, 2] = top_z[is_top]
+                    v[is_bottom, 2] = top_z[is_bottom] - thickness
+                    
+                    # Handle side vertices (interpolated between top and bottom?)
+                    # Trimesh extrusion creates sides. Their Z's are old_z. 
+                    # We need to stretch them.
+                    # Simplest way: 
+                    # new_z = bottom_z + (old_z / thickness) * (top_z - bottom_z)
+                    # if old_z was 0..thickness
+                    
+                    # Normalize old_z [0..1]
+                    # Note: old_z is 0 at bottom, 'thickness' at top usually.
+                    ratio = np.clip(old_z / thickness, 0.0, 1.0)
+                    
+                    final_top = top_z
+                    final_bottom = top_z - thickness
+                    
+                    v[:, 2] = final_bottom + ratio * (final_top - final_bottom)
+
+                mesh.vertices = v
+                
+                # Fix color
+                water_color = np.array([0, 100, 255, 255], dtype=np.uint8)
+                if len(mesh.faces) > 0:
+                     face_colors = np.tile(water_color, (len(mesh.faces), 1))
+                     mesh.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
+                
                 meshes.append(mesh)
                 processed_count += 1
-                # print(f"[DEBUG] Water polygon оброблено: {len(mesh.vertices)} вершин, {len(mesh.faces)} граней")
-            else:
-                print(f"[WARN] Water polygon пропущено: vertices={len(mesh.vertices)}, faces={len(mesh.faces)}")
-                skipped_count += 1
+                
+            except Exception as e:
+                print(f"[WARN] Failed to process water poly {idx}: {e}")
+                continue
 
-    print(f"[INFO] process_water_surface: оброблено {processed_count} полігонів, пропущено {skipped_count}")
     if not meshes:
-        print(f"[WARN] process_water_surface: не створено жодного water mesh!")
         return None
-    
-    print(f"[INFO] process_water_surface: створено {len(meshes)} water meshes")
+        
     try:
         combined = trimesh.util.concatenate(meshes)
-        if combined is not None and len(combined.vertices) > 0 and len(combined.faces) > 0:
-            print(f"[INFO] Water mesh об'єднано: {len(combined.vertices)} вершин, {len(combined.faces)} граней")
-            
-            # ВАЖЛИВО: Застосовуємо синій колір до water mesh ПЕРЕД поверненням
-            # Це гарантує, що колір буде присутній навіть якщо export_3mf не застосує його
-            try:
-                # Синій колір для води: RGB(0, 100, 255) = [0, 100, 255, 255]
-                water_color = np.array([0, 100, 255, 255], dtype=np.uint8)
-                
-                # Застосовуємо face colors (найкраща підтримка в 3MF)
-                if len(combined.faces) > 0:
-                    face_colors = np.tile(water_color, (len(combined.faces), 1))
-                    combined.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
-                    print(f"[INFO] Застосовано синій колір до water mesh: {len(combined.faces)} граней")
-                
-                # Також додаємо vertex colors для fallback
-                if len(combined.vertices) > 0:
-                    vertex_colors = np.tile(water_color[:3], (len(combined.vertices), 1))
-                    # Якщо face colors не працюють, vertex colors будуть використані
-                    if not hasattr(combined.visual, 'face_colors') or combined.visual.face_colors is None:
-                        combined.visual = trimesh.visual.ColorVisuals(vertex_colors=vertex_colors)
-                        print(f"[INFO] Застосовано vertex colors до water mesh: {len(combined.vertices)} вершин")
-            except Exception as e:
-                print(f"[WARN] Не вдалося застосувати колір до water mesh: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            return combined
-        else:
-            print(f"[WARN] Об'єднаний water mesh порожній, повертаємо перший")
-            result = meshes[0] if meshes else None
-            # Застосовуємо колір до першого mesh теж
-            if result is not None and len(result.faces) > 0:
-                try:
-                    water_color = np.array([0, 100, 255, 255], dtype=np.uint8)
-                    face_colors = np.tile(water_color, (len(result.faces), 1))
-                    result.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
-                except Exception:
-                    pass
-            return result
-    except Exception as e:
-        print(f"[WARN] Помилка об'єднання water meshes: {e}, повертаємо перший")
-        result = meshes[0] if meshes else None
-        # Застосовуємо колір до першого mesh теж
-        if result is not None and len(result.faces) > 0:
-            try:
-                water_color = np.array([0, 100, 255, 255], dtype=np.uint8)
-                face_colors = np.tile(water_color, (len(result.faces), 1))
-                result.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
-            except Exception:
-                pass
-        return result
+        return combined
+    except Exception:
+        return meshes[0]
 
 
 def create_water_depression(

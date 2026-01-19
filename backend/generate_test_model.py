@@ -112,6 +112,14 @@ if terrain_enabled:
         water_geoms_for_terrain = list(gdf_water.geometry.values)
         water_depth_for_terrain = float(water_depth_m)
 
+    # Create GlobalCenter
+    from services.global_center import GlobalCenter
+    # Use center of bbox for GlobalCenter
+    center_lat = (north + south) / 2.0
+    center_lon = (east + west) / 2.0
+    global_center = GlobalCenter(center_lat, center_lon)
+    print(f"[DEBUG] Created GlobalCenter: {center_lat}, {center_lon}")
+
     terrain_mesh, terrain_provider = create_terrain_mesh(
         bbox_meters,
         z_scale=terrain_z_scale,
@@ -120,15 +128,16 @@ if terrain_enabled:
         source_crs=source_crs,
         terrarium_zoom=terrarium_zoom,
         base_thickness=(float(terrain_base_thickness_mm) / float(scale_factor)) if scale_factor else 5.0,
-        flatten_buildings=False,  # Не вирівнюємо під будівлями в тестовому режимі
-        building_geometries=None,  # Немає будівель
-        flatten_roads=False,  # Немає доріг
+        flatten_buildings=False,
+        building_geometries=None,
+        flatten_roads=False,
         road_geometries=None,
         smoothing_sigma=float(terrain_smoothing_sigma),
-        water_geometries=water_geoms_for_terrain,  # Додаємо воду тільки якщо є вода та depth > 0
-        water_depth_m=water_depth_for_terrain,  # Глибина depression в рельєфі
-        subdivide=True,  # Увімкнути subdivision для плавнішого mesh
-        subdivide_levels=1,  # 1 рівень subdivision
+        water_geometries=water_geoms_for_terrain,
+        water_depth_m=water_depth_for_terrain,
+        subdivide=True,
+        subdivide_levels=1,
+        global_center=global_center, # Pass global_center
     )
     if terrain_mesh:
         print(f"Рельєф створено: {len(terrain_mesh.vertices)} вершин, {len(terrain_mesh.faces)} граней")
@@ -140,27 +149,44 @@ if terrain_enabled:
     poi_mesh = None
     
     # Створюємо water mesh для тестового режиму
-    # ВАЖЛИВО: water_surface має бути на рівні ground + depth_meters, де ground вже включає depression
     water_mesh = None
     if has_water and terrain_provider is not None and water_depth_m is not None and water_depth_m > 0:
         print("Створення води для тестування...")
         from services.water_processor import process_water_surface
         
         # Збільшуємо товщину води для кращої видимості (1.0-2.0мм на моделі)
-        # Але не більше ніж половина глибини води, щоб не накладалася на рельєф
         max_thickness_mm = min(water_depth * 0.5, 2.0)
         surface_mm = float(max(1.0, min(max_thickness_mm, water_depth * 0.3)))
         thickness_m = float(surface_mm) / float(scale_factor) if scale_factor else (water_depth_m * 0.3)
-            water_mesh = process_water_surface(
-                gdf_water,
-                thickness_m=float(thickness_m),
+        water_mesh = process_water_surface(
+            gdf_water,
+            thickness_m=float(thickness_m),
             depth_meters=float(water_depth_m),
-                terrain_provider=terrain_provider,
-            )
+            terrain_provider=terrain_provider,
+            global_center=global_center, # Pass global_center
+        )
         if water_mesh:
             print(f"Вода створена: {len(water_mesh.vertices)} вершин, {len(water_mesh.faces)} граней")
     
-    print("Пропущено обробку доріг, будівель, парків та POI (тестовий режим)")
+    print("Обробка доріг для тестування (Fix Verification)...")
+    road_mesh = None
+    if G_roads is not None:
+        from services.road_processor import process_roads
+        road_mesh = process_roads(
+            G_roads,
+            terrain_provider=terrain_provider,
+            width_multiplier=1.0,
+            road_height=0.5,
+            road_embed=0.1,
+            global_center=global_center, # Pass global_center
+            water_geometries=water_geoms_for_terrain, # Pass water for bridge detection
+        )
+        if road_mesh:
+            print(f"Дороги створено: {len(road_mesh.vertices)} вершин.")
+        else:
+             print("Дороги створено: None/0 вершин. (Можливо обрізані?)")
+    else:
+        print("Немає даних доріг/графу.")
 
 print("Експорт моделі...")
 output_dir = Path("output")

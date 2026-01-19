@@ -216,6 +216,11 @@ def export_scene(
             road_mesh.fix_normals()
         except Exception:
             pass
+        
+        # Debug: log road mesh bounds
+        bounds = road_mesh.bounds
+        print(f"[DEBUG] Road mesh bounds before export: Z from {bounds[0][2]:.2f} to {bounds[1][2]:.2f}")
+        
         mesh_items.append(("Roads", road_mesh))
     
     # 3. Будівлі
@@ -687,6 +692,10 @@ def export_stl(
                 mesh_copy.remove_unreferenced_vertices()
             
             working_items.append((n, mesh_copy))
+            
+            # Debug: log bounds
+            bounds = mesh_copy.bounds
+            print(f"  [DEBUG] Mesh '{n}': bounds=({bounds[0][0]:.2f}, {bounds[0][1]:.2f}, {bounds[0][2]:.2f}) to ({bounds[1][0]:.2f}, {bounds[1][1]:.2f}, {bounds[1][2]:.2f})")
         
         if not working_items:
             raise ValueError("Немає валідних мешів для експорту")
@@ -696,6 +705,7 @@ def export_stl(
         
         
         combined = trimesh.util.concatenate([m for _, m in working_items])
+        print(f"[DEBUG] After concatenate: {len(combined.vertices)}v, {len(combined.faces)}f")
         
         # Перевіряємо результат
         if combined is None or len(combined.vertices) == 0 or len(combined.faces) == 0:
@@ -703,10 +713,16 @@ def export_stl(
         
         print(f"Об'єднано: {len(combined.vertices)} вершин, {len(combined.faces)} граней")
         
+        # Debug: bounds after concatenate
+        bounds_after_concat = combined.bounds
+        print(f"  [DEBUG] Bounds after concatenate: Z from {bounds_after_concat[0][2]:.2f} to {bounds_after_concat[1][2]:.2f}")
+        
         # Виправляємо нормалі перед експортом (якщо можливо)
         try:
             combined.fix_normals()
-        except Exception:
+            print(f"[DEBUG] After fix_normals: bounds Z from {combined.bounds[0][2]:.2f} to {combined.bounds[1][2]:.2f}")
+        except Exception as e:
+            print(f"[WARN] fix_normals failed: {e}")
             pass  # Якщо не вдалося, продовжуємо
         
         # Додаємо плоску базу, якщо немає рельєфу
@@ -748,6 +764,7 @@ def export_stl(
             vertices[:, 0] -= center_x
             vertices[:, 1] -= center_y
             combined = trimesh.Trimesh(vertices=vertices, faces=combined.faces, process=True)
+            print(f"[DEBUG] After UTM centering: bounds Z from {combined.bounds[0][2]:.2f} to {combined.bounds[1][2]:.2f}")
             
             bounds_after_xy = combined.bounds
             min_z = bounds_after_xy[0][2]
@@ -789,8 +806,11 @@ def export_stl(
                 combined.apply_translation([0.0, 0.0, -center[2]])
             elif preserve_z:
                 combined.apply_translation([-center[0], -center[1], 0.0])
+                bounds_after = combined.bounds
+                print(f"  [DEBUG] After XY centering (preserve_z): Z from {bounds_after[0][2]:.2f} to {bounds_after[1][2]:.2f}, vertices={len(combined.vertices)}")
             else:
                 combined.apply_translation(-center)
+                print(f"  [DEBUG] After full centering: Z from {combined.bounds[0][2]:.2f} to {combined.bounds[1][2]:.2f}")
             bounds_after = combined.bounds
             size_after = bounds_after[1] - bounds_after[0]
         
@@ -823,13 +843,15 @@ def export_stl(
                 # Вся геометрія в нас в "світових" одиницях (метри в локальних координатах),
                 # а print-aware товщини (roads/building foundation/parks/etc) вже конвертовані в метри через /scale_factor.
                 # Тому anisotropic XY-only scale робить дороги/парки/воду "занадто високими" і ламає пропорції.
+                # Масштабуємо ОДНАКОВО по X/Y/Z
+                print(f"[DEBUG] Before scaling: Z from {combined.bounds[0][2]:.2f} to {combined.bounds[1][2]:.2f}, scale={scale_factor:.6f}")
                 s = trimesh.transformations.scale_matrix(scale_factor)
                 combined.apply_transform(s)
                 
-                # Перевіряємо розміри після масштабування
                 bounds_scaled = combined.bounds
                 size_scaled = bounds_scaled[1] - bounds_scaled[0]
                 print(f"Масштабування: {size_scaled[0]:.2f} x {size_scaled[1]:.2f} x {size_scaled[2]:.2f} мм")
+                print(f"[DEBUG] After scaling: Z from {bounds_scaled[0][2]:.2f} to {bounds_scaled[1][2]:.2f}")
             # ВАЖЛИВО: не робимо примусового Z-scale (це спотворює висоти доріг/будівель
             # і дає ефект "дороги занадто високі" / "висять над землею").
         
@@ -884,7 +906,11 @@ def export_stl(
         except Exception as e:
             print(f"Попередження: Центрування/вирівнювання не виконано: {e}")
         
+        
         # Експортуємо об'єднаний (для STL одна геометрія)
+        print(f"[DEBUG] Final mesh before STL export: {len(combined.vertices)}v, {len(combined.faces)}f")
+        print(f"[DEBUG] Final bounds before STL export: Z from {combined.bounds[0][2]:.2f} to {combined.bounds[1][2]:.2f}")
+        
         combined.export(filename, file_type="stl")
         print(f"Експортовано STL: {filename}")
         
