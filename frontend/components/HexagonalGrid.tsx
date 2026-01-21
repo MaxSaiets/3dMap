@@ -9,7 +9,7 @@ import "leaflet/dist/leaflet.css";
 function MapBounds({ bounds }: { bounds: { north: number; south: number; east: number; west: number } }) {
   const map = useMap();
   const hasFittedRef = useRef(false);
-  
+
   useEffect(() => {
     if (bounds && map && !hasFittedRef.current) {
       try {
@@ -65,11 +65,11 @@ const hoverStyle = {
   fillColor: "#34d399",
 };
 
-export default function HexagonalGrid({ 
-  bounds, 
+export default function HexagonalGrid({
+  bounds,
   onZonesSelected,
   gridType: externalGridType = "hexagonal",
-  hexSizeM: externalHexSizeM = 500.0,
+  hexSizeM: externalHexSizeM = 400.0,
 }: HexagonalGridProps) {
   const normalizeId = (id: any): string => String(id ?? "");
   const [hexGrid, setHexGrid] = useState<any>(null);
@@ -104,27 +104,27 @@ export default function HexagonalGrid({
   useEffect(() => {
     onZonesSelectedRef.current = onZonesSelected;
   }, [onZonesSelected]);
-  
+
   // Використовуємо зовнішні значення якщо передані, інакше внутрішні
   const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square">("hexagonal");
   const gridType = externalGridType || internalGridType;
-  const hexSizeM = externalHexSizeM || 500.0;
+  const hexSizeM = externalHexSizeM || 400.0;
 
   const generateGrid = async () => {
     if (isLoading) return; // Запобігаємо подвійній генерації
-    
+
     setIsLoading(true);
     setHexGrid(null); // Скидаємо попередню сітку
-    
+
     try {
       console.log("[HexagonalGrid] Запит генерації сітки з bounds:", bounds);
       const { api } = await import("@/lib/api");
-      
+
       // Перевіряємо валідність bounds
       if (!bounds || bounds.north <= bounds.south || bounds.east <= bounds.west) {
         throw new Error(`Невірні координати bounds: north=${bounds?.north}, south=${bounds?.south}, east=${bounds?.east}, west=${bounds?.west}`);
       }
-      
+
       console.log("[HexagonalGrid] Відправляємо запит до API з bounds:", bounds, "gridType:", gridType, "hexSizeM:", hexSizeM);
       const data = await api.generateHexagonalGrid({
         north: bounds.north,
@@ -134,13 +134,13 @@ export default function HexagonalGrid({
         hex_size_m: hexSizeM,
         grid_type: gridType,
       });
-      
+
       console.log("[HexagonalGrid] Отримано сітку:", data.hex_count, "шестикутників, is_valid:", data.is_valid);
-      
+
       if (!data.geojson || !data.geojson.features || data.geojson.features.length === 0) {
         throw new Error("Сітка порожня або невалідна");
       }
-      
+
       // Діагностика першого feature
       if (data.geojson.features.length > 0) {
         const firstFeature = data.geojson.features[0];
@@ -152,7 +152,7 @@ export default function HexagonalGrid({
           coordsCount: firstFeature?.geometry?.coordinates?.[0]?.length
         });
       }
-      
+
       setHexGrid(data.geojson);
       setIsValid(data.is_valid);
       setValidationErrors(data.validation_errors || []);
@@ -171,15 +171,15 @@ export default function HexagonalGrid({
     const currentSelected = selectedZonesRef.current;
     const currentOrder = selectedOrderRef.current;
     console.log(`[HexagonalGrid] handleZoneClick called for zoneId: ${zoneId}, current selected:`, Array.from(currentSelected));
-    
+
     if (!zoneId) {
       console.error("[HexagonalGrid] zoneId is empty!");
       return;
     }
-    
+
     const nextSelected = new Set(currentSelected);
     let nextOrder = [...currentOrder];
-    
+
     // Перемикаємо стан зони
     if (nextSelected.has(zoneId)) {
       nextSelected.delete(zoneId);
@@ -196,7 +196,7 @@ export default function HexagonalGrid({
     selectedOrderRef.current = nextOrder;
     setSelectedZones(nextSelected);
     setSelectedOrder(nextOrder);
-    
+
     // Оновлюємо список вибраних зон у стабільному порядку (click-order),
     // щоб backend створював задачі у тій же послідовності.
     const featureById = new Map<string, any>();
@@ -205,7 +205,7 @@ export default function HexagonalGrid({
       if (fId) featureById.set(fId, f);
     }
     const selectedFeatures = nextOrder.map((id) => featureById.get(id)).filter(Boolean);
-    
+
     console.log(`[HexagonalGrid] Selected features count: ${selectedFeatures.length}`);
     onZonesSelectedRef.current(selectedFeatures);
   };
@@ -225,7 +225,7 @@ export default function HexagonalGrid({
       if (ac != null && bc != null && ac !== bc) return ac - bc;
       return String(a.id).localeCompare(String(b.id));
     });
-    const allZoneIds = new Set(all.map((x: any) => x.id));
+    const allZoneIds = new Set<string>(all.map((x: any) => x.id as string));
     selectedZonesRef.current = allZoneIds;
     selectedOrderRef.current = all.map((x: any) => x.id);
     setSelectedZones(allZoneIds);
@@ -254,10 +254,10 @@ export default function HexagonalGrid({
       console.warn("[HexagonalGrid] getZoneStyle called with empty zoneId");
       return defaultStyle;
     }
-    
+
     const isSelected = selectedZonesRef.current.has(zid);
     const isHovered = hoveredZoneRef.current === zid;
-    
+
     if (isSelected) {
       return selectedStyle;
     }
@@ -275,18 +275,18 @@ export default function HexagonalGrid({
   // Автоматично генеруємо сітку при відкритті
   useEffect(() => {
     console.log("[HexagonalGrid] useEffect викликано, bounds:", bounds, "hexGrid:", !!hexGrid, "isLoading:", isLoading, "gridType:", gridType);
-    
+
     // Перевіряємо валідність bounds
     if (!bounds) {
       console.warn("[HexagonalGrid] bounds не визначено");
       return;
     }
-    
+
     if (bounds.north <= bounds.south || bounds.east <= bounds.west) {
       console.error("[HexagonalGrid] Невірні координати:", bounds);
       return;
     }
-    
+
     // Генеруємо сітку якщо вона ще не згенерована
     if (!hexGrid && !isLoading) {
       console.log("[HexagonalGrid] Запускаємо генерацію сітки для bounds:", bounds);
@@ -364,7 +364,7 @@ export default function HexagonalGrid({
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
           />
           <MapBounds bounds={bounds} />
-          
+
           {hexGrid && hexGrid.features && hexGrid.features.length > 0 && (
             <GeoJSON
               // IMPORTANT: Do NOT remount on selection changes, otherwise the map/tiles can "jump back".
@@ -381,17 +381,17 @@ export default function HexagonalGrid({
               }}
               onEachFeature={(feature, layer) => {
                 const zoneId = normalizeId(feature?.properties?.id || feature?.id);
-                
+
                 if (!zoneId) {
                   console.error("[HexagonalGrid] Feature without ID:", feature);
                   return;
                 }
-                
+
                 console.log(`[HexagonalGrid] Feature ${zoneId} added to map, feature.id=${feature?.id}, feature.properties.id=${feature?.properties?.id}`);
-                
+
                 // Зберігаємо посилання на layer для оновлення стилю
                 (layer as any)._hexZoneId = zoneId;
-                
+
                 layer.on({
                   click: (e: L.LeafletMouseEvent) => {
                     e.originalEvent?.stopPropagation?.();
@@ -400,22 +400,22 @@ export default function HexagonalGrid({
                     // Apply immediate visual feedback based on ref state (no stale closures)
                     const willSelect = !selectedZonesRef.current.has(zoneId);
                     handleZoneClick(zoneId);
-                    
+
                     // Оновлюємо стиль після кліку
                     setTimeout(() => {
                       // Use immediate decision first, then fallback to state-driven style
-                      layer.setStyle(willSelect ? selectedStyle : defaultStyle);
+                      (layer as L.Path).setStyle(willSelect ? selectedStyle : defaultStyle);
                       // After state settles, sync with computed style
-                      setTimeout(() => layer.setStyle(getZoneStyle(zoneId)), 0);
+                      setTimeout(() => (layer as L.Path).setStyle(getZoneStyle(zoneId)), 0);
                     }, 0);
                   },
                   mouseover: () => {
                     handleZoneHover(zoneId);
-                    layer.setStyle(hoverStyle);
+                    (layer as L.Path).setStyle(hoverStyle);
                   },
                   mouseout: () => {
                     handleZoneHover(null);
-                    layer.setStyle(getZoneStyle(zoneId));
+                    (layer as L.Path).setStyle(getZoneStyle(zoneId));
                   },
                 });
 

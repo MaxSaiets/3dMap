@@ -20,7 +20,12 @@ interface ControlPanelProps {
   gridType?: "hexagonal" | "square";
   setGridType?: (type: "hexagonal" | "square") => void;
   hexSizeM?: number;
+
   setHexSizeM?: (size: number) => void;
+  // City selection
+  availableCities?: Record<string, any>;
+  selectedCityKey?: string;
+  onCityChange?: (cityKey: string) => void;
 }
 
 export function ControlPanel({
@@ -32,6 +37,10 @@ export function ControlPanel({
   setGridType: externalSetGridType,
   hexSizeM: externalHexSizeM,
   setHexSizeM: externalSetHexSizeM,
+
+  availableCities,
+  selectedCityKey,
+  onCityChange,
 }: ControlPanelProps = {}) {
   const {
     selectedArea,
@@ -96,7 +105,7 @@ export function ControlPanel({
 
   // Налаштування сітки (використовуємо зовнішні якщо передані)
   const [internalGridType, setInternalGridType] = useState<"hexagonal" | "square">("hexagonal");
-  const [internalHexSizeM, setInternalHexSizeM] = useState(500.0);
+  const [internalHexSizeM, setInternalHexSizeM] = useState(400.0);
 
   const gridType = externalGridType !== undefined ? externalGridType : internalGridType;
   const setGridType = externalSetGridType || setInternalGridType;
@@ -212,9 +221,7 @@ export function ControlPanel({
         context_padding_m: 400.0, // Додаємо контекстний padding для визначення мостів
       };
 
-      console.log("[DEBUG] Відправляємо запит на генерацію:", request);
       const response = await api.generateModel(request);
-      console.log("[DEBUG] Отримано відповідь:", response);
       setTaskGroup(response.task_id, [response.task_id]);
       setActiveTaskId(response.task_id);
     } catch (err: any) {
@@ -275,12 +282,19 @@ export function ControlPanel({
         return aid.localeCompare(bid);
       });
 
+      // Визначаємо bounds для запиту (Global Reference)
+      let requestBounds = kyivBounds;
+
+      if (availableCities && selectedCityKey && availableCities[selectedCityKey]) {
+        requestBounds = availableCities[selectedCityKey].bounds;
+      }
+
       // Використовуємо координати з вибраних зон
       const request = {
-        north: kyivBounds.north,
-        south: kyivBounds.south,
-        east: kyivBounds.east,
-        west: kyivBounds.west,
+        north: requestBounds.north,
+        south: requestBounds.south,
+        east: requestBounds.east,
+        west: requestBounds.west,
         road_width_multiplier: roadWidthMultiplier,
         road_height_mm: roadHeightMm,
         road_embed_mm: roadEmbedMm,
@@ -339,7 +353,31 @@ export function ControlPanel({
 
       {/* Секція вибору режиму роботи */}
       <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
-        <h2 className="text-lg font-semibold">Режим роботи</h2>
+        <h2 className="text-lg font-semibold">Налаштування</h2>
+
+        {/* Вибір міста */}
+        {availableCities && onCityChange && selectedCityKey && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Місто</label>
+            <select
+              value={selectedCityKey}
+              onChange={(e) => {
+                onCityChange(e.target.value);
+                // Reset errors and selection on city change
+                setError(null);
+                setSelectedZones([]);
+              }}
+              className="w-full p-2 border rounded bg-white"
+            >
+              {Object.keys(availableCities).map((city) => (
+                <option key={city} value={city}>
+                  {city === "Kyiv" ? "Київ" : city === "Khmelnytskyi" ? "Хмельницький" : city}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
         <div className="flex gap-2">
           <button
             onClick={() => {
@@ -348,8 +386,8 @@ export function ControlPanel({
               setError(null);
             }}
             className={`flex-1 px-4 py-2 rounded transition-colors ${!showHexGrid
-                ? "bg-blue-600 text-white"
-                : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+              ? "bg-blue-600 text-white"
+              : "bg-gray-200 text-gray-700 hover:bg-gray-300"
               }`}
           >
             Одна область
@@ -360,8 +398,8 @@ export function ControlPanel({
               setError(null);
             }}
             className={`flex-1 px-4 py-2 rounded transition-colors ${showHexGrid
-                ? "bg-blue-600 text-white"
-                : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+              ? "bg-blue-600 text-white"
+              : "bg-gray-200 text-gray-700 hover:bg-gray-300"
               }`}
           >
             <Grid size={16} className="inline mr-1" />

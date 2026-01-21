@@ -20,21 +20,28 @@ export default function Home() {
   const [showHexGrid, setShowHexGrid] = useState(false);
   const [selectedZones, setSelectedZones] = useState<any[]>([]);
   const [gridType, setGridType] = useState<"hexagonal" | "square">("hexagonal");
-  const [hexSizeM, setHexSizeM] = useState(500.0);
-  
-  // Координати Києва
-  const kyivBounds = {
-    north: 50.6,
-    south: 50.2,
-    east: 30.8,
-    west: 30.2,
+  const [hexSizeM, setHexSizeM] = useState(400.0);
+
+  // Координати міст
+  const CITIES: Record<string, { bounds: { north: number; south: number; east: number; west: number }; center: [number, number] }> = {
+    Kyiv: {
+      bounds: { north: 50.6, south: 50.2, east: 30.8, west: 30.2 },
+      center: [50.4501, 30.5234],
+    },
+    Khmelnytskyi: {
+      bounds: { north: 49.48, south: 49.36, east: 27.08, west: 26.88 },
+      center: [49.4200, 26.9800],
+    },
   };
+
+  const [currentCityKey, setCurrentCityKey] = useState("Kyiv");
+  const currentCity = CITIES[currentCityKey];
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">
       {/* Бічна панель з налаштуваннями */}
       <div className="w-80 bg-gray-100 dark:bg-gray-900 border-r border-gray-300 dark:border-gray-700 overflow-y-auto">
-        <ControlPanel 
+        <ControlPanel
           showHexGrid={showHexGrid}
           setShowHexGrid={setShowHexGrid}
           selectedZones={selectedZones}
@@ -43,6 +50,9 @@ export default function Home() {
           setGridType={setGridType}
           hexSizeM={hexSizeM}
           setHexSizeM={setHexSizeM}
+          availableCities={CITIES}
+          selectedCityKey={currentCityKey}
+          onCityChange={setCurrentCityKey}
         />
       </div>
 
@@ -52,14 +62,14 @@ export default function Home() {
         <div className="h-1/2 border-b border-gray-300 dark:border-gray-700 min-h-0">
           {showHexGrid ? (
             <HexagonalGrid
-              key={`hex-grid-${gridType}-${hexSizeM}`} // Key для перемонтування при зміні налаштувань
-              bounds={kyivBounds}
+              key={`hex-grid-${gridType}-${hexSizeM}-${currentCityKey}`} // Key для перемонтування при зміні налаштувань
+              bounds={currentCity.bounds}
               onZonesSelected={setSelectedZones}
               gridType={gridType}
               hexSizeM={hexSizeM}
             />
           ) : (
-            <MapSelector />
+            <MapSelector center={currentCity.center} />
           )}
         </div>
 

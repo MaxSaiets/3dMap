@@ -158,7 +158,6 @@ def process_water_surface(
 
     if global_center is not None:
         try:
-            print(f"[DEBUG] Перетворюємо gdf_water з UTM в локальні координати (глобальний центр)")
             def to_local_transform(x, y, z=None):
                 x_local, y_local = global_center.to_local(x, y)
                 if z is not None:

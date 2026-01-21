@@ -68,13 +68,10 @@ def create_terrain_mesh(
     height_m = maxy - miny
     aspect_ratio = width_m / height_m if height_m > 0 else 1.0
     
-    # resolution - це кількість точок по довшій стороні
-    if width_m > height_m:
-        res_x = resolution
-        res_y = int(resolution / aspect_ratio)
-    else:
-        res_y = resolution
-        res_x = int(resolution * aspect_ratio)
+    # resolution - це простір між точками в метрах (наприклад, 1.0м)
+    # Тому кількість точок = довжина / resolution
+    res_x = int(max(width_m / resolution, 2))
+    res_y = int(max(height_m / resolution, 2))
     
     # Мінімальна роздільна здатність - 10 точок
     res_x = max(10, res_x)

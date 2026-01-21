@@ -103,11 +103,24 @@ function DrawControl() {
   return null;
 }
 
-export function MapSelector() {
+
+function MapViewUpdater({ center }: { center: [number, number] }) {
+  const map = useMap();
+  useEffect(() => {
+    map.flyTo(center, 13);
+  }, [center, map]);
+  return null;
+}
+
+interface MapSelectorProps {
+  center?: [number, number];
+}
+
+export function MapSelector({ center = [50.4501, 30.5234] }: MapSelectorProps) {
   return (
     <div className="w-full h-full" style={{ minHeight: '100%' }}>
       <MapContainer
-        center={[50.4501, 30.5234]} // Київ
+        center={center} // Initial center
         zoom={13}
         style={{ height: "100%", width: "100%", minHeight: "100%" }}
         className="w-full h-full"
@@ -117,6 +130,7 @@ export function MapSelector() {
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
         <DrawControl />
+        <MapViewUpdater center={center} />
       </MapContainer>
     </div>
   );

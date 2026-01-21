@@ -140,13 +140,10 @@ async function loadColoredPartsFromBlobs(blobs: Partial<Record<"base" | "roads" 
 
 // Функція для завантаження 3MF (3MF це ZIP з XML та STL файлами всередині)
 async function load3MF(blob: Blob): Promise<THREE.Group> {
-  console.log("Завантаження 3MF, розмір:", blob.size);
-
   try {
     // ThreeMFLoader потребує URL, але може не працювати з blob URL
     // Спробуємо спочатку через ThreeMFLoader, якщо не вийде - розпакуємо ZIP вручну
     const zipUrl = URL.createObjectURL(blob);
-    console.log("Створено URL для 3MF ZIP");
 
     try {
       return await new Promise<THREE.Group>((resolve, reject) => {
@@ -197,7 +194,6 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
 
       // Fallback: розпаковуємо ZIP і шукаємо STL або використовуємо .model файл
       const zip = await JSZip.loadAsync(blob);
-      console.log("3MF ZIP розпаковано, файлів:", Object.keys(zip.files).length);
 
       // Шукаємо .model файл
       const modelFile = zip.file("3D/3dmodel.model");
@@ -206,7 +202,6 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
       }
 
       const modelBlob = await modelFile.async('blob');
-      console.log("Файл моделі витягнуто, розмір:", modelBlob.size);
 
       // Перевіряємо, чи це XML (3MF формат) або бінарний (STL)
       const firstBytes = await modelBlob.slice(0, 50).text();
@@ -224,7 +219,6 @@ async function load3MF(blob: Blob): Promise<THREE.Group> {
             stlUrl,
             (geometry) => {
               URL.revokeObjectURL(stlUrl);
-              console.log("STL геометрія завантажена:", geometry.attributes.position.count, "вершин");
               const material = new THREE.MeshStandardMaterial({
                 color: 0x888888,
                 flatShading: true
@@ -529,9 +523,7 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
         const size = box.getSize(new THREE.Vector3());
         const maxDim = Math.max(size.x, size.y, size.z);
 
-        console.log("=== ІНФОРМАЦІЯ ПРО ТЕСТОВУ МОДЕЛЬ ===");
-        console.log("Розміри до обробки:", size.x, size.y, size.z);
-        console.log("Максимальний розмір:", maxDim);
+
 
         if (maxDim > 0) {
           const targetSize = maxDim < 0.1 ? 300 : 220;

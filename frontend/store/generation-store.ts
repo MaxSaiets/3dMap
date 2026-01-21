@@ -104,7 +104,7 @@ const initialState = {
   terrainResolution: 180,
   terrariumZoom: 15,
   exportFormat: "3mf" as const,
-  modelSizeMm: 100.0, // 100мм = 10см за замовчуванням
+  modelSizeMm: 80.0, // 80мм = 8см за замовчуванням
 
   // Preview: smooth shading can show a visible seam between separate tiles on slopes
   terrainSmoothShading: false,

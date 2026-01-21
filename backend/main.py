@@ -35,37 +35,7 @@ from shapely.ops import transform
 
 app = FastAPI(title="3D Map Generator API", version="1.0.0")
 
-def _transform_building_geometries_to_local(gdf_buildings, global_center: Optional[GlobalCenter]) -> Optional[List]:
-    """
-    Перетворює геометрії будівель з UTM в локальні координати для вирівнювання землі.
-    """
-    if gdf_buildings is None or gdf_buildings.empty or global_center is None:
-        return None
-    
-    try:
-        def to_local_transform(x, y, z=None):
-            """Трансформер: UTM -> локальні координати"""
-            x_local, y_local = global_center.to_local(x, y)
-            if z is not None:
-                return (x_local, y_local, z)
-            return (x_local, y_local)
-        
-        building_geometries_local = []
-        for geom in gdf_buildings.geometry.values:
-            if geom is not None and not geom.is_empty:
-                try:
-                    local_geom = transform(to_local_transform, geom)
-                    if local_geom is not None and not local_geom.is_empty:
-                        building_geometries_local.append(local_geom)
-                except Exception as e:
-                    print(f"[WARN] Не вдалося перетворити геометрію будівлі для flatten: {e}")
-                    continue
-        
-        print(f"[DEBUG] Перетворено {len(building_geometries_local)} геометрій будівель в локальні координати для flatten")
-        return building_geometries_local if building_geometries_local else None
-    except Exception as e:
-        print(f"[WARN] Помилка перетворення building_geometries для flatten: {e}")
-        return None
+
 
 # CORS налаштування для інтеграції з frontend
 app.add_middleware(
@@ -110,7 +80,7 @@ class GenerationRequest(BaseModel):
     include_parks: bool = True
     parks_height_mm: float = Field(default=0.6, ge=0.1, le=5.0)
     parks_embed_mm: float = Field(default=0.2, ge=0.0, le=2.0)
-    include_pois: bool = True
+    include_pois: bool = False
     poi_size_mm: float = Field(default=0.6, ge=0.2, le=3.0)
     poi_height_mm: float = Field(default=0.8, ge=0.2, le=5.0)
     poi_embed_mm: float = Field(default=0.2, ge=0.0, le=2.0)
@@ -135,7 +105,7 @@ class GenerationRequest(BaseModel):
     # Terrain-first стабілізація для доріг: робить дороги більш читабельними на малому масштабі і прибирає "шипи" на бокових стінках.
     flatten_roads_on_terrain: bool = True
     export_format: str = "3mf"  # "stl" або "3mf"
-    model_size_mm: float = 100.0  # Розмір моделі в міліметрах (за замовчуванням 100мм = 10см)
+    model_size_mm: float = 80.0  # Розмір моделі в міліметрах (за замовчуванням 80мм = 8см)
     # Контекст навколо зони (в метрах): завантажуємо OSM/Extras з більшим bbox,
     # але фінальні меші все одно обрізаємо по полігону зони.
     # Це потрібно, щоб коректно визначати мости/перетини біля краю зони.
@@ -337,7 +307,6 @@ async def merge_zones_endpoint(
         completed_tasks.append(task)
     
     # Завантажуємо всі меші
-    import trimesh
     all_meshes = []
     
     for task in completed_tasks:
@@ -364,7 +333,7 @@ async def merge_zones_endpoint(
         raise HTTPException(status_code=500, detail=f"Помилка об'єднання мешів: {str(e)}")
     
     # Зберігаємо об'єднаний файл
-    import uuid
+    # Зберігаємо об'єднаний файл
     merged_id = f"merged_{uuid.uuid4()}"
     if format.lower() == "3mf":
         output_file = OUTPUT_DIR / f"{merged_id}.3mf"
@@ -496,7 +465,7 @@ class HexagonalGridRequest(BaseModel):
     south: float
     east: float
     west: float
-    hex_size_m: float = Field(default=500.0, ge=100.0, le=10000.0)  # 0.5 км за замовчуванням
+    hex_size_m: float = Field(default=400.0, ge=100.0, le=10000.0)  # 0.4 км за замовчуванням
     grid_type: str = Field(default="hexagonal", description="Тип сітки: 'hexagonal' (шестикутники) або 'square' (квадрати)")
 
 
@@ -623,7 +592,7 @@ class ZoneGenerationRequest(BaseModel):
     
     zones: List[dict]  # Список зон (GeoJSON features)
     # Hex grid parameters (used to reconstruct exact zone polygons in metric space for perfect stitching)
-    hex_size_m: float = Field(default=500.0, ge=100.0, le=10000.0)
+    hex_size_m: float = Field(default=400.0, ge=100.0, le=10000.0)
     # IMPORTANT: city/area bbox (WGS84) for a stable global reference across sessions.
     # If provided, global_center + DEM bbox + elevation_ref are computed/cached from this bbox,
     # so later "add more zones" runs stitch perfectly with earlier prints.
@@ -632,7 +601,7 @@ class ZoneGenerationRequest(BaseModel):
     east: Optional[float] = None
     west: Optional[float] = None
     # Всі інші параметри як у GenerationRequest
-    model_size_mm: float = Field(default=100.0, ge=10.0, le=500.0)
+    model_size_mm: float = Field(default=80.0, ge=10.0, le=500.0)
     road_width_multiplier: float = Field(default=0.8, ge=0.1, le=5.0)
     road_height_mm: float = Field(default=0.5, ge=0.1, le=10.0)
     road_embed_mm: float = Field(default=0.3, ge=0.0, le=5.0)
@@ -657,7 +626,7 @@ class ZoneGenerationRequest(BaseModel):
     # Fast mode for stitching diagnostics: generate only terrain (optionally with water depression)
     terrain_only: bool = False
     include_parks: bool = True
-    include_pois: bool = True
+    include_pois: bool = False
 
 
 @app.post("/api/generate-zones", response_model=GenerationResponse)
@@ -1468,7 +1437,7 @@ async def generate_model_task(
             terrain_mesh, terrain_provider = create_terrain_mesh(
                 bbox_meters,
                 z_scale=request.terrain_z_scale,
-                resolution=request.terrain_resolution,
+                resolution=max(float(request.terrain_resolution), 1.0) if request.terrain_resolution is not None else 1.0,
                 latlon_bbox=latlon_bbox,
                 source_crs=source_crs,
                 terrarium_zoom=request.terrarium_zoom,

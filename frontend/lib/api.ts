@@ -108,7 +108,7 @@ export const api = {
       `${API_BASE_URL}/api/hexagonal-grid`,
       {
         ...bounds,
-        hex_size_m: bounds.hex_size_m || 500.0,
+        hex_size_m: bounds.hex_size_m || 400.0,
         grid_type: bounds.grid_type || "hexagonal",
       }
     );

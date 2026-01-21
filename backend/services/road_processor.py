@@ -195,81 +195,7 @@ def create_bridge_supports(
     return supports
 
 
-def create_bridge_supports(
-    bridge_polygon,
-    bridge_base_z: float,
-    terrain_provider,
-    support_spacing: float = 25.0,
-    support_width: float = 2.0,
-    min_support_height: float = 2.0
-):
-    """
-    Створює опори для 3D друку під підвищеними мостами.
-    
-    Args:
-        bridge_polygon: Полігон моста
-        bridge_base_z: Висота низу моста
-        terrain_provider: Надавач висот terrain
-        support_spacing: Відстань між опорами (м)
-        support_width: Діаметр опори (м)
-        min_support_height: Мінімальна висота опори для створення
-    
-    Returns:
-        List of support meshes
-    """
-    import trimesh
-    import numpy as np
-    from shapely.geometry import Point
-    
-    supports = []
-    
-    try:
-        # Get bounding box of bridge
-        minx, miny, maxx, maxy = bridge_polygon.bounds
-        
-        # Create grid of support points
-        x_points = np.arange(minx, maxx, support_spacing)
-        y_points = np.arange(miny, maxy, support_spacing)
-        
-        for x in x_points:
-            for y in y_points:
-                pt = Point(x, y)
-                
-                # Check if point is inside bridge polygon
-                if not bridge_polygon.contains(pt):
-                    continue
-                
-                # Get terrain height at this point
-                terrain_z = terrain_provider.get_surface_heights_for_points(np.array([[x, y]]))[0]
-                
-                # Calculate support height
-                support_height = bridge_base_z - terrain_z
-                
-                # Only create support if tall enough
-                if support_height < min_support_height:
-                    continue
-                
-                # Create cylindrical support
-                try:
-                    radius = support_width / 2.0
-                    cylinder = trimesh.creation.cylinder(
-                        radius=radius,
-                        height=support_height,
-                        sections=8  # Octagonal for performance
-                    )
-                    
-                    # Position support
-                    cylinder.apply_translation([x, y, terrain_z + support_height / 2.0])
-                    
-                    supports.append(cylinder)
-                    
-                except Exception as e:
-                    continue
-        
-    except Exception as e:
-        print(f"[WARN] Error creating bridge supports: {e}")
-    
-    return supports
+
 
 
 def detect_bridges(
@@ -488,12 +414,10 @@ def detect_bridges(
                                             has_bridge_in_name = 'міст' in road_name or 'bridge' in road_name or 'патон' in road_name
                                             
                                             if is_major_road or has_bridge_in_name:
-                                                print(f"DEBUG: Road {idx} ({road_name}) exits zone towards water (distance={distance_to_water:.0f}m), classified as BRIDGE")
                                                 is_bridge = True
                                                 bridge_height = max(bridge_height, 10.0)  # Default bridge height
                                                 break
                 except Exception as e:
-                    print(f"DEBUG: Cross-zone bridge detection failed for road {idx}: {e}")
                     pass
 
             
@@ -503,15 +427,12 @@ def detect_bridges(
                     # Перевіряємо чи дорога перетинає воду
                     if geom.intersects(water_union):
                         intersection_length = geom.intersection(water_union).length
-                        print(f"DEBUG: Road {idx} intersects water_union! Length: {intersection_length:.2f}")
-                        
                         # RELAXED: Accept 1m+ intersection (for partial bridges at zone edges)
                         if intersection_length >= 1.0:
-                            print(f"DEBUG: Valid intersection! Road {idx} classified as BRIDGE.")
                             is_bridge = True
                             is_over_water = True
                         else:
-                            print(f"DEBUG: Intersection too short ({intersection_length:.2f}m < 1m), NOT a bridge.")
+
                             # Висота моста залежить від ширини води
                             if hasattr(water_union, 'area'):
                                 # Знаходимо найближчий водний об'єкт для оцінки ширини
