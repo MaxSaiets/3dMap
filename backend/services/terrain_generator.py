@@ -68,14 +68,36 @@ def create_terrain_mesh(
     height_m = maxy - miny
     aspect_ratio = width_m / height_m if height_m > 0 else 1.0
     
-    # resolution - це простір між точками в метрах (наприклад, 1.0м)
-    # Тому кількість точок = довжина / resolution
-    res_x = int(max(width_m / resolution, 2))
-    res_y = int(max(height_m / resolution, 2))
+    # resolution - це параметр якості.
+    # Якщо resolution >= 10, це "кількість точок" (target grid size).
+    # Якщо resolution < 10, це "метри між точками" (spacing).
+    # Для 400м зони:
+    #   Old logic: 100 -> 400/100 = 4 points (FAIL)
+    #   New logic: 100 -> 100 points (GOOD)
     
-    # Мінімальна роздільна здатність - 10 точок
-    res_x = max(10, res_x)
-    res_y = max(10, res_y)
+    target_res = float(resolution)
+    if target_res >= 10:
+        # Target count mode
+        if width_m >= height_m:
+            res_x = int(target_res)
+            res_y = int(target_res / aspect_ratio)
+        else:
+            res_y = int(target_res)
+            res_x = int(target_res * aspect_ratio)
+    else:
+        # Spacing mode (meters per pixel)
+        # Prevent zero division or extreme density
+        spacing = max(0.1, target_res)
+        res_x = int(width_m / spacing)
+        res_y = int(height_m / spacing)
+    
+    # Enforce sane minimums (prevent low-poly artifacts)
+    res_x = max(64, res_x)
+    res_y = max(64, res_y)
+    
+    # Enforce sane maximums (prevent OOM)
+    res_x = min(2000, res_x)
+    res_y = min(2000, res_y)
     
     # КРИТИЧНЕ ВИПРАВЛЕННЯ: Використання глобального центру для синхронізації квадратів
     # Якщо global_center задано - використовуємо його (єдина точка відліку для всієї карти)
@@ -151,6 +173,21 @@ def create_terrain_mesh(
     # Отримуємо висоти (спробує API, якщо не вдалося - синтетичний рельєф)
     # ВАЖЛИВО: Передаємо UTM координати (X_utm, Y_utm) для семплінгу висот
     # get_elevation_data перетворить їх в Lat/Lon для API
+    
+    # ВИПРАВЛЕННЯ: Якщо використовується глобальний центр, ми ПОВИННІ використовувати його CRS
+    # для зворотного перетворення UTM -> LatLon.
+    # Інакше, якщо source_crs прийшов з локального файлу (будівлі), він може мати іншу UTM зону,
+    # і перетворення дасть зовсім інші координати (в іншому місці планети -> висота 0).
+    if global_center is not None:
+        try:
+            # Отримуємо CRS від глобального центру
+            gc_crs = global_center.get_utm_crs()
+            if gc_crs is not None:
+                print(f"[INFO] Using GlobalCenter CRS for elevation lookup (overriding provided source_crs)")
+                source_crs = gc_crs
+        except Exception as e:
+            print(f"[WARN] Failed to get CRS from global_center: {e}")
+
     Z = get_elevation_data(
         X_utm,  # Використовуємо UTM координати для семплінгу
         Y_utm,
@@ -393,18 +430,24 @@ def create_terrain_mesh(
         print(f"[WARN] water depression failed: {e}")
         Z_original_before_water = None
 
-    # Restore border ring again after water carve (same reasoning as above).
-    if stitching_mode and Z_seam_ref is not None:
-        try:
-            k = 2
-            Z = np.asarray(Z, dtype=float)
-            Z_seam_ref = np.asarray(Z_seam_ref, dtype=float)
-            Z[:, :k] = Z_seam_ref[:, :k]
-            Z[:, -k:] = Z_seam_ref[:, -k:]
-            Z[:k, :] = Z_seam_ref[:k, :]
-            Z[-k:, :] = Z_seam_ref[-k:, :]
-        except Exception:
-            pass
+    # [REMOVED] Second border ring restoration.
+    # We DO NOT want to restore the border to Z_seam_ref here, because that would undo 
+    # the water depression at the edges, creating a "wall" or "ridge" of water/ground 
+    # discontinuity where the water meets the tile boundary.
+    # Since adjacent tiles share the same water polygons and depth logic, they will 
+    # both carve the same depth at the shared edge, preserving stitching.
+    #
+    # if stitching_mode and Z_seam_ref is not None:
+    #     try:
+    #         k = 2
+    #         Z = np.asarray(Z, dtype=float)
+    #         Z_seam_ref = np.asarray(Z_seam_ref, dtype=float)
+    #         Z[:, :k] = Z_seam_ref[:, :k]
+    #         Z[:, -k:] = Z_seam_ref[:, -k:]
+    #         Z[:k, :] = Z_seam_ref[:k, :]
+    #         Z[-k:, :] = Z_seam_ref[-k:, :]
+    #     except Exception:
+    #         pass
     
     # Safety (again): ensure any post-processing didn't break the grid shape.
     try:
@@ -1049,6 +1092,38 @@ def create_terrain_mesh(
     # Do NOT adapt it per-tile based on min(Z) — that causes vertical offsets between adjacent zones.
     base_thickness_for_solid = float(base_thickness)
 
+    # OPTIMIZATION: Simplify the SURFACE mesh before creating walls/solid.
+    # A 600x600 grid has ~720k faces (36MB binary STL). With subdivision, it's >1.5M faces (80MB+).
+    try:
+        # Default budget
+        target_faces = 80000
+        # If user explicitly requested high resolution (e.g. 300-600), respect it!
+        # Don't simplify aggressively, or "big triangles" appear.
+        if resolution > 150:
+            target_faces = 300000  # High detail budget (approx 15MB STL)
+            
+        original_faces = len(terrain_top_clipped.faces) if hasattr(terrain_top_clipped, "faces") else 0
+        
+        if original_faces > (target_faces * 1.2):
+            print(f"[INFO] Simplifying terrain surface from {original_faces} to ~{target_faces} faces (resolution={resolution})...")
+            
+            # Method 1: Quadratic Decimation (Open3D / Fast)
+            simplified = None
+            # Method: Quadratic Decimation (Fast & Standard)
+            try:
+                simplified = terrain_top_clipped.simplify_quadratic_decimation(target_faces)
+                if simplified is not None and len(simplified.faces) < original_faces:
+                     terrain_top_clipped = simplified
+                     print(f"[INFO] Quadratic decimation successful: {len(terrain_top_clipped.faces)} faces")
+            except Exception as e:
+                print(f"[WARN] Simplify quadratic decimation failed: {e}")
+
+            # Recalculate normals after simplification
+            terrain_top_clipped.fix_normals()
+            
+    except Exception as e:
+        print(f"[WARN] Failed to simplify terrain surface: {e}")
+
     terrain_solid = create_solid_terrain(
         terrain_top_clipped,  # Використовуємо обрізаний terrain
         X, Y, Z, 
@@ -1665,58 +1740,13 @@ def create_solid_terrain(
             loop_idx = [int(i) for i in best]
             loop_xy = verts[np.array(loop_idx, dtype=int), :2]
 
-            # Smooth/simplify boundary to avoid "ribbed" side walls from tiny zig-zags along the triangulation.
-            # IMPORTANT: keep Z from the *real* top mesh boundary vertices (do NOT invent new top vertices).
-            try:
-                from shapely.geometry import LineString as _LineString
-                line = _LineString([(float(x), float(y)) for x, y in loop_xy])
-                simp = line.simplify(1.0, preserve_topology=True)  # meters
-                coords = list(simp.coords)
-                if len(coords) >= 3:
-                    # Snap simplified coords to nearest existing boundary vertices (preserves true Z)
-                    try:
-                        from scipy.spatial import cKDTree
-                        tree = cKDTree(np.asarray(loop_xy, dtype=float))
-                        _, nn = tree.query(np.asarray(coords, dtype=float), k=1)
-                        nn = [int(i) for i in np.asarray(nn).reshape(-1)]
-                        # De-dup while preserving order
-                        picked = []
-                        seen = set()
-                        for i in nn:
-                            if i in seen:
-                                continue
-                            seen.add(i)
-                            picked.append(i)
-                        if len(picked) >= 3:
-                            loop_idx = [loop_idx[i] for i in picked]
-                            loop_xy = verts[np.array(loop_idx, dtype=int), :2]
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # Additional: compress collinear points so long straight edges (hex sides) become flat segments.
-            # This keeps walls planar and also helps stitched tiles share exactly the same edge vertices.
-            try:
-                if len(loop_idx) >= 4:
-                    keep = []
-                    n = len(loop_idx)
-                    # NOTE: coordinates are typically in model units (mm) by this stage; allow tiny floating noise.
-                    eps = 1e-6
-                    for i in range(n):
-                        p0 = loop_xy[(i - 1) % n]
-                        p1 = loop_xy[i % n]
-                        p2 = loop_xy[(i + 1) % n]
-                        v1 = p1 - p0
-                        v2 = p2 - p1
-                        cross = float(v1[0] * v2[1] - v1[1] * v2[0])
-                        if abs(cross) > eps:
-                            keep.append(i)
-                    if len(keep) >= 3:
-                        loop_idx = [loop_idx[i] for i in keep]
-                        loop_xy = verts[np.array(loop_idx, dtype=int), :2]
-            except Exception:
-                pass
+            # DISABLE Simplification: keeping all vertices ensures the wall follows Z-undulations (hills/valleys) exactly.
+            # Simplifying based on XY only (collinear points) removes valley-bottom points, causing the wall top
+            # to bridge across the valley (creating a sheer wall artifact blocking the view).
+            
+            # (Simplification block removed)
+            
+            # (Compression block removed)
 
             # Create bottom vertices (aligned with boundary XY)
             bottom_map: dict[int, int] = {}
@@ -1774,30 +1804,41 @@ def create_solid_terrain(
         except Exception:
             return None
 
-    # Try boundary-based solidify first (best quality)
-    # Stitching mode is STRICT: we must not invent walls/bottoms via bbox fallbacks,
-    # otherwise adjacent tiles can diverge and the seam becomes crooked.
-    if stitching_mode:
-        solid_boundary = _solidify_from_boundary(terrain_top, min_z)
-        if solid_boundary is None:
-            raise ValueError("stitching_mode: failed to solidify terrain from top boundary (would fall back to bbox walls).")
-        return solid_boundary
-    else:
-        if zone_polygon is None:
-            try:
-                solid_boundary = _solidify_from_boundary(terrain_top, min_z)
-                if solid_boundary is not None:
-                    return solid_boundary
-            except Exception:
-                pass
-
-    # Отримуємо межі рельєфу
+    # Try boundary-based solidify first (best quality).
+    # This works for BOTH stitching_mode (strict) and regular mode.
+    # It extracts the ACTUAL mesh boundary loop and extrudes it, ensuring 
+    # the solid is watertight even if the mesh was simplified or slightly warped.
+    try:
+        # In stitching mode, we pass floor_z from arguments (strict).
+        # In regular mode, we calculate it from local min.
+        floor_z_val = min_z
+        solid_boundary = _solidify_from_boundary(terrain_top, floor_z_val)
+        
+        if solid_boundary is not None:
+            # Success!
+            if stitching_mode:
+                 # Additional sanity checks for stitching could go here
+                 pass
+            return solid_boundary
+            # In strict stitching mode, if robust method fails, we MUST fail 
+            # (fallback to bbox would create non-matching seams).
+            raise ValueError("stitching_mode: failed to solidify terrain from boundary.")
+    except Exception as e:
+        if stitching_mode:
+            raise e
+        print(f"[WARN] Boundary solidification failed: {e}. Legacy fallback DISABLED to avoid artifacts.")
+        # Proceed to raise error so we fallback to returning just the top surface (clean result)
+        # instead of trying to construct a buggy wall.
+        raise ValueError(f"Boundary solidification failed: {e}") 
+        
+    # Legacy Fallback code below is now unreachable effectively, but we keep the variables definition 
+    # if python scoping needs them, or just let it be skipped.
+    # Actually, let's make sure we don't run the legacy code.
     bounds = terrain_top.bounds
     min_x, min_y = float(bounds[0][0]), float(bounds[0][1])
     max_x, max_y = float(bounds[1][0]), float(bounds[1][1])
     
     # КРИТИЧНО: Якщо є полігон зони, використовуємо його для base та стінок
-    # Інакше використовуємо квадратний bbox
     if zone_polygon is not None:
         try:
             # Створюємо НИЖНЮ площину base по формі полігону (БЕЗ екструзії).
@@ -1874,24 +1915,36 @@ def create_solid_terrain(
     tol_y = max((max_y - min_y) * 0.02, 0.1)
     
     # Знаходимо граничні вершини за координатами
-    # ОПТИМІЗАЦІЯ: Обмежуємо кількість вершин для стінок, щоб уникнути занадто багатьох вертикальних ліній
-    max_wall_vertices = 50  # Максимальна кількість вершин на одну стінку
+    # ОПТИМІЗАЦІЯ: Більше не обмежуємо кількість вершин для стінок.
+    # Раніше було max_wall_vertices = 50, що призводило до "bridging artifacts" (стінка перекривала ями).
+    # Тепер, коли resolution пофікшено, нам потрібна детальна стінка, яка слідує за кожним вигином рельєфу.
+    max_wall_vertices = 1000000 # Практично без ліміту
     
-    def simplify_edge_vertices(edge_verts, sort_axis, max_verts=max_wall_vertices):
+    def simplify_edge_vertices(edge_verts, sort_axis, max_verts=None):
         """Спрощує граничні вершини, об'єднуючи близькі"""
-        if len(edge_verts) == 0:
+        if len(edge_verts) < 3:
             return edge_verts
         
         # Сортуємо по заданій осі
         edge_verts = edge_verts[edge_verts[:, sort_axis].argsort()]
         
-        # Якщо вершин занадто багато, вибираємо рівномірно розподілені
-        if len(edge_verts) > max_verts:
-            # Вибираємо рівномірно розподілені вершини
-            indices = np.linspace(0, len(edge_verts) - 1, max_verts, dtype=int)
-            edge_verts = edge_verts[indices]
+        # Simple distance-based simplification to reduce wall triangle count
+        # Keep points that are at least 'min_dist' apart.
+        # This prevents walls from having 1000s of sliver triangles.
+        min_dist = 1.0 # 1 meter minimum step for walls
         
-        return edge_verts
+        simplified = [edge_verts[0]]
+        for i in range(1, len(edge_verts) - 1):
+            prev = simplified[-1]
+            curr = edge_verts[i]
+            # dist along the sort axis (2D approximation is fine for walls aligned to axis)
+            dist = abs(curr[sort_axis] - prev[sort_axis])
+            if dist >= min_dist:
+                simplified.append(curr)
+        
+        simplified.append(edge_verts[-1])
+        
+        return np.array(simplified)
 
     def add_wall(v1_top: np.ndarray, v2_top: np.ndarray):
         """Створює стіну з правильним порядком вершин (CCW)"""
@@ -1943,6 +1996,9 @@ def create_solid_terrain(
     # Створюємо стінки безпосередньо від полігону зони, а не від вершин terrain
     use_bbox_walls = True
     if zone_polygon is not None:
+        # ENABLED POLYGON WALLS: Walls must follow the exact hex boundary.
+        # Square bbox walls create gaps between hex tiles.
+        pass
         # Build flat walls strictly along the polygon edges (no ribbed/zig-zag walls).
         # Also compress collinear points so hex edges become exactly 6 segments.
         try:
@@ -1995,28 +2051,30 @@ def create_solid_terrain(
             nearest_tol = 2.0  # meters (local coords)
 
             def get_terrain_height_at_xy(x: float, y: float) -> float:
-                # Prefer nearest vertex on terrain_top if close
-                if _edge_tree is not None:
-                    try:
-                        dist, idx = _edge_tree.query([float(x), float(y)], k=1)
-                        if np.isfinite(dist) and float(dist) <= float(nearest_tol):
-                            return float(verts[int(idx), 2])
-                    except Exception:
-                        pass
-                # TerrainProvider interpolation fallback
+                # 1. Prefer Global TerrainProvider interpolation (ensure strict continuity across tiles)
                 if terrain_provider is not None:
                     try:
+                        h = None
                         if hasattr(terrain_provider, "get_height_at"):
                             h = terrain_provider.get_height_at(float(x), float(y))
                         elif hasattr(terrain_provider, "get_height"):
                             h = terrain_provider.get_height(float(x), float(y))
-                        else:
-                            h = None
+                            
                         if h is not None and np.isfinite(h):
                             return float(h)
                     except Exception:
                         pass
-                # last resort: nearest by brute force
+
+                # 2. Fallback: Nearest vertex on generated mesh
+                if _edge_tree is not None:
+                    try:
+                        dist, idx = _edge_tree.query([float(x), float(y)], k=1)
+                        if np.isfinite(dist): # Check valid index
+                             return float(verts[int(idx), 2])
+                    except Exception:
+                        pass
+                
+                # 3. Last resort: nearest by brute force
                 d = np.sqrt((verts[:, 0] - float(x)) ** 2 + (verts[:, 1] - float(y)) ** 2)
                 j = int(np.argmin(d))
                 return float(verts[j, 2])

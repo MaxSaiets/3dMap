@@ -46,6 +46,7 @@ export interface TaskStatus {
     parks?: string | null;
     poi?: string | null;
   };
+  output_files?: Record<string, string>;
 }
 
 export interface BatchTaskStatusResponse {
@@ -84,11 +85,87 @@ export const api = {
     if (format) params.set("format", format);
     if (part) params.set("part", part);
     const qs = params.toString();
-    const response = await axios.get(
-      `${API_BASE_URL}/api/download/${taskId}${qs ? `?${qs}` : ""}`,
-      { responseType: "blob" }
-    );
-    return response.data;
+    const url = `${API_BASE_URL}/api/download/${taskId}${qs ? `?${qs}` : ""}`;
+
+    const CHUNK_SIZE = 1024 * 1024; // 1MB chunks as requested
+
+    try {
+      // 1. Get file size first via HEAD to handle redirects and get headers
+      const probe = await fetch(url, { method: 'HEAD' });
+
+      // If HEAD fails or gives incomplete info, we might need a GET probe
+      let totalSize = Number(probe.headers.get("Content-Length"));
+
+      if (!totalSize || isNaN(totalSize) || totalSize === 0) {
+        // Fallback: try GET range 0-0
+        try {
+          const probe2 = await fetch(url, { headers: { Range: "bytes=0-0" } });
+          const rangeHeader = probe2.headers.get("Content-Range"); // bytes 0-0/12345
+          if (rangeHeader) {
+            const match = rangeHeader.match(/\/(\d+)$/);
+            if (match) totalSize = Number(match[1]);
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      // If still unknown (or small < 5MB), just classic download
+      if (!totalSize || totalSize < 5 * CHUNK_SIZE) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Status ${res.status}`);
+        return await res.blob();
+      }
+
+      // 2. Download in chunks
+      console.log(`[Download] Starting chunked download: ${totalSize} bytes in ${(totalSize / CHUNK_SIZE).toFixed(1)} chunks`);
+      const chunks: Blob[] = [];
+      let loaded = 0;
+
+      while (loaded < totalSize) {
+        const end = Math.min(loaded + CHUNK_SIZE - 1, totalSize - 1);
+        const range = `bytes=${loaded}-${end}`;
+
+        let chunkSuccess = false;
+        let chunkAttempts = 0;
+
+        while (!chunkSuccess && chunkAttempts < 5) {
+          try {
+            // IMPORTANT: Fetch usually follows redirects.
+            // The redirected URL (StaticFile) respects Range.
+            const chunkRes = await fetch(url, {
+              headers: { Range: range }
+            });
+
+            if (!chunkRes.ok && chunkRes.status !== 206) {
+              // If 200 OK returned on Range request, it ignored range -> we got full file.
+              // Just return it (if first chunk) or handle error.
+              if (loaded === 0 && chunkRes.status === 200) {
+                return await chunkRes.blob();
+              }
+              throw new Error(`Chunk status: ${chunkRes.status}`);
+            }
+
+            const blob = await chunkRes.blob();
+            chunks.push(blob);
+            loaded += blob.size;
+            chunkSuccess = true;
+          } catch (e) {
+            chunkAttempts++;
+            console.warn(`[Download] Chunk retry ${chunkAttempts}:`, e);
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
+        if (!chunkSuccess) throw new Error("Failed to download chunk after retries");
+      }
+
+      return new Blob(chunks);
+
+    } catch (err) {
+      console.error("Chunked download critical fail:", err);
+      // Last resort: simple fetch
+      const finalTry = await fetch(url);
+      if (!finalTry.ok) throw err;
+      return await finalTry.blob();
+    }
   },
 
   async generateHexagonalGrid(bounds: {

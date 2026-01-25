@@ -309,7 +309,7 @@ export function ControlPanel({
         terrain_resolution: terrainResolution,
         terrarium_zoom: terrariumZoom,
         terrain_smoothing_sigma: 2.0, // Значення за замовчуванням
-        terrain_subdivide: false,
+        terrain_subdivide: true,
         terrain_subdivide_levels: 1,
         flatten_buildings_on_terrain: true,
         flatten_roads_on_terrain: false,
@@ -741,9 +741,9 @@ export function ControlPanel({
                   </label>
                   <input
                     type="range"
-                    min="120"
-                    max="320"
-                    step="20"
+                    min="100"
+                    max="1000"
+                    step="50"
                     value={terrainResolution}
                     onChange={(e) => setTerrainResolution(parseInt(e.target.value, 10))}
                     className="w-full"

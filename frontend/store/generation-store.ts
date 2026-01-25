@@ -101,13 +101,13 @@ const initialState = {
   // Тонка “підложка” під рельєф (мм на фінальній моделі)
   terrainBaseThicknessMm: 2.0,
   // Вища деталізація рельєфу -> менші трикутники, більше “реальності”
-  terrainResolution: 180,
+  terrainResolution: 150,
   terrariumZoom: 15,
   exportFormat: "3mf" as const,
   modelSizeMm: 80.0, // 80мм = 8см за замовчуванням
 
   // Preview: smooth shading can show a visible seam between separate tiles on slopes
-  terrainSmoothShading: false,
+  terrainSmoothShading: true,
 };
 
 export const useGenerationStore = create<GenerationState>((set) => ({

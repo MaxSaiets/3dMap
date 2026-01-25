@@ -8,6 +8,7 @@ import { api } from "@/lib/api";
 import * as THREE from "three";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
+import * as BufferGeometryUtils from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import JSZip from "jszip";
 import { useFrame } from "@react-three/fiber";
 
@@ -23,9 +24,7 @@ function bakeStlZUpToThreeYUp(object: THREE.Object3D) {
       geom.rotateX(rot);
       geom.computeBoundingBox();
       geom.computeBoundingSphere();
-      // Нормалі після повороту (щоб освітлення було коректним)
-      // computeVertexNormals може бути важким на великих мешах, але для STL превʼю це ок.
-      geom.computeVertexNormals();
+      // Нормалі після повороту (вже обчислені при завантаженні для smoothness)
     } catch {
       // ignore
     }
@@ -48,7 +47,22 @@ async function loadStlAsMesh(blob: Blob, color: number): Promise<THREE.Mesh> {
       url,
       (geometry) => {
         URL.revokeObjectURL(url);
-        const material = new THREE.MeshStandardMaterial({ color, flatShading: true });
+
+        // Improve mesh smoothness (merge vertices to share normals)
+        // This fixes the "faceted / big triangles" look on terrain.
+        try {
+          geometry.deleteAttribute('normal');
+          geometry = BufferGeometryUtils.mergeVertices(geometry);
+          geometry.computeVertexNormals();
+        } catch (e) {
+          console.warn("Failed to smooth mesh geometry", e);
+        }
+
+        const material = new THREE.MeshStandardMaterial({
+          color,
+          flatShading: false, // Smooth shading 
+          roughness: 0.8,
+        });
         const mesh = new THREE.Mesh(geometry, material);
         bakeStlZUpToThreeYUp(mesh);
         resolve(mesh);
@@ -578,25 +592,32 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
   };
 
   const loadZoneModel = async (id: string) => {
+    // 0) Get status to know which parts are available
+    let availableParts: string[] = ["base", "roads", "buildings", "water", "parks", "poi"];
+    try {
+      const s = await api.getStatus(id);
+      if (s && s.status === "completed" && s.output_files) {
+        // Check which keys exist in output_files
+        availableParts = availableParts.filter(p => !!(s as any).output_files[`${p}_stl`]);
+      }
+    } catch {
+      // ignore, try all
+    }
+
     // 1) Кольорові частини: пробуємо завантажити STL по частинах
     let loadedModel: THREE.Group | THREE.Mesh;
     const blobs: any = {};
-    const tryPart = async (p: "base" | "roads" | "buildings" | "water" | "parks" | "poi") => {
+
+    // Load sequentially to avoid "ERR_FAILED" / connection reset on heavy load
+    for (const p of availableParts) {
       try {
-        const b = await api.downloadModel(id, "stl", p);
+        const partKey = p as "base" | "roads" | "buildings" | "water" | "parks" | "poi";
+        const b = await api.downloadModel(id, "stl", partKey);
         if (b && b.size > 100) blobs[p] = b;
       } catch {
         // ignore
       }
-    };
-    await Promise.all([
-      tryPart("base"),
-      tryPart("roads"),
-      tryPart("buildings"),
-      tryPart("water"),
-      tryPart("parks"),
-      tryPart("poi"),
-    ]);
+    }
 
     if (Object.keys(blobs).length > 0) {
       loadedModel = await loadColoredPartsFromBlobs(blobs);
@@ -631,24 +652,40 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
       try {
         // Load without per-tile normalize so we can preserve real relative alignment (when available)
         const loadZoneModelRaw = async (id: string) => {
+          // 0) Get status first
+          let availableParts: string[] = ["base"]; // Default fallback: just base
+          try {
+            // Access cached status if possible to save a request
+            let st = (taskStatuses as any)?.[id];
+            if (!st || !st.output_files) {
+              st = await api.getStatus(id);
+            }
+
+            if (st && st.status === "completed" && (st as any).output_files) {
+              const files = (st as any).output_files;
+              // Check explicit keys for each part
+              availableParts = ["base", "roads", "buildings", "water", "parks", "poi"].filter(
+                p => files[`${p}_stl`] || files[`${p}`]
+              );
+            }
+          } catch {
+            console.warn(`[Batch] Failed to get status for ${id}, trying base only`);
+          }
+
           let loadedModel: THREE.Group | THREE.Mesh;
           const blobs: any = {};
-          const tryPart = async (p: "base" | "roads" | "buildings" | "water" | "parks" | "poi") => {
+
+          // Sequential load
+          for (const p of availableParts) {
             try {
-              const b = await api.downloadModel(id, "stl", p);
+              const partKey = p as "base" | "roads" | "buildings" | "water" | "parks" | "poi";
+              const b = await api.downloadModel(id, "stl", partKey);
               if (b && b.size > 100) blobs[p] = b;
-            } catch {
-              // ignore
+            } catch (e) {
+              // Warning, but don't stop everything
+              // console.warn(`Failed to download part ${p} for ${id}`);
             }
-          };
-          await Promise.all([
-            tryPart("base"),
-            tryPart("roads"),
-            tryPart("buildings"),
-            tryPart("water"),
-            tryPart("parks"),
-            tryPart("poi"),
-          ]);
+          }
 
           if (Object.keys(blobs).length > 0) {
             loadedModel = await loadColoredPartsFromBlobs(blobs);
@@ -812,18 +849,33 @@ function ModelLoader({ rotateMode }: { rotateMode: RotateMode }) {
             // ignore missing part
           }
         };
-        await Promise.all([
-          tryPart("base"),
-          tryPart("roads"),
-          tryPart("buildings"),
-          tryPart("water"),
-          tryPart("parks"),
-          tryPart("poi"),
-        ]);
+        // Execute sequentially to avoid browser connection limits/timeouts
+        // Fetch status first to know which parts exist (avoid 404s)
+        let availableParts: string[] = ["base", "roads", "buildings", "water", "parks", "poi"];
+        try {
+          const st = await api.getStatus(activeTaskId);
+          if ((st as any).preview_parts) {
+            const pp = (st as any).preview_parts;
+            availableParts = Object.keys(pp).filter(k => pp[k] !== null);
+          }
+        } catch {
+          // fallback to all
+        }
 
-        if (Object.keys(blobs).length > 0) {
+        await tryPart("base");
+        if (availableParts.includes("roads")) await tryPart("roads");
+        if (availableParts.includes("buildings")) await tryPart("buildings");
+        if (availableParts.includes("water")) await tryPart("water");
+        if (availableParts.includes("parks")) await tryPart("parks");
+        if (availableParts.includes("poi")) await tryPart("poi");
+
+        // Check if we have the critical 'base' part. If not, partial loading creates a broken view.
+        // In that case, discard parts and try loading the single combined file (fallback).
+        if (blobs["base"]) {
+          console.log("Завантажено частин:", Object.keys(blobs));
           loadedModel = await loadColoredPartsFromBlobs(blobs);
         } else {
+          console.warn("Не вдалося завантажити 'base' (рельєф). Пробуємо завантажити повний файл як fallback...");
           // 2) Fallback на один STL
           const blob = await api.downloadModel(activeTaskId, "stl");
           loadedModel = await loadStlAsMesh(blob, 0x888888);

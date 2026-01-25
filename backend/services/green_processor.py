@@ -21,6 +21,25 @@ from services.terrain_provider import TerrainProvider
 from services.global_center import GlobalCenter
 
 
+def _iter_polys(geom):
+    """Yield Polygon parts from Polygon/MultiPolygon/GeometryCollection-ish inputs."""
+    if geom is None:
+        return []
+    if isinstance(geom, Polygon):
+        yield geom
+    elif isinstance(geom, MultiPolygon):
+        for g in geom.geoms:
+            if isinstance(g, Polygon):
+                yield g
+    elif hasattr(geom, "geoms"):
+        try:
+            for g in geom.geoms:
+                if isinstance(g, Polygon):
+                    yield g
+        except Exception:
+            pass
+
+
 def _create_high_res_mesh(poly: Polygon, height_m: float, target_edge_len_m: float) -> Optional[trimesh.Trimesh]:
     """
     Створює меш з UNIFORM тріангуляцією (remeshed) використовуючи Steiner points.
@@ -158,8 +177,20 @@ def _create_high_res_mesh(poly: Polygon, height_m: float, target_edge_len_m: flo
             for face in faces:
                 # Рахуємо центр трикутника
                 centroid = np.mean(vertices[face], axis=0)
+                
+                # Check 1: Centroid inside polygon
                 if contains_check(centroid):
-                    final_faces.append(face)
+                    # Check 2: Max edge length (remove long skinny triangles spanning gaps)
+                    # This prevents artifacts in concave areas where Delaunay jumps across the gap
+                    p1, p2, p3 = vertices[face]
+                    max_edge = max(
+                        np.linalg.norm(p1 - p2),
+                        np.linalg.norm(p2 - p3),
+                        np.linalg.norm(p3 - p1)
+                    )
+                    # Allow slightly larger edges than target, but not huge ones
+                    if max_edge < target_edge_len_m * 2.5:
+                        final_faces.append(face)
             
             if len(final_faces) == 0:
                 # Fallback
@@ -259,6 +290,10 @@ def process_green_areas(
     simplify_mm: float = 0.4,
     # --- НОВИЙ АРГУМЕНТ: Полігони доріг для вирізання ---
     road_polygons: Optional[object] = None,  # Shapely Polygon/MultiPolygon об'єднаних доріг (в локальних координатах)
+    # --- НОВИЙ АРГУМЕНТ: Полігони води для вирізання ---
+    water_polygons: Optional[object] = None,
+    # Зниження деталізації для парків
+    target_edge_len_m: Optional[float] = None,
 ) -> Optional[trimesh.Trimesh]:
     if gdf_green is None or gdf_green.empty:
         return None
@@ -280,38 +315,41 @@ def process_green_areas(
         except Exception:
             pass
 
-    # --- Road Mask Preparation (Підготовка маски доріг для вирізання) ---
-    # Переконуємось, що полігон доріг теж в локальних координатах
+    # --- Masks Preparation ---
+    # Road Mask
     road_mask = road_polygons
     if road_mask is not None:
-        # Перевіряємо, чи маска не порожня
         try:
             if getattr(road_mask, "is_empty", False):
                 road_mask = None
         except Exception:
             pass
         
-        # Перетворення координат (якщо потрібно)
         if road_mask is not None and global_center is not None:
-            # Перевірка: якщо координати доріг виглядають як UTM (великі числа), а ми вже в local
             try:
                 bounds = road_mask.bounds
                 sample_x = bounds[0]
-                # Евристика: якщо координати > 100000, це UTM
                 if abs(sample_x) > 100000:
                     def to_local_transform(x, y, z=None):
                         x_local, y_local = global_center.to_local(x, y)
-                        if z is not None:
-                            return (x_local, y_local, z)
-                        return (x_local, y_local)
+                        return (x_local, y_local, z) if z is not None else (x_local, y_local)
                     road_mask = transform(to_local_transform, road_mask)
-                    # Перевіряємо валідність після перетворення
                     if road_mask is None or getattr(road_mask, "is_empty", False):
                         road_mask = None
             except Exception as e:
                 print(f"[WARN] Помилка перетворення road_polygons в локальні координати: {e}")
-                # Якщо не вдалося перетворити, не використовуємо маску
                 road_mask = None
+
+    # Water Mask
+    water_mask = water_polygons
+    if water_mask is not None:
+        try:
+            if getattr(water_mask, "is_empty", False):
+                water_mask = None
+        except Exception:
+            pass
+        # Assuming water_mask passed from main is already local if generated from local geometries
+        # (It is, based on main.py logic using water_geometries_local)
 
     # --- Clipping Block ---
     clip_box = None
@@ -325,7 +363,7 @@ def process_green_areas(
     # --- Parameters Calculation ---
     simplify_tol_m = 0.5
     min_width_m = None
-    target_edge_len_m = 3.0  # Базове значення
+    target_edge_len_m = float(target_edge_len_m) if target_edge_len_m is not None else 3.0
     
     if scale_factor is not None and float(scale_factor) > 0:
         try:
@@ -336,179 +374,95 @@ def process_green_areas(
             min_width_m = max(0.0, float(min_feature_mm) / float(scale_factor))
         except Exception:
             pass
-        
-        # Для Low Poly текстури нам потрібна сітка ~1.5 - 2 мм на моделі
-        # Це забезпечить достатньо вершин для "піків"
-        try:
-            target_edge_len_m = 2.0 / float(scale_factor)  # 2mm на моделі
-            # Обмежуємо, щоб не повісити систему на великих картах
-            target_edge_len_m = max(1.5, min(target_edge_len_m, 10.0))
-        except Exception:
-            pass
-
-    # --- Polygon Cleaning & Collection ---
-    polys: list[Polygon] = []
-
-    def _iter_polys(g):
-        if g is None or getattr(g, "is_empty", False):
-            return []
-        if isinstance(g, Polygon):
-            return [g]
-        if isinstance(g, MultiPolygon):
-            return list(g.geoms)
-        if hasattr(g, "geoms"):
-            return [gg for gg in g.geoms if isinstance(gg, Polygon)]
-        return []
-
-    for _, row in gdf_green.iterrows():
-        geom = getattr(row, "geometry", None)
-        if geom is None or getattr(geom, "is_empty", False):
-            continue
-        try:
-            if not geom.is_valid:
-                geom = geom.buffer(0)
-        except Exception:
-            pass
-        if geom is None or getattr(geom, "is_empty", False):
-            continue
-
-        if clip_box is not None:
-            try:
-                geom = geom.intersection(clip_box)
-            except Exception:
-                continue
-            if geom is None or getattr(geom, "is_empty", False):
-                continue
-
-        # --- ROAD CLIPPING (ВИРІЗАННЯ ДОРІГ) ---
-        # Це найважливіший момент: віднімаємо дороги від зеленої зони
-        # Це запобігає z-fighting та перетину між дорогами та парками
-        if road_mask is not None:
-            try:
-                # ОПТИМІЗАЦІЯ: Обрізаємо road_mask по bounds поточного парку перед вирізанням
-                # Це значно прискорює Boolean операцію для великих MultiPolygon доріг
-                geom_bounds = geom.bounds
-                road_mask_clipped = road_mask
-                
-                # Створюємо bounding box для парку з невеликим padding (для безпеки)
-                padding = 10.0  # 10 метрів padding для уникнення проблем на краях
-                clip_box_geom = box(
-                    geom_bounds[0] - padding,
-                    geom_bounds[1] - padding,
-                    geom_bounds[2] + padding,
-                    geom_bounds[3] + padding
-                )
-                
-                # Обрізаємо road_mask по bounds парку
-                try:
-                    road_mask_clipped = road_mask.intersection(clip_box_geom)
-                    if road_mask_clipped is None or getattr(road_mask_clipped, "is_empty", False):
-                        # Якщо дороги не перетинаються з цим парком, пропускаємо вирізання
-                        pass
-                    else:
-                        # Вирізаємо дороги з парку (Boolean Difference)
-                        geom = geom.difference(road_mask_clipped)
-                except Exception:
-                    # Якщо intersection не вдався, пробуємо без обрізання (повільніше, але надійніше)
-                    geom = geom.difference(road_mask)
-                    
-            except Exception as e:
-                print(f"[WARN] Помилка вирізання доріг із парку: {e}")
-                # Якщо помилка, залишаємо як є (краще мати парк, ніж нічого)
-                pass
-            
-            # Перевіряємо, чи геометрія не стала порожньою після вирізання
-            if geom is None or getattr(geom, "is_empty", False):
-                continue
-
-        for poly in _iter_polys(geom):
-            if poly is None or getattr(poly, "is_empty", False):
-                continue
-            try:
-                if not poly.is_valid:
-                    poly = poly.buffer(0)
-            except Exception:
-                pass
-            if poly is None or getattr(poly, "is_empty", False):
-                continue
-
-            # Clean tiny artifacts after clipping (особливо після вирізання доріг)
-            try:
-                # Після вирізання доріг можуть залишитися дуже маленькі шматочки
-                # Видаляємо їх (менше 10м² замість 100м², бо це артефакти від вирізання)
-                if float(getattr(poly, "area", 0.0) or 0.0) < 10.0:
-                    continue
-            except Exception:
-                pass
-            polys.append(poly)
-
-    if not polys:
-        return None
-
-    # Union overlapping parks (після вирізання доріг)
-    # ВАЖЛИВО: Union робимо ПІСЛЯ вирізання доріг, щоб уникнути проблем з об'єднанням
-    try:
-        merged = unary_union(polys)
-        polys = []
-        for p in _iter_polys(merged):
-            if p is not None and not p.is_empty:
-                # Додаткова перевірка площі після union (можуть з'явитися нові дрібні шматочки)
-                try:
-                    if float(getattr(p, "area", 0.0) or 0.0) < 10.0:
-                        continue
-                except Exception:
-                    pass
-                polys.append(p)
-    except Exception:
-        pass
 
     # Filter & Simplify
-    filtered: list[Polygon] = []
-    for poly in polys:
-        if poly is None or poly.is_empty:
-            continue
-        try:
-            poly = poly.simplify(float(simplify_tol_m), preserve_topology=True)
-        except Exception:
-            pass
-        if poly is None or poly.is_empty:
-            continue
+    collected_items = [] # (polygon, row)
+    for idx, row in gdf_green.iterrows():
+        geom = row.geometry
+        if geom is None or getattr(geom, "is_empty", False): continue
+        
+        # 1. Clip to Bbox
+        if clip_box is not None:
+             try:
+                 geom = geom.intersection(clip_box)
+             except: continue
+        
+        # 2. Subtract Roads
+        if road_mask is not None:
+             try:
+                  geom = geom.difference(road_mask)
+             except: pass
 
-        if min_width_m is not None and float(min_width_m) > 0:
-            # Simple check via area/perimeter ratio
-            try:
-                per = float(getattr(poly, "length", 0.0) or 0.0)
-                area = float(getattr(poly, "area", 0.0) or 0.0)
-                if per > 0 and area > 0:
-                    equiv_width = float((2.0 * area) / per)
-                    if equiv_width < float(min_width_m):
-                        continue
-            except Exception:
-                pass
-        filtered.append(poly)
+        # 3. Subtract Water (CRITICAL FIX for water under terrain)
+        if water_mask is not None:
+             try:
+                  geom = geom.difference(water_mask)
+             except: pass
+        
+        if geom is None or getattr(geom, "is_empty", False): continue
 
-    if not filtered:
+        for p in _iter_polys(geom):
+             if p and not p.is_empty:
+                  try:
+                      p = p.simplify(float(simplify_tol_m), preserve_topology=True)
+                  except: pass
+                  
+                  if p and not p.is_empty and p.area > 2.0:
+                       collected_items.append((p, row))
+
+    if not collected_items:
         return None
 
     # --- MESH GENERATION ---
     meshes: list[trimesh.Trimesh] = []
-    for poly in filtered:
+    
+    for poly, row in collected_items:
         try:
-            # 1. Створення високодеталізованого мешу
+            is_paved = False
+            is_pier = False
+            is_cemetery = False
+            is_transition = False # construction, brownfield
+            
+            # Helper to check tags safely
+            def check_tag(key, values):
+                if key in row and str(row[key]) in values: return True
+                return False
+
+            # Paved checks
+            if check_tag('amenity', ['parking', 'marketplace', 'university', 'school']): is_paved = True
+            if check_tag('place', ['square']): is_paved = True
+            if check_tag('landuse', ['plaza', 'commercial', 'retail', 'railway']): is_paved = True
+            if check_tag('highway', ['pedestrian']): is_paved = True
+            if check_tag('man_made', ['pier', 'breakwater', 'groyne']): is_paved = True; is_pier = True
+            if check_tag('railway', ['station', 'platform']): is_paved = True
+            
+            # Restaurants / Food (Treat as paved/road color as requested)
+            if check_tag('amenity', ['restaurant', 'cafe', 'fast_food', 'bar', 'pub', 'food_court', 'ice_cream', 'bicycle_parking', 'shelter']):
+                is_paved = True
+
+            # Cemeteries (Distinct "not green" color)
+            if check_tag('amenity', ['grave_yard']) or check_tag('landuse', ['cemetery', 'religious']):
+                is_cemetery = True
+                is_paved = False # Distinct handling
+
+            # Transition / Industrial / Construction / Farmland
+            if check_tag('landuse', ['construction', 'brownfield', 'industrial', 'garages', 'farmland', 'farmyard', 'orchard', 'vineyard', 'greenhouse_horticulture']):
+                is_transition = True
+                is_paved = True # Treat as gray/paved
+
+            # 1. High Res Mesh
             mesh = _create_high_res_mesh(poly, float(height_m), target_edge_len_m)
+            if mesh is None or len(mesh.vertices) == 0: continue
 
-            if mesh is None or len(mesh.vertices) == 0:
-                continue
-
-            # 2. Накладання на рельєф (Draping)
+            # 2. Draping
             if terrain_provider is not None:
                 v = mesh.vertices.copy()
                 old_z = v[:, 2].copy()
                 ground_heights = terrain_provider.get_surface_heights_for_points(v[:, :2])
-                
+                ground_heights = np.nan_to_num(ground_heights, nan=0.0)
+
                 z_min = float(np.min(old_z))
-                z_max = float(np.max(old_z))
-                z_range = z_max - z_min
+                z_range = float(np.max(old_z)) - z_min
                 
                 relative_height = np.zeros_like(old_z)
                 if z_range > 1e-6:
@@ -516,32 +470,47 @@ def process_green_areas(
                 
                 new_z = ground_heights - float(embed_m) + relative_height * float(height_m)
                 
-                # Локальна корекція (щоб не провалювалось)
-                safety_margin = 0.01 
-                min_allowed_z = ground_heights + safety_margin - float(embed_m)
-                new_z = np.maximum(new_z, min_allowed_z)
+                if is_pier: new_z += 1.0 # Lift piers
                 
-                # ВИПРАВЛЕННЯ Z-FIGHTING: Забезпечуємо, що парки трохи нижчі за дороги на стику
-                # Дороги мають min_top_clearance = road_height * 0.02 (2% від висоти)
-                # Парки мають бути нижче, щоб уникнути z-fighting
-                # Додаємо невеликий offset для верхніх вершин парку (0.5% від висоти парку)
-                z_fighting_offset = float(height_m) * 0.005  # 0.5% від висоти парку
-                top_vertices_mask = relative_height > 0.9  # Верхні 10% вершин
-                if np.any(top_vertices_mask):
-                    # Трохи опускаємо верхні вершини парку для уникнення z-fighting з дорогами
-                    new_z[top_vertices_mask] = new_z[top_vertices_mask] - z_fighting_offset
+                if not is_pier:
+                    safety_margin = 0.01 
+                    min_allowed_z = ground_heights + safety_margin - float(embed_m)
+                    new_z = np.maximum(new_z, min_allowed_z)
+                    
+                    z_fighting_offset = float(height_m) * 0.005
+                    top_vertices_mask = relative_height > 0.9
+                    if np.any(top_vertices_mask):
+                        new_z[top_vertices_mask] = new_z[top_vertices_mask] - z_fighting_offset
                 
                 v[:, 2] = new_z
                 mesh.vertices = v
         
-            # 3. Додавання текстури з маскою країв
-            mesh = _add_strong_faceted_texture(mesh, height_m, scale_factor, original_polygon=poly)
+            # 3. Texture / Color
+            final_color = np.array([34, 139, 34, 255], dtype=np.uint8) # Default Green
+            use_texture = False
+
+            if is_pier:
+                 final_color = np.array([160, 140, 100, 255], dtype=np.uint8) # Wood
+            elif is_cemetery:
+                 final_color = np.array([90, 90, 85, 255], dtype=np.uint8) # Stone/Dark Grey for Cemetery
+            elif is_paved or is_transition:
+                 final_color = np.array([50, 50, 50, 255], dtype=np.uint8) # Dark Gray (almost Black) for Paved/Restaurants
+            else:
+                 # Green
+                 final_color = np.array([34, 139, 34, 255], dtype=np.uint8)
+                 use_texture = True
+
+            if len(mesh.faces) > 0:
+                 face_colors = np.tile(final_color, (len(mesh.faces), 1))
+                 mesh.visual = trimesh.visual.ColorVisuals(face_colors=face_colors)
+            
+            if use_texture:
+                mesh = _add_strong_faceted_texture(mesh, height_m, scale_factor, original_polygon=poly)
 
             if len(mesh.faces) > 0:
                 meshes.append(mesh)
 
         except Exception as e:
-            print(f"[WARN] Помилка обробки полігону: {e}")
             continue
 
     if not meshes:

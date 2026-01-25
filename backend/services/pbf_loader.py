@@ -378,9 +378,23 @@ def fetch_extras_from_pbf(
 
     green = osm.get_data_by_custom_criteria(
         custom_filter={
-            "leisure": ["park", "garden", "playground", "recreation_ground", "pitch"],
-            "landuse": ["grass", "meadow", "forest", "village_green"],
-            "natural": ["wood"],
+            "leisure": ["park", "garden", "playground", "recreation_ground", "pitch", "common", "sports_centre"],
+            "landuse": [
+                "grass", "meadow", "forest", "village_green", "cemetery", "religious", 
+                "recreation_ground", "allotments", "plaza", "commercial", "retail", 
+                "railway", "construction", "brownfield", "industrial", "garages",
+                "farmland", "farmyard", "orchard", "vineyard"
+            ],
+            "natural": ["wood", "scrub", "heath", "grassland", "sand", "beach"],
+            "amenity": [
+                "parking", "grave_yard", "university", "school", "college", "kindergarten", 
+                "marketplace", "restaurant", "cafe", "fast_food", "bar", "pub", "food_court",
+                "ice_cream", "bicycle_parking", "shelter"
+            ],
+            "man_made": ["pier", "breakwater", "groyne"],
+            "place": ["square"],
+            "highway": ["pedestrian"],
+            "railway": ["station", "platform"],
         },
         filter_type="keep",
         keep_nodes=False,
@@ -395,10 +409,11 @@ def fetch_extras_from_pbf(
             warnings.simplefilter("ignore", DeprecationWarning)
             green = ox.project_gdf(green)
     t2 = time.perf_counter()
-    print(f"[pbf] green: {len(green)} in {(t2 - t1):.2f}s")
+    print(f"[pbf] green/extras: {len(green)} in {(t2 - t1):.2f}s")
 
     pois = osm.get_data_by_custom_criteria(
-        custom_filter={"amenity": ["bench", "fountain"]},
+        custom_filter={
+            "amenity": ["bench", "fountain", "statue"],
         filter_type="keep",
         keep_nodes=False,
         keep_relations=True,

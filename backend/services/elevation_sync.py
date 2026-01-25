@@ -231,11 +231,19 @@ def calculate_global_elevation_reference(
 
     # 2) Fallback: sample absolute heights for the grid bbox
     try:
+        # ВИПРАВЛЕННЯ: Якщо координати згенеровані через global_center,
+        # ми ПОВИННІ передати CRS цього центру, а не автоматично визначений source_crs.
+        api_crs = source_crs
+        if global_center is not None:
+             gc_crs = getattr(global_center, "utm_crs", None)
+             if gc_crs is not None:
+                 api_crs = gc_crs
+        
         Z_abs = get_elevation_abs_meters_from_api(
             bbox_latlon=grid_bbox_latlon,
             X_meters=X_utm,
             Y_meters=Y_utm,
-            source_crs=source_crs,
+            source_crs=api_crs,
             terrarium_zoom=terrarium_zoom,
         )
         

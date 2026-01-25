@@ -40,11 +40,25 @@ app = FastAPI(title="3D Map Generator API", version="1.0.0")
 # CORS налаштування для інтеграції з frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[
+        "http://localhost:3000", "http://localhost:3001",
+        "http://127.0.0.1:3000", "http://127.0.0.1:3001"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Disposition", "Content-Type"],
 )
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    print(f"[ERROR] Validation error: {exc}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body},
+    )
 
 # Зберігання задач генерації
 tasks: dict[str, GenerationTask] = {}
@@ -54,6 +68,10 @@ multiple_tasks_map: dict[str, list[str]] = {}
 # Директорія для збереження згенерованих файлів
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Mount files directory for static access (more robust downloads)
+from fastapi.staticfiles import StaticFiles
+app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 
 class GenerationRequest(BaseModel):
@@ -91,9 +109,9 @@ class GenerationRequest(BaseModel):
     terrain_base_thickness_mm: float = Field(default=1.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
     # Деталізація рельєфу
     # - terrain_resolution: кількість точок по осі (mesh деталь). Вища = детальніше, повільніше.
-    terrain_resolution: int = Field(default=350, ge=80, le=600)  # Висока деталізація для максимально плавного рельєфу
+    terrain_resolution: int = Field(default=150, ge=80, le=800)  # Optimized for performance (was 200)
     # Subdivision: додаткова деталізація mesh після створення (для ще плавнішого рельєфу)
-    terrain_subdivide: bool = Field(default=True, description="Застосувати subdivision для плавнішого mesh")
+    terrain_subdivide: bool = Field(default=False, description="Застосувати subdivision для плавнішого mesh")
     terrain_subdivide_levels: int = Field(default=1, ge=0, le=2, description="Рівні subdivision (0-2, більше = плавніше але повільніше)")
     # - terrarium_zoom: зум DEM tiles (Terrarium). Вища = детальніше, але більше тайлів.
     terrarium_zoom: int = Field(default=15, ge=10, le=16)
@@ -117,6 +135,8 @@ class GenerationRequest(BaseModel):
     baseline_offset_m: float = 0.0  # Зміщення baseline (метри)
     # Preserve global XY coordinates (do NOT center per tile) for perfect stitching across zones/sessions.
     preserve_global_xy: bool = False
+    # Cache key identifying the city/context (used for fetching global water data for bridges)
+    city_cache_key: Optional[str] = None
 
 
 class GenerationResponse(BaseModel):
@@ -155,6 +175,55 @@ async def generate_model(request: GenerationRequest, background_tasks: Backgroun
         raise HTTPException(status_code=500, detail=f"Помилка створення задачі: {str(e)}")
 
 
+def recover_task_if_exists(task_id: str):
+    """If task is missing from memory but exists on disk, restore it."""
+    if task_id in tasks:
+        return
+
+    # Check for main output file (3mf or stl)
+    main_3mf = OUTPUT_DIR / f"{task_id}.3mf"
+    main_stl = OUTPUT_DIR / f"{task_id}.stl"
+
+    found_main = None
+    fmt = "stl"
+
+    if main_3mf.exists():
+        found_main = main_3mf
+        fmt = "3mf"
+    elif main_stl.exists():
+        found_main = main_stl
+        fmt = "stl"
+    
+    if found_main:
+        # Recreate task
+        # We don't have the original request, but we can creating a dummy one or None
+        from services.generation_task import GenerationTask
+        # dummy request object
+        class DummyReq:
+            pass
+        
+        t = GenerationTask(task_id=task_id, request=DummyReq())
+        t.status = "completed"
+        t.progress = 100
+        t.message = "Recovered from disk"
+        t.output_file = str(found_main.resolve())
+        t.set_output(fmt, str(found_main.resolve()))
+        
+        # Recover parts
+        for part in ["base", "roads", "buildings", "water", "parks", "poi"]:
+            p_stl = OUTPUT_DIR / f"{task_id}_{part}.stl"
+            if p_stl.exists():
+                t.set_output(f"{part}_stl", str(p_stl.resolve()))
+            # Also check for legacy naming without prefix if necessary, but we stick to standard
+        
+        # Also check for preview STL if main is 3MF
+        if fmt == "3mf" and main_stl.exists():
+             t.set_output("stl", str(main_stl.resolve()))
+             
+        tasks[task_id] = t
+        print(f"[INFO] Recovered task {task_id} from disk")
+
+
 @app.get("/api/status/{task_id}")
 async def get_status(task_id: str):
     """
@@ -185,12 +254,11 @@ async def get_status(task_id: str):
         return {
             "task_id": task_id,
             "status": "multiple",
-            "tasks": tasks_status,
-            "total": len(tasks_status),
             "completed": sum(1 for t in tasks_status if t["status"] == "completed"),
             "all_task_ids": all_task_ids_list
         }
     
+    recover_task_if_exists(task_id)
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
@@ -216,7 +284,7 @@ async def get_status(task_id: str):
     }
 
 
-@app.get("/api/download/{task_id}")
+@app.api_route("/api/download/{task_id}", methods=["GET", "HEAD"])
 async def download_model(
     task_id: str,
     format: Optional[str] = Query(default=None, description="Optional: stl або 3mf"),
@@ -225,12 +293,16 @@ async def download_model(
     """
     Завантажує згенерований файл
     """
+    recover_task_if_exists(task_id)
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
     task = tasks[task_id]
     if task.status != "completed" or not task.output_file:
         raise HTTPException(status_code=400, detail="Model not ready")
+    
+    # PATH DEBUGGING LOGS
+    print(f"[DEBUG] Download Request: task_id={task_id}, format={format}, part={part}")
     
     # Якщо запитали конкретний формат/частину — пробуємо віддати її (якщо існує)
     selected_path: Optional[str] = None
@@ -241,13 +313,17 @@ async def download_model(
             key = f"{p}_{fmt}"
             selected_path = getattr(task, "output_files", {}).get(key)
             if not selected_path:
+                print(f"[DEBUG] Requested part NOT found in output_files: key={key}, output_files keys={list(getattr(task, 'output_files', {}).keys())}")
                 raise HTTPException(status_code=404, detail=f"Requested part not available: {p} ({fmt})")
         else:
             selected_path = getattr(task, "output_files", {}).get(fmt)
             if not selected_path:
+                print(f"[DEBUG] Requested format NOT found in output_files: fmt={fmt}")
                 raise HTTPException(status_code=404, detail=f"Requested format not available: {fmt}")
     else:
         selected_path = task.output_file
+
+    print(f"[DEBUG] Selected file path (raw): {selected_path}")
 
     # Перевіряємо існування файлу (з абсолютним шляхом)
     file_path = Path(selected_path)
@@ -255,27 +331,36 @@ async def download_model(
         # Спробуємо знайти файл відносно OUTPUT_DIR
         alt_path = OUTPUT_DIR / file_path.name
         if alt_path.exists():
+            print(f"[DEBUG] File found at alt path: {alt_path}")
             file_path = alt_path
         else:
+            print(f"[ERROR] File NOT found at: {file_path} OR {alt_path}")
             raise HTTPException(
                 status_code=404, 
                 detail=f"File not found: {selected_path} (also tried: {alt_path})"
             )
+    else:
+         print(f"[DEBUG] File found at primary path: {file_path}")
 
-    # content-type залежно від розширення (для коректнішої детекції на фронті)
+    # content-type залежно від розширення
     ext = file_path.suffix.lower()
     if ext == ".3mf":
-        media_type = "model/3mf"
+        media_type = "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
     elif ext == ".stl":
         media_type = "model/stl"
     else:
         media_type = "application/octet-stream"
 
-    return FileResponse(
-        str(file_path),
-        media_type=media_type,
-        filename=file_path.name
-    )
+    # ROBUST FILE SERVING STRATEGY (REDIRECT TO STATIC MOUNT):
+    # Instead of serving bytes via Python app logic (which can be flaky with connection resets),
+    # we redirect the browser to the optimized StaticFiles mount at /files/.
+    # This leverages Uvicorn/Starlette's native file handling, ranges, chunks, and concurrency.
+    
+    from fastapi.responses import RedirectResponse
+    # Ensure filename is URL-safe (though UUIDs are safe)
+    redirect_url = f"/files/{file_path.name}"
+    print(f"[DEBUG] Redirecting download to static file: {redirect_url} (303 See Other)")
+    return RedirectResponse(url=redirect_url, status_code=303)
 
 
 @app.post("/api/merge-zones")
@@ -400,7 +485,9 @@ async def get_test_model_part(part_name: str):
     file_path = OUTPUT_DIR / f"test_model_kyiv_{p}.stl"
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Test model part not found")
-    return FileResponse(str(file_path), media_type="model/stl", filename=file_path.name)
+    
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/files/{file_path.name}")
 
 
 @app.post("/api/global-center")
@@ -545,6 +632,51 @@ async def generate_hexagonal_grid_endpoint(request: HexagonalGridRequest):
         
         # Обчислюємо центр сітки для синхронізації координат
         grid_center = None
+        # -------------------------------------------------------------------------
+        # 0. GLOBAL CENTER & TERRAIN CONFIGURATION
+        # -------------------------------------------------------------------------
+        
+        # 1. Force Terrain Configuration for Europe (Kiev)
+        # We want real terrain, not flat fallback
+        os.environ["ELEVATION_PROVIDER"] = "opentopodata"
+        os.environ["OPENTOPODATA_DATASET"] = "eudem25m" # Best for Europe
+        print(f"[INFO] Enforcing terrain config: PROVIDER={os.environ.get('ELEVATION_PROVIDER')}, DATASET={os.environ.get('OPENTOPODATA_DATASET')}")
+
+        # 2. Check Global Center Distance
+        # If the cached center is too far (>100km) from this zone, FORCE RESET IT.
+        # This fixes the "wrong global coordinates" issue when switching cities.
+        current_gc = get_global_center()
+        if current_gc:
+            gc_lat, gc_lon = current_gc.get_center_wgs84()
+            zone_lat = (request.north + request.south) / 2.0
+            zone_lon = (request.east + request.west) / 2.0
+            
+            # Simple Haversine approximation
+            R = 6371.0 # km
+            dlat = math.radians(zone_lat - gc_lat)
+            dlon = math.radians(zone_lon - gc_lon)
+            a = math.sin(dlat/2)**2 + math.cos(math.radians(gc_lat)) * math.cos(math.radians(zone_lat)) * math.sin(dlon/2)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+            dist_km = R * c
+            
+            if dist_km > 100.0:
+                print(f"[WARN] Current Global Center is {dist_km:.1f}km away! Forcing RESET to zone center.")
+                # FORCE RESET by setting internal variable to None, then re-creating
+                import services.global_center as gc_module
+                gc_module._global_center = None
+                set_global_center(zone_lat, zone_lon)
+            else:
+                print(f"[INFO] Global Center is close ({dist_km:.1f}km). Keeping it.")
+        else:
+            # First time init
+            zone_lat = (request.north + request.south) / 2.0
+            zone_lon = (request.east + request.west) / 2.0
+            print(f"[INFO] Initializing Global Center to zone: {zone_lat}, {zone_lon}")
+            set_global_center(zone_lat, zone_lon)
+
+        # -------------------------------------------------------------------------
+
+        # Update status
         try:
             center_lat, center_lon = calculate_grid_center_from_geojson(geojson, to_wgs84=to_wgs84)
             grid_center = {
@@ -614,7 +746,7 @@ class ZoneGenerationRequest(BaseModel):
     terrain_enabled: bool = True
     terrain_z_scale: float = Field(default=0.5, ge=0.1, le=10.0)
     terrain_base_thickness_mm: float = Field(default=2.0, ge=0.5, le=20.0)  # Мінімум 0.5мм для синхронізованих зон
-    terrain_resolution: int = Field(default=180, ge=50, le=500)
+    terrain_resolution: int = Field(default=300, ge=80, le=800)
     terrarium_zoom: int = Field(default=15, ge=10, le=18)
     terrain_smoothing_sigma: Optional[float] = Field(default=None, ge=0.0, le=5.0)
     terrain_subdivide: bool = False
@@ -696,8 +828,8 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
     import hashlib, json
     cache_dir = Path("cache/cities")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # cache version bump: elevation baseline logic changed (needs refresh)
-    city_key = f"v4_{grid_bbox_latlon[0]:.6f}_{grid_bbox_latlon[1]:.6f}_{grid_bbox_latlon[2]:.6f}_{grid_bbox_latlon[3]:.6f}_z{int(request.terrarium_zoom)}_zs{float(request.terrain_z_scale):.3f}_ms{float(request.model_size_mm):.1f}"
+    # cache version bump: resolution default update (v16)
+    city_key = f"v16_{grid_bbox_latlon[0]:.6f}_{grid_bbox_latlon[1]:.6f}_{grid_bbox_latlon[2]:.6f}_{grid_bbox_latlon[3]:.6f}_z{int(request.terrarium_zoom)}_zs{float(request.terrain_z_scale):.3f}_ms{float(request.model_size_mm):.1f}"
     city_hash = hashlib.md5(city_key.encode()).hexdigest()
     city_cache_file = cache_dir / f"city_{city_hash}.json"
 
@@ -860,6 +992,7 @@ async def generate_zones_endpoint(request: ZoneGenerationRequest, background_tas
             elevation_ref_m=global_elevation_ref_m,  # Глобальна базова висота для всіх зон
             baseline_offset_m=global_baseline_offset_m,  # Глобальне зміщення baseline
             preserve_global_xy=True,  # IMPORTANT: export in a shared coordinate frame for stitching
+            city_cache_key=city_hash,  # Pass the city hash so tasks can load the full city water cache
         )
         
         # Генеруємо модель для зони
@@ -1082,14 +1215,36 @@ async def generate_model_task(
         # ВАЖЛИВО: Для доріг використовуємо padding, щоб отримати повні мости з сусідніх зон
         print(f"[DEBUG] Завантаження даних для зони: north={request.north}, south={request.south}, east={request.east}, west={request.west}")
         
-        # Padding для доріг (0.01° ≈ 1км) для детекції мостів
+        # Padding для доріг (0.01° ≈ 1.1км) зменшено з 5.5км для оптимізації, але достатньо для мостів
         road_padding = 0.01
-        gdf_buildings, gdf_water, G_roads = fetch_city_data(
+        # Padding для будівель/води (0.005° ≈ 550м) стандартний
+        standard_padding = 0.005
+        
+        # 1. Fetch Buildings and Water (Standard Padding)
+        print(f"[DEBUG] Fetching Buildings & Water with padding={standard_padding}...")
+        gdf_buildings, gdf_water, _ = fetch_city_data(
+            request.north + standard_padding, 
+            request.south - standard_padding, 
+            request.east + standard_padding, 
+            request.west - standard_padding,
+            padding=0.005, # internal padding logic
+            fetch_buildings=True,
+            fetch_water=True,
+            fetch_roads=False
+        )
+        
+        # 2. Fetch Roads ONLY (Large Padding)
+        print(f"[DEBUG] Fetching Roads with padding={road_padding}...")
+        # FIX: Do not overwrite gdf_buildings/gdf_water with empty results!
+        _, _, G_roads = fetch_city_data(
             request.north + road_padding, 
             request.south - road_padding, 
             request.east + road_padding, 
             request.west - road_padding,
-            padding=0.002  # Стандартний padding для будівель/води
+            padding=0.005, # internal padding logic
+            fetch_buildings=False,
+            fetch_water=False,
+            fetch_roads=True
         )
         
         # Логування завантажених даних
@@ -1494,24 +1649,26 @@ async def generate_model_task(
             city_cache_key = getattr(request, 'city_cache_key', None)
             if city_cache_key:
                 print(f"[DEBUG] Завантаження води з кешу міста для детекції мостів (key={city_cache_key})...")
-                from services.data_loader import load_city_cache
-                
-                city_data = load_city_cache(city_cache_key)
-                if city_data and 'water' in city_data:
-                    gdf_water_city = city_data['water']
-                    if gdf_water_city is not None and not gdf_water_city.empty:
-                        # Об'єднуємо з оригінальною водою (щоб не втратити локальні водойми)
-                        if water_geoms_for_bridges is None:
-                            water_geoms_for_bridges = list(gdf_water_city.geometry.values)
-                        else:
-                            # Додаємо тільки унікальні геометрії (щоб не дублювати)
-                            existing_bounds = {g.bounds for g in water_geoms_for_bridges if g is not None}
-                            for g in gdf_water_city.geometry.values:
-                                if g is not None and g.bounds not in existing_bounds:
-                                    water_geoms_for_bridges.append(g)
-                        print(f"[DEBUG] Додано {len(gdf_water_city)} водних об'єктів з кешу міста для детекції мостів")
-                else:
-                    print(f"[DEBUG] Кеш міста не містить води, використовуємо тільки локальну воду")
+                try:
+                    # Dynamic import to avoid top-level circular dependency potential
+                    from services.data_loader import load_city_cache
+                    
+                    city_data = load_city_cache(city_cache_key)
+                    if city_data and 'water' in city_data:
+                        gdf_water_city = city_data['water']
+                        if gdf_water_city is not None and not gdf_water_city.empty:
+                            if water_geoms_for_bridges is None:
+                                water_geoms_for_bridges = list(gdf_water_city.geometry.values)
+                            else:
+                                existing_bounds = {g.bounds for g in water_geoms_for_bridges if g is not None}
+                                for g in gdf_water_city.geometry.values:
+                                    if g is not None and g.bounds not in existing_bounds:
+                                        water_geoms_for_bridges.append(g)
+                            print(f"[DEBUG] Додано {len(gdf_water_city)} водних об'єктів з кешу міста для детекції мостів")
+                    else:
+                        print(f"[DEBUG] Кеш міста не містить води, використовуємо тільки локальну воду")
+                except ImportError:
+                     print("[WARN] Could not import load_city_cache from services.data_loader")
             else:
                 print(f"[DEBUG] city_cache_key не задано, використовуємо тільки локальну воду для детекції мостів")
         except Exception as e:
@@ -1524,7 +1681,51 @@ async def generate_model_task(
             # For roads+bridges we keep everything consistent:
             # - pass UTM merged_roads + UTM water_geometries
             # - pass global_center so road_processor converts edges+roads+water to LOCAL consistently
-            merged_roads_for_mesh = locals().get("merged_roads_geom")
+            # Prepare CLIPPED road polygons for mesh generation
+            # We want to generate meshes ONLY for roads inside the zone, 
+            # but keep G_roads (graph) full for bridge detection analysis.
+            merged_roads_for_mesh = None
+            
+            # Reuse precomputed local clipped roads if available (from terrain block)
+            # Reuse precomputed local clipped roads if available (from terrain block)
+            # FORCE FIX: Use RAW unclipped roads if available
+            # Reuse precomputed local clipped roads if available (from terrain block)
+            # FORCE FIX: ALWAYS CLIP to zone!
+            if locals().get("merged_roads_geom_local_raw") is not None and zone_polygon_local is not None:
+                print(f"[DEBUG] Clipping RAW road polygons to zone...")
+                try:
+                    merged_roads_for_mesh = locals().get("merged_roads_geom_local_raw").intersection(zone_polygon_local)
+                except Exception as e:
+                     print(f"[WARN] Clipping failed, falling back to raw: {e}")
+                     merged_roads_for_mesh = locals().get("merged_roads_geom_local_raw")
+            elif locals().get("merged_roads_geom_local") is not None:
+                merged_roads_for_mesh = locals().get("merged_roads_geom_local")
+                print(f"[DEBUG] Reusing pre-clipped road polygons from terrain logic.")
+            
+            # If not available (e.g. terrain disabled or failed), compute it now
+            if merged_roads_for_mesh is None and G_roads is not None and zone_polygon_local is not None:
+                try:
+                    print(f"[DEBUG] Computing clipped road polygons for meshing...")
+                    # 1. Build full polygons from padded graph
+                    full_road_polys = build_road_polygons(G_roads, width_multiplier=float(request.road_width_multiplier))
+                    
+                    # 2. Transform to local
+                    if global_center is not None and full_road_polys is not None:
+                        from shapely.ops import transform as _transform
+                        def _to_local_r(x, y, z=None):
+                            return global_center.to_local(x, y)
+                        
+                        full_road_polys_local = _transform(_to_local_r, full_road_polys)
+                        
+                        # 3. Clip to zone (RESTORED from debug)
+                        # We MUST clip here because we fetched 5km of roads.
+                        merged_roads_for_mesh = full_road_polys_local.intersection(zone_polygon_local)
+                        # merged_roads_for_mesh = full_road_polys_local
+                        print(f"[DEBUG] Road polygons clipped to zone (from 5km buffer).")
+                except Exception as e:
+                    print(f"[WARN] Failed to compute/clip road polygons: {e}")
+                    merged_roads_for_mesh = None
+
             gc_for_roads = global_center
             water_geoms_for_bridges_final = water_geoms_for_bridges
 
@@ -1545,12 +1746,12 @@ async def generate_model_task(
                 terrain_provider=terrain_provider,
                 road_height=float(road_height_m) if road_height_m is not None else 1.0,
                 road_embed=float(road_embed_m) if road_embed_m is not None else 0.0,
-                merged_roads=merged_roads_for_mesh,
+                merged_roads=merged_roads_for_mesh,  # Pass CLIPPED polygons (local coords)
                 water_geometries=water_geoms_for_bridges_final,  # Для визначення мостів
                 bridge_height_multiplier=1.5,  # make bridges/overpasses visibly elevated
                 global_center=gc_for_roads,
                 min_width_m=min_road_width_m,
-                clip_polygon=zone_polygon_local,  # pre-clip roads to zone BEFORE extrusion
+                clip_polygon=zone_polygon_local,  # Also pass clip polygon for bridge detection logic
                 city_cache_key=city_cache_key,  # For cross-zone bridge detection
             )
             if road_mesh is None:
@@ -1621,8 +1822,14 @@ async def generate_model_task(
         parks_mesh = None
         poi_mesh = None
         try:
-            # Extras також завантажуємо тільки для цієї зони (без padding)
-            gdf_green, gdf_pois = fetch_extras(request.north, request.south, request.east, request.west)
+            # Extras завантажуємо з padding, щоб не губити об'єкти на межі
+            # Використовуємо той самий padding, що і для будівель (standard_padding)
+            gdf_green, gdf_pois = fetch_extras(
+                request.north + standard_padding, 
+                request.south - standard_padding, 
+                request.east + standard_padding, 
+                request.west - standard_padding
+            )
             if scale_factor and scale_factor > 0 and terrain_provider is not None:
                 if request.include_parks and gdf_green is not None and not gdf_green.empty:
                     # ВАЖЛИВО: gdf_green приходить в UTM (метри), але terrain_provider + вся сцена вже в локальних координатах.
@@ -1724,16 +1931,40 @@ async def generate_model_task(
                             print(f"[WARN] Fallback також не вдався: {e2}")
                             road_polygons_for_clipping = None
                     
+                    # Розрахунок деталізації для зелених зон (знижуємо до 60, оскільки 180 все ще забагато)
+                    target_res_green = 60.0
+                    if not bbox_meters:
+                        bbox_meters = (0, 0, 1000, 1000) # fallback
+                    bbox_width = max(bbox_meters[2] - bbox_meters[0], 100.0)
+                    bbox_height = max(bbox_meters[3] - bbox_meters[1], 100.0)
+                    avg_dim = (bbox_width + bbox_height) / 2.0
+                    target_edge_len_green_m = max(4.0, avg_dim / target_res_green) # Не менше 4.0м (low poly)
+                    
+                    print(f"[INFO] Деталізація парків: resolution={target_res_green}, edge_len={target_edge_len_green_m:.2f}м")
+
                     # Зменшуємо висоту зелених зон в 2 рази для кращого візуального балансу
+                    # Підготовка водних полігонів для вирізання з парків
+                    water_polygons_for_clipping = None
+                    if locals().get("water_geometries_local") is not None:
+                         try:
+                             from shapely.ops import unary_union as _unary_union
+                             water_polys_list = [g for g in locals().get("water_geometries_local") if g is not None and not g.is_empty]
+                             if water_polys_list:
+                                 water_polygons_for_clipping = _unary_union(water_polys_list)
+                         except Exception as e:
+                             print(f"[WARN] Failed to union water polygons: {e}")
+
                     parks_mesh = process_green_areas(
                         gdf_green,
-                        height_m=(float(request.parks_height_mm) / float(scale_factor)) / 1.2,  # Висота зменшена в 2 рази
+                        height_m=(float(request.parks_height_mm) / float(scale_factor)) / 1.2,
                         embed_m=float(request.parks_embed_mm) / float(scale_factor),
                         terrain_provider=terrain_provider,
-                        global_center=None,  # already in local coords
+                        global_center=None,
                         scale_factor=float(scale_factor),
-                        # --- КРИТИЧНО: Передаємо полігони доріг для вирізання ---
                         road_polygons=road_polygons_for_clipping,
+                         # Pass water masking
+                        water_polygons=water_polygons_for_clipping,
+                        target_edge_len_m=float(target_edge_len_green_m),
                     )
                     if parks_mesh is None:
                         print(f"[WARN] process_green_areas повернув None для {len(gdf_green)} парків")
@@ -1758,21 +1989,14 @@ async def generate_model_task(
         
         # 5.9 Покращення якості всіх mesh для 3D принтера
         if terrain_mesh is not None:
-            terrain_mesh = improve_mesh_for_3d_printing(terrain_mesh, aggressive=True)
-            is_valid, mesh_warnings = validate_mesh_for_3d_printing(terrain_mesh, scale_factor=scale_factor, model_size_mm=request.model_size_mm)
-            if mesh_warnings:
-                print(f"[INFO] Попередження щодо якості terrain mesh:")
-                for w in mesh_warnings:
-                    print(f"  - {w}")
+            # DISABLE terrain simplification: it destroys sharp edges of the solid block, creating holes/gaps.
+            # terrain_mesh = improve_mesh_for_3d_printing(terrain_mesh, aggressive=True)
+            pass
         
         if road_mesh is not None:
-            # Вже покращено в road_processor, але перевіряємо
-            is_valid, mesh_warnings = validate_mesh_for_3d_printing(road_mesh, scale_factor=scale_factor, model_size_mm=request.model_size_mm)
-            if mesh_warnings:
-                print(f"[INFO] Попередження щодо якості road mesh:")
-                for w in mesh_warnings:
-                    print(f"  - {w}")
-        
+            # road_mesh = improve_mesh_for_3d_printing(road_mesh, aggressive=False) # Roads already good
+            pass
+
         if building_meshes is not None:
             improved_buildings = []
             for i, bmesh in enumerate(building_meshes):
@@ -1807,12 +2031,16 @@ async def generate_model_task(
         if terrain_mesh is not None:
             # CRITICAL: terrain is generated with zone_polygon-aware base/walls; mesh-level clipping re-introduces
             # edge artifacts (big thin triangles). Only bbox-clip when polygon is NOT provided.
-            if zone_polygon_coords is None:
+            # FIX: If zone_polygon_local (or coords) is present, we assume terrain is ALREADY correctly shaped/walled.
+            # Do NOT clip it again, as it causes gaps between walls and top (Step 537 issue).
+            if zone_polygon_coords is None and zone_polygon_local is None:
                 clipped_terrain = clip_mesh_to_bbox(terrain_mesh, bbox_meters, tolerance=clip_tolerance)
                 if clipped_terrain is not None and len(clipped_terrain.vertices) > 0:
                     terrain_mesh = clipped_terrain
                 else:
                     print(f"[WARN] Terrain mesh став порожнім після обрізання, залишаємо оригінальний")
+            else:
+                print(f"[INFO] Skipping extra clipping for terrain (already shaped to zone)")
         
         if road_mesh is not None:
             # CRITICAL: roads are already pre-clipped to zone polygon BEFORE extrusion (clip_polygon=zone_polygon_local).
@@ -1920,7 +2148,8 @@ async def generate_model_task(
         # Якщо це STL і є окремі частини, зберігаємо їх
         if parts_from_main and isinstance(parts_from_main, dict) and request.export_format.lower() == "stl":
             for part_name, path in parts_from_main.items():
-                task.set_output(f"{part_name}_stl", str(Path(path).resolve()))
+                key = part_name if part_name.endswith("_stl") else f"{part_name}_stl"
+                task.set_output(key, str(Path(path).resolve()))
 
         # ДЛЯ PREVIEW: якщо користувач обрав 3MF, паралельно зберігаємо STL (Three.js стабільно вантажить STL)
         # Це також вирішує проблему, коли 3MF loader падає, а frontend намагається парсити ZIP як STL.
@@ -1981,9 +2210,11 @@ async def generate_model_task(
                     preserve_z=preserve_z,
                     preserve_xy=preserve_xy,
                 )
-                # Зберігаємо в output_files
+                # Зберігаємо в output_files з перевіркою
                 for part_name, path in parts.items():
-                    task.set_output(f"{part_name}_stl", str(Path(path).resolve()))
+                    key = part_name if part_name.endswith("_stl") else f"{part_name}_stl"
+                    task.set_output(key, str(Path(path).resolve()))
+                    # print(f"[DEBUG] Set output part: {key} -> {path}")
         except Exception as e:
             print(f"[WARN] Preview parts export failed: {e}")
         

@@ -295,6 +295,27 @@ def process_buildings(
                 except Exception:
                     pass
 
+                # Smart Foundation Integration
+                slope_extra_height = 0.0
+                if terrain_provider is not None and 'ground_min' in locals():
+                     # Calculate how much we need to extend downwards
+                     slope_diff = ground_max - ground_min
+                     
+                     # New base Z: Lowest point - safety margin
+                     translate_z = ground_min - 0.1 - float(foundation_depth_eff)
+                     
+                     # Effective height must cover:
+                     # 1. Original height (above street level)
+                     # 2. Slope difference (ground_max - ground_min)
+                     # 3. Foundation depth (below ground_min)
+                     # 4. Safety margin (0.1)
+                     # Formula: eff_height = height + slope_diff + foundation_depth_eff + 0.1
+                     
+                     slope_extra_height = slope_diff + float(foundation_depth_eff) + 0.2 # +0.2m safety/margin
+                
+                # Effective height for extrusion
+                eff_height = height + slope_extra_height
+
                 # Екструзія полігону (використовуємо trimesh.creation.extrude_polygon)
                 if isinstance(geom, Polygon):
                     # Перевіряємо чи полігон має достатньо точок
@@ -304,62 +325,19 @@ def process_buildings(
                     
                     try:
                         # Використовуємо вбудовану функцію trimesh для екструзії
-                        mesh = trimesh.creation.extrude_polygon(geom, height=height)
+                        mesh = trimesh.creation.extrude_polygon(geom, height=eff_height)
                         
                         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
                             print(f"  [WARN] Будівля {idx}: extrude_polygon повернув порожній mesh")
                             # Fallback на старий метод
-                            mesh = extrude_building(geom, height)
+                            mesh = extrude_building(geom, eff_height)
                             if mesh is None or len(mesh.faces) == 0:
                                 continue
                         
                         # Садимо від translate_z (нижня точка будівлі)
                         mesh.apply_translation([0, 0, translate_z])
                         
-                        if terrain_provider is not None and len(mesh.vertices) > 0:
-                            vertices = mesh.vertices.copy()
-                            
-                            # ВИПРАВЛЕННЯ: Використовуємо нижні 20% висоти будівлі замість фіксованого порогу
-                            building_height = float(height)
-                            bottom_limit = translate_z + (building_height * 0.2)
-                            
-                            # Оптимізація: Перевіряємо тільки потенційно проблемні вершини (нижні)
-                            # Це значно пришвидшує обробку, уникаючи семплінгу для даху
-                            check_mask = vertices[:, 2] <= bottom_limit
-                            
-                            if np.any(check_mask):
-                                check_indices = np.where(check_mask)[0]
-                                check_xy = vertices[check_indices, :2]
-                                check_z = vertices[check_indices, 2]
-                                
-                                ground_heights = terrain_provider.get_heights_for_points(check_xy)
-                                
-                                if len(ground_heights) > 0:
-                                    # 5см допуск
-                                    below_ground = check_z < (ground_heights - 0.05)
-                                    
-                                    if np.any(below_ground):
-                                        # Знаходимо максимальне заглиблення
-                                        buried_indices = np.where(below_ground)[0]
-                                        # buried_indices індексують масив check_z/ground_heights (який є subset)
-                                        
-                                        # Нам потрібно знайти наскільки підняти
-                                        # required_z = ground + epsilon
-                                        # current = z
-                                        # diff = required - current
-                                        
-                                        # Векторизовано для всіх заглиблених вершин
-                                        needed_z = ground_heights[buried_indices] + 0.1
-                                        curr_z = check_z[buried_indices]
-                                        diffs = needed_z - curr_z
-                                        
-                                        max_diff = np.max(diffs)
-                                        
-                                        if max_diff > 0:
-                                            # Піднімаємо всю будівлю
-                                            vertices[:, 2] += max_diff
-                                            translate_z += max_diff
-                                            mesh.vertices = vertices
+                        # (Removed old aggressive lift logic which caused floating)
                         
                         # Перевірка на валідність mesh
                         try:
@@ -413,91 +391,38 @@ def process_buildings(
                                 poly_ground_min = float(np.min(poly_heights))
                                 poly_ground_max = float(np.max(poly_heights))
                                 
-                                # Така сама логіка як для одиночних полігонів
-                                safety_margin = 0.1
-                                if float(embed_depth) > 0:
-                                    poly_base_z = max(poly_ground_min - float(embed_depth), poly_ground_min - safety_margin)
-                                else:
-                                    poly_base_z = poly_ground_min + safety_margin
+                                # Smart Foundation Integration
+                                slope_extra_height = 0.0
+                                slope_diff = poly_ground_max - poly_ground_min
                                 
-                                poly_translate_z = float(poly_base_z) - float(foundation_depth_eff)
+                                # New base Z: Lowest point - safety margin
+                                poly_translate_z = poly_ground_min - 0.1 - float(foundation_depth_eff)
                                 
-                                # Додаткова перевірка
-                                min_allowed_z = poly_ground_min - float(foundation_depth_eff) + safety_margin
-                                if poly_translate_z < min_allowed_z:
-                                    poly_translate_z = min_allowed_z
+                                # Formula: eff_height = height + slope_diff + foundation_depth_eff + 0.1
+                                slope_extra_height = slope_diff + float(foundation_depth_eff) + 0.2
+                                
+                                # Use eff_height
+                                eff_height = height + slope_extra_height
                         
                         try:
-                            mesh = trimesh.creation.extrude_polygon(poly, height=height)
+                            # Use eff_height
+                            mesh = trimesh.creation.extrude_polygon(poly, height=eff_height)
                             
                             if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-                                # Fallback
-                                mesh = extrude_building(poly, height)
+                                # Fallback with eff_height
+                                mesh = extrude_building(poly, eff_height)
                                 if mesh is None or len(mesh.faces) == 0:
                                     continue
                             
                             mesh.apply_translation([0, 0, poly_translate_z])
                             
-                            # Така сама покращена агресивна перевірка як для одиночних полігонів
-                            if terrain_provider is not None and len(mesh.vertices) > 0:
-                                vertices = mesh.vertices.copy()
-                                
-                                # Використовуємо нижні 20% висоти будівлі
-                                building_height = float(height)
-                                bottom_percentage = 0.2
-                                bottom_threshold = poly_translate_z + (building_height * bottom_percentage)
-                                is_bottom = vertices[:, 2] <= bottom_threshold
-                                
-                                if np.any(is_bottom):
-                                    bottom_vertices_xy = vertices[is_bottom, :2]
-                                    ground_heights = terrain_provider.get_heights_for_points(bottom_vertices_xy)
-                                    
-                                    # НОВА ЛОГІКА: Садимо на найнижчу точку, але збільшуємо висоту будівлі
-                                    # Це гарантує, що фундамент стоїть на землі (не висить),
-                                    # а дах не провалюється в схил (бо ми додали різницю висот).
-                                    
-                                    # 1. Знаходимо найнижчу точку рельєфу під будівлею
-                                    min_ground_h = float(np.min(ground_heights))
-                                    max_ground_h = float(np.max(ground_heights))
-                                    slope_diff = max_ground_h - min_ground_h
-                                    
-                                    # 2. Визначаємо бажану базу (мінімальна точка + embed)
-                                    # embed_depth тут працює як "заглиблення нижче найнижчої точки"
-                                    desired_base_z = min_ground_h - max(float(embed_depth), 0.0)
-                                    
-                                    # 3. Перевіряємо поточну позицію
-                                    current_bottom_z = float(np.min(vertices[:, 2]))
-                                    
-                                    # 4. Переміщаємо будівлю на нову базу
-                                    # (зсуваємо вниз, якщо вона була вище)
-                                    z_shift = desired_base_z - current_bottom_z
-                                    vertices[:, 2] += z_shift
-                                    # translate_z теж оновлюємо для подальших перевірок (хоча вони вже не треба)
-                                    poly_translate_z += z_shift
-                                    
-                                    # 5. КРИТИЧНО: "Витягуємо" будівлю вгору, щоб компенсувати схил
-                                    # Тобто вершини даху піднімаємо на slope_diff
-                                    # Вершини, що були "зверху" (дах), мають z > (current_bottom_z + building_height * 0.9)
-                                    # АЛЕ простіше: просто знаходимо верхні вершини
-                                    
-                                    # Припускаємо, що дах - це все, що вище "низу + 50% висоти"
-                                    # (для простих коробок це працює, для складних форм може бути нюанс, 
-                                    # але extrude_polygon робить вертикальні стіни, тому ок)
-                                    roof_threshold = np.min(vertices[:, 2]) + (building_height * 0.5)
-                                    is_roof = vertices[:, 2] > roof_threshold
-                                    
-                                    if np.any(is_roof):
-                                        # Додаємо різницю висот до даху, щоб він був рівним відносно найвищої точки схилу
-                                        vertices[is_roof, 2] += slope_diff
-                                    
-                                    mesh.vertices = vertices
-                                    
-                                    mesh.vertices = vertices
-                                    
-                                    try:
-                                        mesh.fix_normals()
-                                    except:
-                                        pass
+                            # (Removed old aggressive lift logic which caused floating)
+                            
+                            # Перевірка на валідність mesh
+                            try:
+                                mesh.fix_normals()
+                            except:
+                                pass
                             
                             # Перевірка на валідність mesh
                             try:

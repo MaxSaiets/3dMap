@@ -356,6 +356,10 @@ def export_3mf(
         if not mesh_items:
             raise ValueError("Сцена порожня, немає що експортувати")
         
+        # Ensure directory exists
+        if os.path.dirname(filename):
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
         # Робоча копія списку з нормалізацією структури
         working_items: List[Tuple[str, trimesh.Trimesh]] = []
         for n, m in mesh_items:
@@ -641,6 +645,10 @@ def export_stl(
     try:
         if not mesh_items:
             raise ValueError("Немає мешів для експорту")
+            
+        # Ensure directory exists
+        if os.path.dirname(filename):
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
         
         # Робоча копія з нормалізацією структури
         working_items: List[Tuple[str, trimesh.Trimesh]] = []

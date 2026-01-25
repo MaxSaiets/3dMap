@@ -262,33 +262,61 @@ def process_water_surface(
                     else:
                         original_ground = depressed_ground + float(depth_meters) if depth_meters else depressed_ground + 2.0
 
-                    # 3. Calculate Water Level per vertex
-                    # Default: slightly below original ground (shoreline)
-                    base_water_level = original_ground - 0.15
-                    
-                    # 4. Apply Noise (only to top surface)
+                    # 3. Calculate Water Level (FLAT for the entire polygon)
+                    # We sample the perimeter of the original polygon to find the "shoreline" height.
+                    water_level = 0.0
+                    try:
+                        shore_heights = []
+                        if isinstance(poly, Polygon) and not poly.exterior.is_empty:
+                            # Sample points along the exterior ring
+                            ring = poly.exterior
+                            length = ring.length
+                            if length > 0:
+                                # Sample every ~10 meters (or at least 4 points)
+                                num_samples = max(4, int(length / 10.0))
+                                sample_dists = np.linspace(0, length, num_samples)
+                                sample_pts = [ring.interpolate(d) for d in sample_dists]
+                                sample_coords = np.array([(p.x, p.y) for p in sample_pts])
+                                
+                                # Get heights for shoreline
+                                if hasattr(terrain_provider, 'original_heights_provider') and terrain_provider.original_heights_provider:
+                                    shore_heights = terrain_provider.original_heights_provider.get_heights_for_points(sample_coords)
+                                else:
+                                    # Fallback to current terrain + depth
+                                    h_curr = terrain_provider.get_surface_heights_for_points(sample_coords)
+                                    shore_heights = h_curr + (float(depth_meters) if depth_meters else 2.0)
+                        
+                        shore_heights = np.array(shore_heights)
+                        shore_heights = shore_heights[np.isfinite(shore_heights)]
+                        
+                        if len(shore_heights) > 0:
+                            # Use 5th percentile to keep water LOW (preventing flooding up the banks)
+                            # FIX: Raise water level slightly (-0.1m instead of -0.3m) to avoid being covered by embedded green areas (-0.2m)
+                            water_level = float(np.quantile(shore_heights, 0.05)) - 0.1
+                        else:
+                            # Fallback if no shoreline samples
+                            water_level = float(np.mean(depressed_ground)) + 0.5
+                    except Exception as e:
+                        print(f"[WARN] Water level calc failed: {e}")
+                        water_level = float(np.mean(depressed_ground)) + 0.5
+
+                    # 4. Apply Noise (only to top surface) and Set Z
                     height_offsets = np.zeros(len(v))
                     if ADD_TEXTURE and get_noise:
-                        # Vectorized noise is hard without lib, use loop or simple numpy op
-                        # Try to use numpy if possible for speed, but our get_noise is scalar
-                        # Let's map it.
-                        if len(v) < 50000: # Limit noise calc for performance
-                             # Optimization: use numpy operations if get_noise was simple, but it is valid python func.
-                             # vectorized wrapper:
+                        if len(v) < 50000:
                              n_v = np.vectorize(get_noise)
                              noise_val = n_v(v[:, 0], v[:, 1])
                              height_offsets = noise_val
-                        else:
-                             height_offsets = np.zeros(len(v))
 
-                    # 5. Set Z Values
-                    # For Top vertices:
-                    # Z = max(base_water_level + noise, depressed_ground + epsilon)
-                    # We strictly verify water is ABOVE the carved bed.
+                    # Top vertices: Flat Level + Noise
+                    top_z = water_level + height_offsets
                     
-                    top_z = base_water_level + height_offsets
-                    # Constraint: Water must be at least 0.2m above the depressed bed to avoid Z-fighting
-                    top_z = np.maximum(top_z, depressed_ground + 0.2)
+                    # Ensure water is at least slightly above the carved bed to avoid z-fighting
+                    # BUT strictly enforce flatness -> if bed is higher, we have a problem (dry land).
+                    # We trust quantile(0.05) is low enough to be bounded by banks, but high enough to cover bed.
+                    # Let's just clip min to bed? No, that warps the surface.
+                    # Keep it flat.
+                    pass
                     
                     # For Bottom vertices:
                     # just offset from top by thickness

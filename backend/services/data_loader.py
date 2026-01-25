@@ -282,7 +282,29 @@ def fetch_city_data(
     Returns:
         Tuple з (buildings_gdf, water_gdf, roads_graph) - обрізані до оригінального bbox
     """
-    # Зберігаємо оригінальні координати для обрізки
+    fetch_buildings: bool = True
+    fetch_water: bool = True
+    fetch_roads: bool = True
+    
+    # Internal kwargs extraction (backward compatibility hack if needed, or simply explicit args update in next step)
+    # Actually, let's just use defaults in function signature if we could, but changing signature requires updating all callers.
+    # Since I can update main.py, I will change the signature.
+    pass
+
+def fetch_city_data(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    padding: float = 0.002,
+    fetch_buildings: bool = True,
+    fetch_water: bool = True,
+    fetch_roads: bool = True
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, object]:
+    """
+    Завантажує дані OSM для вказаної області з буферизацією.
+    Підтримує вибіркове завантаження шарів.
+    """
     target_north, target_south, target_east, target_west = north, south, east, west
     
     # Розширюємо зону запиту (буферизація)
@@ -399,187 +421,202 @@ def fetch_city_data(
     ox.settings.use_cache = False
     ox.settings.log_console = False
     
+    gdf_buildings = gpd.GeoDataFrame()
+    gdf_parts = gpd.GeoDataFrame()
+    
     # 1. Будівлі (+ building:part для більшої деталізації)
-    print("Завантаження будівель...")
-    tags_buildings = {'building': True}
-    tags_building_parts = {'building:part': True}
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            # Виправляємо виклик для нової версії osmnx
-            try:
-                # Нова версія osmnx використовує bbox як keyword argument
-                gdf_buildings = ox.features_from_bbox(bbox=padded_bbox, tags=tags_buildings)
-            except TypeError:
-                # Стара версія osmnx використовує позиційні аргументи
-                gdf_buildings = ox.features_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], tags=tags_buildings)
-        # Додатково тягнемо building:part (не завжди присутні, але дають кращу деталізацію)
+    if fetch_buildings:
+        print("Завантаження будівель...")
+        tags_buildings = {'building': True}
+        tags_building_parts = {'building:part': True}
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 # Виправляємо виклик для нової версії osmnx
                 try:
-                    gdf_parts = ox.features_from_bbox(bbox=padded_bbox, tags=tags_building_parts)
+                    # Нова версія osmnx використовує bbox як keyword argument
+                    gdf_buildings = ox.features_from_bbox(bbox=padded_bbox, tags=tags_buildings)
                 except TypeError:
-                    gdf_parts = ox.features_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], tags=tags_building_parts)
-        except Exception:
-            gdf_parts = gpd.GeoDataFrame()
-        # Фільтрація невалідних геометрій
-        gdf_buildings = gdf_buildings[gdf_buildings.geometry.notna()]
-        if not gdf_parts.empty:
-            gdf_parts = gdf_parts[gdf_parts.geometry.notna()]
-        
-        # ОБРІЗКА ДО ПРОЕКЦІЇ (в WGS84 координатах)
-        if not gdf_buildings.empty:
+                    # Стара версія osmnx використовує позиційні аргументи
+                    gdf_buildings = ox.features_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], tags=tags_buildings)
+            # Додатково тягнемо building:part (не завжди присутні, але дають кращу деталізацію)
             try:
-                gdf_buildings = gdf_buildings[gdf_buildings.geometry.intersects(target_bbox_wgs84)]
-            except Exception:
-                pass
-        if not gdf_parts.empty:
-            try:
-                gdf_parts = gdf_parts[gdf_parts.geometry.intersects(target_bbox_wgs84)]
-            except Exception:
-                pass
-        
-        # Проекція в метричну систему (UTM автоматично) - після обрізки
-        if not gdf_buildings.empty:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                gdf_buildings = ox.project_gdf(gdf_buildings)
-        if not gdf_parts.empty:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                gdf_parts = ox.project_gdf(gdf_parts)
-
-        # Позначаємо parts і додаємо до buildings тільки ті, що мають висотні теги
-        if not gdf_parts.empty:
-            gdf_parts = gdf_parts.copy()
-            gdf_parts["__is_building_part"] = True
-            # Якщо part не має height/levels — часто дублює "корпус" без користі → пропускаємо
-            has_height = None
-            for col in [
-                "height",
-                "building:height",
-                "building:levels",
-                "building:levels:aboveground",
-                "roof:height",
-                "roof:levels",
-            ]:
-                if col in gdf_parts.columns:
-                    s = gdf_parts[col].notna()
-                    has_height = s if has_height is None else (has_height | s)
-            if has_height is not None:
-                gdf_parts = gdf_parts[has_height]
-            if not gdf_parts.empty:
-                gdf_buildings = gpd.GeoDataFrame(
-                    pd.concat([gdf_buildings, gdf_parts], ignore_index=True),
-                    crs=gdf_buildings.crs or gdf_parts.crs,
-                )
-    except Exception as e:
-        print(f"Помилка завантаження будівель: {e}")
-        gdf_buildings = gpd.GeoDataFrame()
-
-    # Optional: footprints replacement in Overpass mode too
-    try:
-        from services.footprints_loader import is_footprints_enabled, load_footprints_bbox, transfer_osm_attributes_to_footprints
-
-        if is_footprints_enabled() and gdf_buildings is not None and not gdf_buildings.empty:
-            fp = load_footprints_bbox(north, south, east, west, target_crs=getattr(gdf_buildings, "crs", None))
-            if fp is not None and not fp.empty:
-                fp = transfer_osm_attributes_to_footprints(fp, gdf_buildings)
-                # keep parts if present
-                if "__is_building_part" in gdf_buildings.columns:
-                    parts = gdf_buildings[gdf_buildings["__is_building_part"].fillna(False)]
-                    if not parts.empty:
-                        gdf_buildings = gpd.GeoDataFrame(
-                            pd.concat([fp, parts], ignore_index=True),
-                            crs=fp.crs or parts.crs,
-                        )
-                    else:
-                        gdf_buildings = fp
-                else:
-                    gdf_buildings = fp
-    except Exception as e:
-        print(f"[WARN] Footprints integration skipped: {e}")
-    
-    # 2. Вода (для вирізання з бази)
-    print("Завантаження водних об'єктів...")
-    # ВАЖЛИВО: не тягнемо всі waterway (канали/лінії), бо це дає "воду де не треба".
-    # Беремо тільки реальні полігональні water-об'єкти.
-    tags_water = {
-        'natural': 'water',
-        'water': True,
-        'waterway': 'riverbank',
-        'landuse': 'reservoir',
-    }
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            # Виправляємо виклик для нової версії osmnx
-            try:
-                gdf_water = ox.features_from_bbox(bbox=padded_bbox, tags=tags_water)
-            except TypeError:
-                gdf_water = ox.features_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], tags=tags_water)
-        if not gdf_water.empty:
-            gdf_water = gdf_water[gdf_water.geometry.notna()]
-            # ОБРІЗКА ДО ПРОЕКЦІЇ (в WGS84 координатах)
-            try:
-                gdf_water = gdf_water[gdf_water.geometry.intersects(target_bbox_wgs84)]
-            except Exception:
-                pass
-            # Проекція в метричну систему (UTM автоматично) - після обрізки
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                gdf_water = ox.project_gdf(gdf_water)
-    except InsufficientResponseError:
-        # Це нормальний кейс: в bbox просто немає води за цими тегами
-        gdf_water = gpd.GeoDataFrame()
-    except Exception as e:
-        # Інші помилки (мережа/Overpass) — залишаємо як warning, але не падаємо
-        print(f"[WARN] Завантаження води не вдалося: {e}")
-        gdf_water = gpd.GeoDataFrame()
-    
-    # 3. Дорожня мережа
-    print("Завантаження дорожньої мережі...")
-    try:
-        # 'all' включає всі типи доріг (drive, walk, bike)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            # Виправляємо виклик для нової версії osmnx
-            try:
-                # Нова версія osmnx використовує bbox як keyword argument
-                # Використовуємо retain_all=True для збереження відірваних шматків на краях
-                G_roads = ox.graph_from_bbox(bbox=padded_bbox, network_type='all', simplify=True, retain_all=True)
-            except TypeError:
-                # Стара версія osmnx використовує позиційні аргументи
-                G_roads = ox.graph_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], network_type='all', simplify=True, retain_all=True)
-        
-        if G_roads is None:
-            print("[WARN] osmnx повернув None для графу доріг")
-        elif not hasattr(G_roads, 'edges'):
-            print("[WARN] Граф доріг не має атрибуту 'edges'")
-            G_roads = None
-        else:
-            edges_count = len(list(G_roads.edges()))
-            if edges_count == 0:
-                print("[WARN] Граф доріг порожній після завантаження (0 edges)")
-                G_roads = None
-            else:
-                print(f"[DEBUG] Завантажено {edges_count} доріг (до проекції)")
-                # Проекція графа в метричну систему
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", DeprecationWarning)
-                    G_roads = ox.project_graph(G_roads)
-                    if G_roads is not None and hasattr(G_roads, 'edges'):
-                        edges_after = len(list(G_roads.edges()))
-                        print(f"[DEBUG] Після проекції: {edges_after} доріг")
+                    # Виправляємо виклик для нової версії osmnx
+                    try:
+                        gdf_parts = ox.features_from_bbox(bbox=padded_bbox, tags=tags_building_parts)
+                    except TypeError:
+                        gdf_parts = ox.features_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], tags=tags_building_parts)
+            except Exception:
+                gdf_parts = gpd.GeoDataFrame()
+            # Фільтрація невалідних геометрій
+            gdf_buildings = gdf_buildings[gdf_buildings.geometry.notna()]
+            if not gdf_parts.empty:
+                gdf_parts = gdf_parts[gdf_parts.geometry.notna()]
+            
+            # ОБРІЗКА ДО ПРОЕКЦІЇ (в WGS84 координатах)
+            if not gdf_buildings.empty:
+                try:
+                    gdf_buildings = gdf_buildings[gdf_buildings.geometry.intersects(target_bbox_wgs84)]
+                except Exception:
+                    pass
+            if not gdf_parts.empty:
+                try:
+                    gdf_parts = gdf_parts[gdf_parts.geometry.intersects(target_bbox_wgs84)]
+                except Exception:
+                    pass
+            
+            # Проекція в метричну систему (UTM автоматично) - після обрізки
+            if not gdf_buildings.empty:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    gdf_buildings = ox.project_gdf(gdf_buildings)
+            if not gdf_parts.empty:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    gdf_parts = ox.project_gdf(gdf_parts)
+
+            # Позначаємо parts і додаємо до buildings тільки ті, що мають висотні теги
+            if not gdf_parts.empty:
+                gdf_parts = gdf_parts.copy()
+                gdf_parts["__is_building_part"] = True
+                # Якщо part не має height/levels — часто дублює "корпус" без користі → пропускаємо
+                has_height = None
+                for col in [
+                    "height",
+                    "building:height",
+                    "building:levels",
+                    "building:levels:aboveground",
+                    "roof:height",
+                    "roof:levels",
+                ]:
+                    if col in gdf_parts.columns:
+                        s = gdf_parts[col].notna()
+                        has_height = s if has_height is None else (has_height | s)
+                if has_height is not None:
+                    gdf_parts = gdf_parts[has_height]
+                if not gdf_parts.empty:
+                    gdf_buildings = gpd.GeoDataFrame(
+                        pd.concat([gdf_buildings, gdf_parts], ignore_index=True),
+                        crs=gdf_buildings.crs or gdf_parts.crs,
+                    )
+        except Exception as e:
+            print(f"Помилка завантаження будівель: {e}")
+            gdf_buildings = gpd.GeoDataFrame()
+
+        # Optional: footprints replacement in Overpass mode too
+        try:
+            from services.footprints_loader import is_footprints_enabled, load_footprints_bbox, transfer_osm_attributes_to_footprints
+
+            if is_footprints_enabled() and gdf_buildings is not None and not gdf_buildings.empty:
+                fp = load_footprints_bbox(north, south, east, west, target_crs=getattr(gdf_buildings, "crs", None))
+                if fp is not None and not fp.empty:
+                    fp = transfer_osm_attributes_to_footprints(fp, gdf_buildings)
+                    # keep parts if present
+                    if "__is_building_part" in gdf_buildings.columns:
+                        parts = gdf_buildings[gdf_buildings["__is_building_part"].fillna(False)]
+                        if not parts.empty:
+                            gdf_buildings = gpd.GeoDataFrame(
+                                pd.concat([fp, parts], ignore_index=True),
+                                crs=fp.crs or parts.crs,
+                            )
+                        else:
+                            gdf_buildings = fp
                     else:
-                        print("[WARN] Граф доріг став None після проекції")
-    except Exception as e:
-        print(f"[ERROR] Помилка завантаження доріг: {e}")
-        import traceback
-        traceback.print_exc()
-        G_roads = None
+                        gdf_buildings = fp
+        except Exception as e:
+            print(f"[WARN] Footprints integration skipped: {e}")
+    else:
+        print("Пропуск завантаження будівель (fetch_buildings=False)")
+    
+    # 2. Вода (для вирізання з бази)
+    gdf_water = gpd.GeoDataFrame()
+    if fetch_water:
+        print("Завантаження водних об'єктів...")
+        # ВАЖЛИВО: не тягнемо всі waterway (канали/лінії), бо це дає "воду де не треба".
+        # Беремо тільки реальні полігональні water-об'єкти.
+        tags_water = {
+            'natural': 'water',
+            'water': True,
+            'waterway': 'riverbank',
+            'landuse': 'reservoir',
+        }
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                # Виправляємо виклик для нової версії osmnx
+                try:
+                    gdf_water = ox.features_from_bbox(bbox=padded_bbox, tags=tags_water)
+                except TypeError:
+                    gdf_water = ox.features_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], tags=tags_water)
+            if not gdf_water.empty:
+                gdf_water = gdf_water[gdf_water.geometry.notna()]
+                # ОБРІЗКА ДО ПРОЕКЦІЇ (в WGS84 координатах)
+                try:
+                    gdf_water = gdf_water[gdf_water.geometry.intersects(target_bbox_wgs84)]
+                except Exception:
+                    pass
+                # Проекція в метричну систему (UTM автоматично) - після обрізки
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    gdf_water = ox.project_gdf(gdf_water)
+        except InsufficientResponseError:
+            # Це нормальний кейс: в bbox просто немає води за цими тегами
+            gdf_water = gpd.GeoDataFrame()
+        except Exception as e:
+            # Інші помилки (мережа/Overpass) — залишаємо як warning, але не падаємо
+            print(f"[WARN] Завантаження води не вдалося: {e}")
+            gdf_water = gpd.GeoDataFrame()
+    else:
+        print("Пропуск завантаження води (fetch_water=False)")
+    
+    # 3. Дорожня мережа
+    G_roads = None
+    if fetch_roads:
+        print("Завантаження дорожньої мережі...")
+        try:
+            # 'all' включає всі типи доріг (drive, walk, bike)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                # Використовуємо custom_filter для завантаження І доріг ("highway"), І залізниці ("railway")
+                # network_type='all' часто пропускає залізницю
+                rail_filter = '["highway"]|["railway"~"rail|tram|light_rail|subway|monorail|narrow_gauge|preserved"]'
+                try:
+                    # Нова версія osmnx uses custom_filter arg
+                    G_roads = ox.graph_from_bbox(bbox=padded_bbox, custom_filter=rail_filter, simplify=True, retain_all=True)
+                except TypeError:
+                        # Fallback if bbox arg fails or old version
+                    G_roads = ox.graph_from_bbox(padded_bbox[0], padded_bbox[1], padded_bbox[2], padded_bbox[3], custom_filter=rail_filter, simplify=True, retain_all=True)
+            
+            if G_roads is None:
+                print("[WARN] osmnx повернув None для графу доріг")
+            elif not hasattr(G_roads, 'edges'):
+                print("[WARN] Граф доріг не має атрибуту 'edges'")
+                G_roads = None
+            else:
+                edges_count = len(list(G_roads.edges()))
+                if edges_count == 0:
+                    print("[WARN] Граф доріг порожній після завантаження (0 edges)")
+                    G_roads = None
+                else:
+                    print(f"[DEBUG] Завантажено {edges_count} доріг (до проекції)")
+                    # Проекція графа в метричну систему
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        G_roads = ox.project_graph(G_roads)
+                        if G_roads is not None and hasattr(G_roads, 'edges'):
+                            edges_after = len(list(G_roads.edges()))
+                            print(f"[DEBUG] Після проекції: {edges_after} доріг")
+                        else:
+                            print("[WARN] Граф доріг став None після проекції")
+        except Exception as e:
+            print(f"[ERROR] Помилка завантаження доріг: {e}")
+            import traceback
+            traceback.print_exc()
+            G_roads = None
+    else:
+        print("Пропуск завантаження доріг (fetch_roads=False)")
     
     # Обрізка будівель та води вже виконана ДО проекції (в WGS84)
     num_roads = 0
@@ -618,3 +655,66 @@ def fetch_city_data(
     
     return gdf_buildings, gdf_water, G_roads
 
+
+def load_city_cache(city_cache_key: str) -> Optional[dict]:
+    """
+    Load city-wide data (specifically water) using the city cache key.
+    This reconstructs the city bbox from the stored metadata and fetches/loads
+    the water data for the entire city context.
+    
+    Args:
+        city_cache_key: The hash key identifying the city context
+        
+    Returns:
+        Dict with 'water' key containing GeoDataFrame, or None
+    """
+    try:
+        if not city_cache_key:
+            return None
+            
+        # Path to city cache metadata
+        cache_dir = Path("cache/cities")
+        cache_file = cache_dir / f"city_{city_cache_key}.json"
+        
+        if not cache_file.exists():
+            return None
+            
+        import json
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+            
+        bbox = metadata.get('bbox')
+        if not bbox:
+            return None
+            
+        north = float(bbox['north'])
+        south = float(bbox['south'])
+        east = float(bbox['east'])
+        west = float(bbox['west'])
+        
+        # Determine padding used for city fetch (usually standard padding)
+        # We try to load from standard cache first to avoid re-fetching online
+        padding = 0.002
+        
+        # reuse fetch_city_data logic but restricted to checking cache/fetching
+        # We only need water for bridge detection
+        
+        print(f"[CACHE] Loading global city context for key {city_cache_key}...")
+        
+        # Check standard cache first
+        cached_data = _load_from_cache(north, south, east, west, padding)
+        if cached_data:
+            _, water, _ = cached_data
+            if water is not None and not water.empty:
+                return {'water': water}
+        
+        # If not in cache, we might avoid fetching online to prevent huge downloads during a render task
+        # But if the user wants global context, maybe we should? 
+        # For now, let's strictly return cached data if available. 
+        # If it wasn't pre-fetched, we skip global context to avoid blocking.
+        
+        return None
+        
+    except Exception as e:
+        print(f"[WARN] Failed to load city cache: {e}")
+        return None

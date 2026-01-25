@@ -70,14 +70,32 @@ def fetch_extras(
     ox.settings.log_console = False
 
     # Parks/green polygons
+    # Parks/green polygons AND other areas (parking, cemeteries, squares, plazas, railways)
     tags_green = {
-        "leisure": ["park", "garden", "playground", "recreation_ground", "pitch"],
-        "landuse": ["grass", "meadow", "forest", "village_green"],
-        "natural": ["wood"],
+        "leisure": ["park", "garden", "playground", "recreation_ground", "pitch", "common", "sports_centre"],
+        "landuse": [
+            "grass", "meadow", "forest", "village_green", "cemetery", "religious", 
+            "recreation_ground", "allotments", "plaza", "commercial", "retail", 
+            "railway", "construction", "brownfield", "industrial", "garages",
+            "farmland", "farmyard", "orchard", "vineyard"
+        ],
+        "natural": ["wood", "scrub", "heath", "grassland", "sand", "beach"],
+        "amenity": [
+            "parking", "grave_yard", "university", "school", "college", "kindergarten", 
+            "marketplace", "restaurant", "cafe", "fast_food", "bar", "pub", "food_court",
+            "ice_cream", "bicycle_parking", "shelter"
+        ],
+        "man_made": ["pier", "breakwater", "groyne"],
+        "place": ["square"],
+        "highway": ["pedestrian"], # pedestrian areas (polygons)
+        "railway": ["station", "platform"], # platforms are often polygons
     }
-    # POIs
+    # POIs (points or small polygons to be treated as detailed objects)
     tags_pois = {
-        "amenity": ["bench", "fountain"],
+        "amenity": ["bench", "fountain", "statue"],
+        "historic": ["monument", "memorial", "archaeological_site", "ruins"],
+        "tourism": ["attraction", "artwork", "viewpoint"],
+        "man_made": ["tower", "mast", "flagpole"],
     }
 
     gdf_green = gpd.GeoDataFrame()
@@ -94,7 +112,8 @@ def fetch_extras(
                 gdf_green = ox.project_gdf(gdf_green)
             # Keep polygons only
             gdf_green = gdf_green[gdf_green.geom_type.isin(["Polygon", "MultiPolygon"])]
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] Failed to fetch green areas: {e}")
         gdf_green = gpd.GeoDataFrame()
 
     try:
